@@ -1,0 +1,7 @@
+.env
+shadow_portfolio.json
+venv
+.sync_backups
+__pycache__
+t212_instruments.json
+*.__pyc
