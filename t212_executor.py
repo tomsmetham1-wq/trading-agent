@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Optional
 
 import requests
+from shadow_portfolio import fetch_price_gbp
 
 
 # -----------------------------------------------------------------------------
@@ -321,8 +322,18 @@ def get_t212_positions_map() -> dict[str, dict]:
     )
     r.raise_for_status()
     positions = r.json()
-    return {p["instrument"]["ticker"]: p for p in positions
-            if isinstance(p, dict) and "instrument" in p}
+    result = {}
+    for p in positions:
+        if not isinstance(p, dict):
+            continue
+        # T212 API returns flat {"ticker": ...} or nested {"instrument": {"ticker": ...}}
+        ticker = (
+            p["instrument"]["ticker"] if "instrument" in p
+            else p.get("ticker", "")
+        )
+        if ticker:
+            result[ticker] = p
+    return result
 
 
 # -----------------------------------------------------------------------------
@@ -396,17 +407,26 @@ def _is_valid_ticker(yf_ticker: str) -> bool:
 # -----------------------------------------------------------------------------
 # Main entry point
 # -----------------------------------------------------------------------------
-def execute_recommendations(recs: list, shadow_events: list[str]) -> list[str]:
-    """Mirror shadow recommendations as real T212 demo orders."""
+def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
+    """
+    Mirror recommendations as real T212 demo orders.
+
+    Returns (events, confirmed_recs). confirmed_recs contains only the recs
+    T212 successfully accepted — shadow must apply these only, to prevent drift
+    when T212 fails (e.g. insufficient funds, ticker not found).
+
+    When T212_DEMO_EXECUTE=false, returns ([], all_recs) so shadow applies everything.
+    """
     if not T212_DEMO_EXECUTE:
-        return []
+        return [], list(recs)
     if T212_ENV == "live":
         print("  ! T212_DEMO_EXECUTE=true but T212_ENV=live — refusing to execute.")
-        return ["SKIPPED: T212_DEMO_EXECUTE refused on live account."]
+        return ["SKIPPED: T212_DEMO_EXECUTE refused on live account."], []
     if not recs:
-        return []
+        return [], []
 
-    events = []
+    events: list[str] = []
+    confirmed_recs: list[dict] = []
     instruments = _load_instruments()
     positions_map = get_t212_positions_map()
 
@@ -416,7 +436,6 @@ def execute_recommendations(recs: list, shadow_events: list[str]) -> list[str]:
         if not yf_ticker or action not in ("BUY", "SELL", "TRIM"):
             continue
 
-        # Validate ticker format before trying to translate
         if not _is_valid_ticker(yf_ticker):
             events.append(f"SKIP {action} '{yf_ticker}': invalid ticker format")
             continue
@@ -428,31 +447,40 @@ def execute_recommendations(recs: list, shadow_events: list[str]) -> list[str]:
 
         try:
             if action == "BUY":
-                shares = _shares_from_shadow_events(shadow_events, yf_ticker)
-                if shares is None or shares <= 0:
-                    events.append(f"SKIP BUY {yf_ticker}: "
-                                  f"couldn't determine quantity from shadow")
+                amount_gbp = float(rec.get("amount_gbp") or 0)
+                if amount_gbp <= 0:
+                    events.append(f"SKIP BUY {yf_ticker}: no amount specified")
                     continue
+                price_gbp = fetch_price_gbp(yf_ticker)
+                if not price_gbp or price_gbp <= 0:
+                    events.append(f"SKIP BUY {yf_ticker}: couldn't fetch price")
+                    continue
+                shares = amount_gbp / price_gbp
+                order_placed = False
                 try:
                     result = _place_market_order(t212_ticker, shares)
+                    order_placed = True
                 except requests.HTTPError as e:
                     if e.response.status_code == 404 and yf_ticker.upper() in TICKER_ALIASES:
-                        # Alias was wrong — retry with search-based translation
                         print(f"  ! Alias {t212_ticker} returned 404, "
                               f"retrying with instrument search...")
                         t212_ticker = _search_translate(yf_ticker, instruments)
-                        if not t212_ticker:
+                        if t212_ticker:
+                            result = _place_market_order(t212_ticker, shares)
+                            order_placed = True
+                        else:
                             events.append(f"SKIP BUY {yf_ticker}: "
                                           f"alias 404 and search found nothing")
                             continue
-                        result = _place_market_order(t212_ticker, shares)
                     else:
                         raise
-                events.append(
-                    f"T212 BUY {shares:.4f} {t212_ticker} "
-                    f"(order {result.get('id', '?')})"
-                )
-                time.sleep(1.2)  # Respect rate limit
+                if order_placed:
+                    events.append(
+                        f"T212 BUY {shares:.4f} {t212_ticker} "
+                        f"(order {result.get('id', '?')})"
+                    )
+                    confirmed_recs.append(rec)
+                    time.sleep(1.2)
 
             elif action in ("SELL", "TRIM"):
                 pos = positions_map.get(t212_ticker)
@@ -466,16 +494,16 @@ def execute_recommendations(recs: list, shadow_events: list[str]) -> list[str]:
                 if held <= 0:
                     events.append(f"SKIP {action} {yf_ticker}: zero quantity held")
                     continue
-                if action == "SELL":
-                    qty_to_sell = held
-                else:
-                    pct = float(rec.get("trim_pct") or 50) / 100
-                    qty_to_sell = held * pct
+                qty_to_sell = (
+                    held if action == "SELL"
+                    else held * (float(rec.get("trim_pct") or 50) / 100)
+                )
                 result = _place_market_order(t212_ticker, -qty_to_sell)
                 events.append(
                     f"T212 {action} {qty_to_sell:.4f} {t212_ticker} "
                     f"(order {result.get('id', '?')})"
                 )
+                confirmed_recs.append(rec)
                 time.sleep(1.2)
 
         except requests.HTTPError as e:
@@ -486,20 +514,4 @@ def execute_recommendations(recs: list, shadow_events: list[str]) -> list[str]:
         except Exception as e:
             events.append(f"T212 ORDER ERROR {action} {t212_ticker}: {e}")
 
-    return events
-
-
-def _shares_from_shadow_events(shadow_events: list[str],
-                               yf_ticker: str) -> Optional[float]:
-    """Extract share quantity from shadow event string."""
-    ticker_upper = yf_ticker.upper()
-    for event in shadow_events:
-        if ticker_upper in event.upper() and event.startswith("BOUGHT"):
-            try:
-                parts = event.split()
-                amount = float(parts[1].replace("£", ""))
-                price = float(parts[5].replace("£", ""))
-                return amount / price
-            except (IndexError, ValueError):
-                continue
-    return None
+    return events, confirmed_recs

@@ -50,7 +50,7 @@ def save_ledger(ledger: dict) -> None:
 
 
 def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
-                   t212_to_yf_fn) -> bool:
+                   t212_to_yf_fn, bidirectional: bool = True) -> bool:
     """
     Bidirectional reconciliation of shadow ledger against T212 (source of truth).
 
@@ -70,9 +70,15 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
     # Build a map of T212 positions by yfinance ticker
     t212_by_yf = {}
     for pos in t212_positions:
-        if not isinstance(pos, dict) or "instrument" not in pos:
+        if not isinstance(pos, dict):
             continue
-        t212_ticker = pos["instrument"].get("ticker", "")
+        # T212 API returns flat {"ticker": "AAPL_US_EQ", ...}
+        t212_ticker = (
+            pos["instrument"].get("ticker", "") if "instrument" in pos
+            else pos.get("ticker", "")
+        )
+        if not t212_ticker:
+            continue
         yf_ticker = t212_to_yf_fn(t212_ticker)
         if not yf_ticker:
             continue
@@ -87,16 +93,27 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
     missing_in_shadow = t212_tickers - shadow_tickers   # T212 holds it, shadow doesn't
     extra_in_shadow   = shadow_tickers - t212_tickers   # Shadow holds it, T212 doesn't
 
-    t212_available = float(t212_cash.get("cash", {}).get("availableToTrade", 0))
-    cash_changed = abs(t212_available - ledger["cash_gbp"]) > 1.0
+    # T212 account summary returns flat {"free": ..., "total": ...}
+    t212_available = float(
+        t212_cash.get("free", 0)
+        or t212_cash.get("cash", {}).get("free", 0)
+        or t212_cash.get("cash", {}).get("availableToTrade", 0)
+    )
+    # Cash sync only relevant when T212 is authoritative (bidirectional mode)
+    cash_changed = bidirectional and abs(t212_available - ledger["cash_gbp"]) > 1.0
 
-    if not missing_in_shadow and not extra_in_shadow and not cash_changed:
+    needs_work = (
+        missing_in_shadow
+        or (bidirectional and extra_in_shadow)
+        or cash_changed
+    )
+    if not needs_work:
         return False
 
     today = datetime.now().strftime("%Y-%m-%d")
     changed = False
 
-    # Add positions T212 holds that shadow is missing
+    # Add positions T212 holds that shadow is missing (always — catches manual T212 trades)
     if missing_in_shadow:
         print(f"  Sync: adding to shadow (held in T212): {sorted(missing_in_shadow)}")
         for yf_ticker in missing_in_shadow:
@@ -112,15 +129,16 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
             }
             changed = True
 
-    # Remove positions shadow holds that T212 never executed
-    if extra_in_shadow:
-        print(f"  Sync: removing from shadow (never executed in T212): {sorted(extra_in_shadow)}")
+    # Remove positions shadow holds that T212 doesn't — bidirectional only.
+    # Skipped in shadow-only mode because shadow is authoritative there.
+    if bidirectional and extra_in_shadow:
+        print(f"  Sync: removing from shadow (not in T212): {sorted(extra_in_shadow)}")
         for yf_ticker in extra_in_shadow:
             del ledger["positions"][yf_ticker]
         changed = True
 
-    # Sync cash to T212's actual balance (always, when anything changed)
-    if cash_changed or changed:
+    # Sync cash to T212's actual balance — bidirectional only
+    if bidirectional and (cash_changed or changed):
         ledger["cash_gbp"] = t212_available
         changed = True
 
@@ -278,7 +296,8 @@ def apply_recommendations(ledger: dict, recs: list, run_date: str) -> list[str]:
 # Valuation & benchmark
 # -----------------------------------------------------------------------------
 def _build_t212_price_map(t212_positions: list,
-                          t212_to_yf_fn) -> dict[str, float]:
+                          t212_to_yf_fn,
+                          instruments: list = None) -> dict[str, float]:
     """
     Build a {yf_ticker: price_gbp} map from T212 live position data.
 
@@ -288,15 +307,31 @@ def _build_t212_price_map(t212_positions: list,
     which equals current value in GBP / shares.
 
     Falls back to avg_cost if ppl is missing.
+    instruments: optional T212 instruments list used to look up currencyCode.
     """
     price_map = {}
     if not isinstance(t212_positions, list):
         return price_map
 
+    # Build currency lookup from instruments cache: {t212_ticker: currencyCode}
+    inst_currency: dict[str, str] = {}
+    if instruments:
+        for inst in instruments:
+            t = inst.get("ticker", "")
+            c = inst.get("currencyCode", "")
+            if t and c:
+                inst_currency[t] = c.upper()
+
     for pos in t212_positions:
-        if not isinstance(pos, dict) or "instrument" not in pos:
+        if not isinstance(pos, dict):
             continue
-        t212_ticker = pos["instrument"].get("ticker", "")
+        # T212 API returns flat {"ticker": "AAPL_US_EQ", ...}
+        t212_ticker = (
+            pos["instrument"].get("ticker", "") if "instrument" in pos
+            else pos.get("ticker", "")
+        )
+        if not t212_ticker:
+            continue
         yf_ticker = t212_to_yf_fn(t212_ticker)
         if not yf_ticker:
             continue
@@ -304,7 +339,11 @@ def _build_t212_price_map(t212_positions: list,
         try:
             qty = float(pos.get("quantity", 0))
             current_price_native = float(pos.get("currentPrice", 0))
-            currency = pos.get("instrument", {}).get("currencyCode", "USD").upper()
+            # Currency: prefer instrument sub-object → instruments cache → default USD
+            if "instrument" in pos:
+                currency = pos["instrument"].get("currencyCode", "USD").upper()
+            else:
+                currency = inst_currency.get(t212_ticker, "USD")
             ppl = pos.get("ppl")  # profit/loss in account currency (GBP)
 
             if current_price_native > 0 and qty > 0:

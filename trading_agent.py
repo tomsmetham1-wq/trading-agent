@@ -236,17 +236,27 @@ def build_prompt(shadow_val: dict, shadow_ledger: dict,
     recent_trades = shadow_ledger.get("trades", [])[-15:]
 
     # Compact T212 summary — only send what Claude needs, not the full raw response
+    # T212 account summary returns flat {"free": ..., "total": ...}
     t212_available = float(
-        t212_cash.get("cash", {}).get("availableToTrade", 0)
-        or t212_cash.get("totalValue", 0)
+        t212_cash.get("free", 0)
+        or t212_cash.get("cash", {}).get("free", 0)
+        or t212_cash.get("cash", {}).get("availableToTrade", 0)
+    )
+    t212_total_val = float(
+        t212_cash.get("total", 0)
+        or t212_cash.get("totalValue", t212_available)
     )
     t212_summary = {
         "cash_gbp": round(t212_available, 2),
-        "total_value_gbp": round(float(t212_cash.get("totalValue", t212_available)), 2),
+        "total_value_gbp": round(t212_total_val, 2),
         "position_count": len(t212_positions) if isinstance(t212_positions, list) else 0,
         "positions": [
             {
-                "ticker": p.get("instrument", {}).get("ticker", ""),
+                # T212 positions: flat {"ticker": ...} or nested {"instrument": {"ticker": ...}}
+                "ticker": (
+                    p["instrument"].get("ticker", "") if "instrument" in p
+                    else p.get("ticker", "")
+                ),
                 "quantity": p.get("quantity"),
                 "currentPrice": p.get("currentPrice"),
                 "ppl": p.get("ppl"),
@@ -417,7 +427,7 @@ def run_weekly(started: datetime) -> None:
 
     t212_cash = get_t212_cash()
     t212_positions = get_t212_positions()
-    total = t212_cash.get("totalValue", t212_cash.get("cash", {}).get("availableToTrade", "?"))
+    total = t212_cash.get("total", t212_cash.get("totalValue", t212_cash.get("free", "?")))
     currency = t212_cash.get("currency", "GBP")
     print(f"  T212: {total} {currency} | {len(t212_positions)} positions")
 
@@ -432,14 +442,17 @@ def run_weekly(started: datetime) -> None:
             return t212ex.t212_to_yf_ticker(t212_ticker, instruments)
 
         # Build live price map from T212 position data (replaces yfinance for held positions)
-        t212_price_map = sp._build_t212_price_map(t212_positions, _t212_to_yf)
+        t212_price_map = sp._build_t212_price_map(t212_positions, _t212_to_yf,
+                                                   instruments)
 
-        # Sync shadow ledger against T212 if demo execution is on
-        if os.getenv("T212_DEMO_EXECUTE", "false").lower() == "true":
-            changed = sp.sync_from_t212(ledger, t212_cash, t212_positions,
-                                        _t212_to_yf)
-            if changed:
-                sp.save_ledger(ledger)
+        # Sync shadow ↔ T212. Runs every week regardless of T212_DEMO_EXECUTE:
+        #   bidirectional=True  → T212 is authoritative (removes phantom positions, syncs cash)
+        #   bidirectional=False → add-only (catches manual T212 trades; shadow stays authoritative)
+        changed = sp.sync_from_t212(ledger, t212_cash, t212_positions,
+                                    _t212_to_yf,
+                                    bidirectional=t212ex.T212_DEMO_EXECUTE)
+        if changed:
+            sp.save_ledger(ledger)
 
     except Exception as e:
         print(f"  ! T212 data error, falling back to yfinance: {e}")
@@ -455,14 +468,16 @@ def run_weekly(started: datetime) -> None:
 
     recs = extract_recommendations(response)
     print(f"  Claude made {len(recs)} actionable recommendations")
-    events = sp.apply_recommendations(ledger, recs, run_date) if recs else []
-    for e in events:
-        print(f"    - {e}")
 
-    # Mirror to T212 demo account if T212_DEMO_EXECUTE=true
-    t212_events = t212ex.execute_recommendations(recs, events)
+    # T212 executes first — shadow only mirrors confirmed trades.
+    # This prevents drift when T212 fails (insufficient funds, bad ticker, etc).
+    t212_events, confirmed_recs = t212ex.execute_recommendations(recs)
     for e in t212_events:
         print(f"    [T212] {e}")
+
+    events = sp.apply_recommendations(ledger, confirmed_recs, run_date) if confirmed_recs else []
+    for e in events:
+        print(f"    - {e}")
 
     post_val = sp.valuation(ledger, t212_price_map=t212_price_map)
     sp.snapshot(ledger, post_val, run_date)
@@ -475,11 +490,14 @@ def run_weekly(started: datetime) -> None:
     t212_cash_available = 0.0
     try:
         t212_total = float(
-            t212_cash.get("totalValue")
-            or t212_cash.get("cash", {}).get("availableToTrade", 0)
+            t212_cash.get("total")
+            or t212_cash.get("totalValue")
+            or t212_cash.get("free", 0)
         )
         t212_cash_available = float(
-            t212_cash.get("cash", {}).get("availableToTrade", 0)
+            t212_cash.get("free", 0)
+            or t212_cash.get("cash", {}).get("free", 0)
+            or t212_cash.get("cash", {}).get("availableToTrade", 0)
         )
         t212_section = (
             f"=== T212 Demo Account ===\n"
@@ -536,7 +554,8 @@ def run_monthly_deep_review(started: datetime) -> None:
         instruments = t212ex._load_instruments()
         def _t212_to_yf(t212_ticker: str):
             return t212ex.t212_to_yf_ticker(t212_ticker, instruments)
-        t212_price_map = sp._build_t212_price_map(t212_positions, _t212_to_yf)
+        t212_price_map = sp._build_t212_price_map(t212_positions, _t212_to_yf,
+                                                   instruments)
     except Exception as e:
         print(f"  ! T212 price map failed for deep review: {e}")
 
