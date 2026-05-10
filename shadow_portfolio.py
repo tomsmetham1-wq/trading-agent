@@ -52,15 +52,15 @@ def save_ledger(ledger: dict) -> None:
 def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
                    t212_to_yf_fn) -> bool:
     """
-    Reconcile the shadow ledger against the actual T212 demo account state.
+    Bidirectional reconciliation of shadow ledger against T212 (source of truth).
 
-    This is safe to run every session: it only updates the ledger when there's
-    a meaningful drift (positions in T212 that aren't tracked, or cash out of
-    sync by >£1). Returns True if changes were made.
+    When T212_DEMO_EXECUTE=true, T212 is what actually executed. This sync:
+      - ADDS positions T212 holds that shadow is missing (e.g. after ledger reset)
+      - REMOVES positions shadow holds that T212 doesn't (execution failures)
+      - SYNCS cash to T212's actual available balance
 
-    Why: when you delete the shadow JSON or execution fails mid-way, the
-    shadow and T212 can diverge. Since T212 is the source of truth for what
-    actually executed, we rebuild shadow from it.
+    This runs before Claude is called each week, so shadow always reflects
+    reality before new recommendations are made.
 
     t212_to_yf_fn: a function (t212_ticker) -> yfinance_ticker for translation.
     """
@@ -84,47 +84,59 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
     shadow_tickers = set(ledger["positions"].keys())
     t212_tickers = set(t212_by_yf.keys())
 
-    missing_in_shadow = t212_tickers - shadow_tickers
-    # Note: we deliberately do NOT remove positions from shadow that are
-    # missing in T212 — they may be pending orders not yet settled.
-    # Shadow only adds, never removes, to avoid wiping pending positions.
+    missing_in_shadow = t212_tickers - shadow_tickers   # T212 holds it, shadow doesn't
+    extra_in_shadow   = shadow_tickers - t212_tickers   # Shadow holds it, T212 doesn't
 
-    # Update cash if it's drifted by more than £1
     t212_available = float(t212_cash.get("cash", {}).get("availableToTrade", 0))
     cash_changed = abs(t212_available - ledger["cash_gbp"]) > 1.0
 
-    if not missing_in_shadow and not cash_changed:
+    if not missing_in_shadow and not extra_in_shadow and not cash_changed:
         return False
 
-    if missing_in_shadow:
-        print(f"  Shadow out of sync with T212. Adding missing positions:")
-        print(f"    Adding to shadow: {sorted(missing_in_shadow)}")
-
     today = datetime.now().strftime("%Y-%m-%d")
-    for yf_ticker in missing_in_shadow:
-        data = t212_by_yf[yf_ticker]
-        price_gbp = fetch_price_gbp(yf_ticker)
-        if price_gbp is None:
-            print(f"  ! {yf_ticker}: couldn't fetch GBP price, skipping sync")
-            continue
-        ledger["positions"][yf_ticker] = {
-            "shares": data["shares"],
-            "avg_cost_gbp": price_gbp,
-            "first_bought": today,
-            "thesis": "(synced from T212)",
-        }
+    changed = False
 
-    if cash_changed:
+    # Add positions T212 holds that shadow is missing
+    if missing_in_shadow:
+        print(f"  Sync: adding to shadow (held in T212): {sorted(missing_in_shadow)}")
+        for yf_ticker in missing_in_shadow:
+            price_gbp = fetch_price_gbp(yf_ticker)
+            if price_gbp is None:
+                print(f"  ! {yf_ticker}: couldn't fetch GBP price, skipping sync")
+                continue
+            ledger["positions"][yf_ticker] = {
+                "shares": t212_by_yf[yf_ticker]["shares"],
+                "avg_cost_gbp": price_gbp,
+                "first_bought": today,
+                "thesis": "(synced from T212)",
+            }
+            changed = True
+
+    # Remove positions shadow holds that T212 never executed
+    if extra_in_shadow:
+        print(f"  Sync: removing from shadow (never executed in T212): {sorted(extra_in_shadow)}")
+        for yf_ticker in extra_in_shadow:
+            del ledger["positions"][yf_ticker]
+        changed = True
+
+    # Sync cash to T212's actual balance (always, when anything changed)
+    if cash_changed or changed:
         ledger["cash_gbp"] = t212_available
+        changed = True
 
-    ledger["trades"].append({
-        "date": today,
-        "action": "SYNC_FROM_T212",
-        "ticker": "-",
-        "note": (f"Shadow synced: added {len(missing_in_shadow)} positions, "
-                 f"cash set to £{t212_available:.2f}"),
-    })
-    return True
+    if changed:
+        ledger["trades"].append({
+            "date": today,
+            "action": "SYNC_FROM_T212",
+            "ticker": "-",
+            "note": (
+                f"Bidirectional sync: added {sorted(missing_in_shadow)}, "
+                f"removed {sorted(extra_in_shadow)}, "
+                f"cash set to £{t212_available:.2f}"
+            ),
+        })
+
+    return changed
 
 
 # -----------------------------------------------------------------------------
