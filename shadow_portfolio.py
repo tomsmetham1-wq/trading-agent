@@ -50,7 +50,8 @@ def save_ledger(ledger: dict) -> None:
 
 
 def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
-                   t212_to_yf_fn, bidirectional: bool = True) -> bool:
+                   t212_to_yf_fn, bidirectional: bool = True,
+                   pending_yf_tickers: set = None) -> bool:
     """
     Bidirectional reconciliation of shadow ledger against T212 (source of truth).
 
@@ -131,11 +132,18 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
 
     # Remove positions shadow holds that T212 doesn't — bidirectional only.
     # Skipped in shadow-only mode because shadow is authoritative there.
+    # Also skipped for any ticker with a pending T212 buy order — the order
+    # was placed outside market hours and is queued, not failed.
     if bidirectional and extra_in_shadow:
-        print(f"  Sync: removing from shadow (not in T212): {sorted(extra_in_shadow)}")
-        for yf_ticker in extra_in_shadow:
-            del ledger["positions"][yf_ticker]
-        changed = True
+        queued = (pending_yf_tickers or set()) & extra_in_shadow
+        to_remove = extra_in_shadow - queued
+        if queued:
+            print(f"  Sync: keeping in shadow (T212 buy order pending): {sorted(queued)}")
+        if to_remove:
+            print(f"  Sync: removing from shadow (not in T212): {sorted(to_remove)}")
+            for yf_ticker in to_remove:
+                del ledger["positions"][yf_ticker]
+            changed = True
 
     # Sync cash to T212's actual balance — bidirectional only
     if bidirectional and (cash_changed or changed):

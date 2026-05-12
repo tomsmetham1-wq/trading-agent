@@ -314,6 +314,49 @@ def t212_to_yf_ticker(t212_ticker: str,
 # -----------------------------------------------------------------------------
 # Account state
 # -----------------------------------------------------------------------------
+def get_pending_buy_tickers(instruments: list[dict], t212_to_yf_fn) -> set[str]:
+    """
+    Return yfinance tickers that have an open (unfilled) buy order in T212.
+
+    Used by sync_from_t212 to avoid removing positions whose T212 order was
+    placed outside market hours and is merely queued, not failed.
+    Returns empty set on any API error so callers degrade gracefully.
+    """
+    try:
+        r = requests.get(
+            f"{T212_BASE_URL}/equity/orders",
+            headers=_headers(), timeout=20,
+        )
+        r.raise_for_status()
+        orders = r.json()
+    except Exception as e:
+        print(f"  ! Couldn't fetch pending orders (sync will be conservative): {e}")
+        return set()
+
+    if not isinstance(orders, list):
+        return set()
+
+    pending: set[str] = set()
+    terminal = {"FILLED", "CANCELLED", "CANCELLING", "REJECTED", "REPLACED"}
+    for order in orders:
+        if not isinstance(order, dict):
+            continue
+        side = (order.get("side") or "").upper()
+        status = (order.get("status") or "").upper()
+        if "BUY" not in side or status in terminal:
+            continue
+        t212_ticker = order.get("ticker", "")
+        if not t212_ticker:
+            continue
+        yf_ticker = t212_to_yf_fn(t212_ticker)
+        if yf_ticker:
+            pending.add(yf_ticker)
+
+    if pending:
+        print(f"  Pending T212 buy orders: {sorted(pending)}")
+    return pending
+
+
 def get_t212_positions_map() -> dict[str, dict]:
     """Returns {t212_ticker: position_data} for all open positions."""
     r = requests.get(

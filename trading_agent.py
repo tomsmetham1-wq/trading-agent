@@ -445,12 +445,20 @@ def run_weekly(started: datetime) -> None:
         t212_price_map = sp._build_t212_price_map(t212_positions, _t212_to_yf,
                                                    instruments)
 
+        # Check for pending T212 buy orders so sync doesn't remove positions
+        # that are merely queued (placed outside market hours), not failed.
+        pending_yf_tickers = (
+            t212ex.get_pending_buy_tickers(instruments, _t212_to_yf)
+            if t212ex.T212_DEMO_EXECUTE else set()
+        )
+
         # Sync shadow ↔ T212. Runs every week regardless of T212_DEMO_EXECUTE:
         #   bidirectional=True  → T212 is authoritative (removes phantom positions, syncs cash)
         #   bidirectional=False → add-only (catches manual T212 trades; shadow stays authoritative)
         changed = sp.sync_from_t212(ledger, t212_cash, t212_positions,
                                     _t212_to_yf,
-                                    bidirectional=t212ex.T212_DEMO_EXECUTE)
+                                    bidirectional=t212ex.T212_DEMO_EXECUTE,
+                                    pending_yf_tickers=pending_yf_tickers)
         if changed:
             sp.save_ledger(ledger)
 
