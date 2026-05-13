@@ -14,14 +14,14 @@ yfinance uses exchange suffixes like AAPL, SHEL.L, SAP.DE, 7203.T.
 T212 uses its own format like AAPL_US_EQ, SHEL_EQ, SAP_DE_EQ.
 
 We translate by matching in this priority order:
-  1. Manual aliases (for known quirks, e.g. META vs FB history).
-  2. Root symbol + expected currency (inferred from yfinance suffix).
-  3. Root symbol + T212 exchange marker heuristic.
-  4. Root symbol only (last resort, logged as a warning).
+  1. Manual aliases (for known quirks, e.g. BRK.B which has a dot in the symbol).
+  2. T212 shortName field match (T212's own symbol — most direct and reliable).
+  3. Root symbol + expected currency (inferred from yfinance exchange suffix).
+  4. Root symbol + T212 exchange marker heuristic (_US_EQ vs non-US).
+  5. Root symbol only — last resort, logged as a warning.
 
-Currency is the most reliable signal because every T212 instrument carries
-it and every yfinance suffix maps unambiguously to one or two currencies.
-This is why matching by currency works for all major global exchanges.
+Currency is the most reliable signal because every T212 instrument carries a
+currencyCode and every yfinance suffix maps unambiguously to one or two currencies.
 """
 
 from __future__ import annotations
@@ -37,13 +37,14 @@ import requests
 from shadow_portfolio import fetch_price_gbp
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Config
-# -----------------------------------------------------------------------------
-T212_API_KEY = os.getenv("T212_API_KEY", "").strip()
+# =============================================================================
+
+T212_API_KEY    = os.getenv("T212_API_KEY", "").strip()
 T212_API_SECRET = os.getenv("T212_API_SECRET", "").strip()
-T212_ENV = os.getenv("T212_ENV", "demo").lower().strip()
-T212_BASE_URL = (
+T212_ENV        = os.getenv("T212_ENV", "demo").lower().strip()
+T212_BASE_URL   = (
     "https://live.trading212.com/api/v0"
     if T212_ENV == "live"
     else "https://demo.trading212.com/api/v0"
@@ -55,19 +56,18 @@ INSTRUMENTS_CACHE_PATH = Path(
 )
 
 
-# -----------------------------------------------------------------------------
-# Global exchange reference — the heart of robust ticker translation
-# -----------------------------------------------------------------------------
-# Maps yfinance exchange suffix → the set of currencies we'd expect T212 to
-# report for that exchange. Most are single-currency; some have alternatives
-# (e.g. LSE reports GBP or GBX for pence).
+# =============================================================================
+# Exchange reference — the heart of robust ticker translation
+# =============================================================================
+
+# Maps yfinance exchange suffix → set of currencies T212 uses for that exchange.
+# Most exchanges are single-currency; LSE has GBP and GBX (pence) variants.
 #
-# When Claude suggests a ticker like "SHEL.L", we strip the .L, look up
-# "L" here, and get {"GBP", "GBX"}. We then match T212 instruments with root
-# SHEL and currency in that set.
+# When Claude suggests "SHEL.L", we strip ".L", look up "L" here, get {"GBP", "GBX"},
+# then filter T212 instruments with root "SHEL" whose currencyCode is in that set.
 YF_SUFFIX_TO_CURRENCIES: dict[str, set[str]] = {
     "":    {"USD"},                    # US (NYSE/NASDAQ)
-    "L":   {"GBP", "GBX", "GBp"},      # London Stock Exchange
+    "L":   {"GBP", "GBX", "GBp"},     # London Stock Exchange
     "DE":  {"EUR"},                    # Xetra (Germany)
     "F":   {"EUR"},                    # Frankfurt
     "MU":  {"EUR"},                    # Munich
@@ -114,49 +114,81 @@ YF_SUFFIX_TO_CURRENCIES: dict[str, set[str]] = {
 }
 
 
-# -----------------------------------------------------------------------------
-# Manual aliases — yfinance ticker → exact T212 ticker
-# Used when the automatic translation fails or we know the exact answer.
-# Expand this list as you encounter edge cases.
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Manual ticker aliases
+# =============================================================================
+
+# Maps yfinance ticker → exact T212 ticker. Only add entries here when you've
+# CONFIRMED the T212 ticker exists. Wrong aliases cause 404s and bypass the
+# automatic search entirely.
 TICKER_ALIASES: dict[str, str] = {
-    # Only add entries here when you've CONFIRMED the exact T212 ticker.
-    # Wrong aliases cause 404s and bypass the search.
+    # Berkshire — T212 uses BRK_B_US_EQ (underscore separator, not dot).
+    # BRK.B and BRK.A also resolve correctly via shortName matching, but are
+    # kept here to be explicit. BRK-B (hyphen) REQUIRES the alias — the hyphen
+    # doesn't appear in any shortName or ticker root so auto-translate fails.
+    "BRK.B":  "BRK_B_US_EQ",   # shortName="BRK.B" (Berkshire Class B)
+    "BRK.A":  "BRK/A_US_EQ",   # shortName="BRK.A" (Berkshire Class A, T212 uses slash)
+    "BRK-B":  "BRK_B_US_EQ",   # Hyphen variant — needs explicit alias
 
-    # Berkshire — dot in symbol requires explicit mapping
-    "BRK.B": "BRK.B_US_EQ",
-    "BRK.A": "BRK.A_US_EQ",
-    "BRK-B": "BRK.B_US_EQ",
+    # Meta Platforms — T212 still uses the old Facebook ticker FB_US_EQ.
+    # Without this alias, the shortName search finds three "META" matches
+    # (FB_US_EQ + two WisdomTree ETFs), and could return the wrong one if the
+    # list order ever changes. Confirmed: FB_US_EQ is Meta Platforms (ISIN US30303M1027).
+    "META":   "FB_US_EQ",
 
-    # UK stocks where root symbol is ambiguous
-    "BA.L":   "BAES_EQ",      # BAE Systems
-    "RR.L":   "RR_EQ",        # Rolls-Royce
-    "LSEG.L": "LSEG_EQ",      # London Stock Exchange Group
+    # UK stocks — explicit mappings to lock in the correct GBX-listed instrument.
+    # Auto-translation via shortName+currency also works for these, but aliases
+    # prevent any future ambiguity if T212 adds new instruments with the same shortName.
+    "BA.L":   "BAl_EQ",    # BAE Systems (shortName=BA, GBX — distinct from BA_US_EQ=Richtech)
+    "RR.L":   "RRl_EQ",    # Rolls-Royce (shortName=RR, GBX — distinct from RR_US_EQ=Richtech)
+    "LSEG.L": "LSEl_EQ",   # London Stock Exchange Group (shortName=LSEG, GBX)
 }
 
 
-# -----------------------------------------------------------------------------
-# Auth (shared with main script)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Auth
+# =============================================================================
+
 def _headers() -> dict:
+    """
+    Build Authorization + Content-Type headers for T212 API requests.
+
+    Uses Basic auth with a base64-encoded "key:secret" pair (current API format).
+    Falls back to a legacy single-token header if T212_API_SECRET is not set.
+
+    Returns:
+        dict: Headers dict ready to pass to requests.
+    """
     if T212_API_SECRET:
         token = base64.b64encode(
             f"{T212_API_KEY}:{T212_API_SECRET}".encode("ascii")
         ).decode("ascii")
-        return {"Authorization": f"Basic {token}",
-                "Content-Type": "application/json"}
-    return {"Authorization": T212_API_KEY,
-            "Content-Type": "application/json"}
+        return {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
+    return {"Authorization": T212_API_KEY, "Content-Type": "application/json"}
 
 
-# -----------------------------------------------------------------------------
-# Instrument lookup
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Instrument lookup and caching
+# =============================================================================
+
 def _load_instruments() -> list[dict]:
-    """Fetch all tradable instruments from T212, with 24h local cache."""
+    """
+    Fetch the complete list of tradable instruments from T212, with a 24h local cache.
+
+    T212 has ~17,000 instruments. Fetching them on every run is slow and unnecessary —
+    the list changes infrequently. The cache is stored in t212_instruments.json and
+    refreshed automatically when it's older than 24 hours.
+
+    Returns:
+        list[dict]: Full instrument list. Each dict has at minimum "ticker",
+                    "shortName", and "currencyCode" fields.
+
+    Raises:
+        requests.HTTPError: If the instruments endpoint returns a non-2xx status.
+    """
     if INSTRUMENTS_CACHE_PATH.exists():
         age = time.time() - INSTRUMENTS_CACHE_PATH.stat().st_mtime
-        if age < 86400:
+        if age < 86400:  # 24 hours
             with open(INSTRUMENTS_CACHE_PATH) as f:
                 return json.load(f)
 
@@ -173,21 +205,53 @@ def _load_instruments() -> list[dict]:
     return instruments
 
 
+# =============================================================================
+# Ticker parsing helpers
+# =============================================================================
+
 def _parse_yf_ticker(yf_ticker: str) -> tuple[str, str]:
-    """Split "SHEL.L" -> ("SHEL", "L"); "AAPL" -> ("AAPL", "")."""
+    """
+    Split a yfinance ticker into (root_symbol, exchange_suffix).
+
+    Examples:
+        "SHEL.L"  → ("SHEL", "L")
+        "AAPL"    → ("AAPL", "")
+        "BRK.B"   → ("BRK.B", "")   # .B is not a known exchange suffix
+        "7203.T"  → ("7203", "T")
+
+    The split happens on the LAST dot only when the suffix is a recognised
+    exchange code in YF_SUFFIX_TO_CURRENCIES. This prevents treating "BRK.B"
+    as root="BRK", suffix="B" — B is not an exchange code.
+
+    Args:
+        yf_ticker: Yahoo Finance ticker string (case-insensitive).
+
+    Returns:
+        tuple: (root_symbol, exchange_suffix). Suffix is "" for US tickers.
+    """
     upper = yf_ticker.upper().strip()
     if "." in upper:
-        # Handle BRK.B — only split on LAST dot if suffix is a known exchange
         base, suffix = upper.rsplit(".", 1)
         if suffix in YF_SUFFIX_TO_CURRENCIES:
             return base, suffix
-        # Otherwise treat the dot as part of the symbol (e.g. BRK.B)
+        # Dot is part of the symbol (e.g. BRK.B) — treat whole thing as root
         return upper, ""
     return upper, ""
 
 
 def _instrument_currency(inst: dict) -> str:
-    """Extract currency from an instrument record, tolerating field variations."""
+    """
+    Extract the currency code from a T212 instrument record.
+
+    Tolerates slight field name variations (currencyCode vs currency) that have
+    appeared across different T212 API versions.
+
+    Args:
+        inst: T212 instrument dict from the instruments list.
+
+    Returns:
+        str: Upper-cased currency code, e.g. "USD", "GBP". Empty string if absent.
+    """
     return str(
         inst.get("currencyCode")
         or inst.get("currency")
@@ -196,48 +260,82 @@ def _instrument_currency(inst: dict) -> str:
 
 
 def _instrument_root(inst: dict) -> str:
-    """Get the root symbol from a T212 ticker.
-    Handles both formats:
-      AAPL_US_EQ   -> AAPL   (standard)
-      META.US_EQ   -> META   (dot-format, some US stocks)
-      BRK.B_US_EQ  -> BRK.B (symbol contains dot)
-    Strategy: split on first underscore, then strip any exchange suffix
-    that follows a dot (e.g. .US in META.US)."""
+    """
+    Extract the root symbol from a T212 instrument's ticker string.
+
+    T212 tickers come in several formats:
+      Standard:     AAPL_US_EQ    → root "AAPL"
+      Dot-format:   META.US_EQ   → root "META"  (some US stocks)
+      Symbol-dot:   BRK.B_US_EQ  → root "BRK.B" (symbol itself contains a dot)
+      Exchange-sfx: SHELl_EQ     → root "SHEL"  (T212 appends a lowercase letter
+                    SAPd_EQ      → root "SAP"    as an exchange/listing disambiguator)
+                    VUSAl_EQ     → root "VUSA"
+
+    Key insight: T212 appends a SINGLE LOWERCASE LETTER to disambiguate different
+    exchange listings (e.g. SHELl for London Shell vs SHEL_US_EQ for NYSE Shell).
+    This letter must be stripped BEFORE uppercasing — otherwise "SHELl".upper()
+    becomes "SHELL", mangling the symbol.
+
+    Args:
+        inst: T212 instrument dict.
+
+    Returns:
+        str: Root symbol in uppercase (e.g. "SHEL", "VUSA", "BRK.B").
+    """
     ticker = inst.get("ticker", "")
-    # Get everything before the first underscore
-    root = ticker.split("_", 1)[0].upper()
-    # If root contains a dot followed by an exchange code (e.g. META.US),
-    # and it's NOT a known symbol-dot like BRK.B, strip the .EXCHANGE part
+    # Split on first underscore to get the pre-underscore part
+    raw = ticker.split("_", 1)[0]
+    # Strip T212's lowercase exchange-disambiguation suffix BEFORE uppercasing.
+    # e.g. "SHELl" → "SHEL", "SAPd" → "SAP", "VUSAl" → "VUSA"
+    # Single uppercase/digit/dot suffixes (like "BRK.B") are never stripped.
+    while raw and raw[-1].islower():
+        raw = raw[:-1]
+    root = raw.upper()
+    # Handle dot-exchange format: "META.US" → "META" (strip 2-3 char alpha suffix)
     if "." in root:
         base, suffix = root.rsplit(".", 1)
-        # Exchange suffixes are 2-3 alpha chars (US, DE, HK etc.)
-        # Symbol dots have 1-char suffixes (BRK.B) or digits (0700.HK handled above)
         if suffix.isalpha() and 2 <= len(suffix) <= 3:
             return base
     return root
 
 
-def yf_to_t212_ticker(yf_ticker: str,
-                      instruments: list[dict]) -> Optional[str]:
-    """
-    Translate a yfinance-style ticker to the correct T212 ticker.
+# =============================================================================
+# Ticker translation: yfinance → T212
+# =============================================================================
 
-    Priority:
-      1. Manual alias map
-      2. Match on shortName field (most reliable — T212's own symbol name)
-      3. Currency-based root symbol matching as fallback
+def yf_to_t212_ticker(yf_ticker: str, instruments: list[dict]) -> Optional[str]:
+    """
+    Translate a yfinance-style ticker to the correct T212 instrument ticker.
+
+    Translation pipeline (stops at first match):
+      Stage 1 — Manual alias: check TICKER_ALIASES for an exact override.
+      Stage 2 — shortName match: search instruments by T212's own "shortName" field.
+                This is the most direct — if T212 names it "AAPL", that matches "AAPL".
+                Disambiguates by currency when multiple exchanges list the same name.
+      Stage 3 — Ticker root match: find instruments whose root symbol equals the base.
+                Adds a prefix-match fallback (ticker starts with "SYMBOL_").
+      Stage 4 — Currency filter: when multiple root matches exist, keep only those
+                whose currencyCode matches the expected currency for the yfinance suffix.
+      Stage 5 — Exchange heuristic: US tickers prefer "_US_EQ" variants; non-US
+                prefer anything without "_US_" in the T212 ticker.
+
+    Args:
+        yf_ticker:   Yahoo Finance ticker (e.g. "AAPL", "SHEL.L", "SAP.DE").
+        instruments: T212 instruments list from _load_instruments().
+
+    Returns:
+        str: T212 ticker string (e.g. "AAPL_US_EQ"), or None if not found.
     """
     upper = yf_ticker.upper().strip()
 
-    # Stage 1 — manual alias
+    # Stage 1: Manual alias overrides
     if upper in TICKER_ALIASES:
         return TICKER_ALIASES[upper]
 
-    # Stage 2 — parse the yfinance ticker
     base_symbol, yf_suffix = _parse_yf_ticker(upper)
     expected_currencies = YF_SUFFIX_TO_CURRENCIES.get(yf_suffix, set())
 
-    # Stage 3 — match on shortName (T212's own symbol, most direct)
+    # Stage 2: shortName match (T212's own symbol label)
     short_matches = [
         inst for inst in instruments
         if (inst.get("shortName") or "").upper() == base_symbol
@@ -245,7 +343,6 @@ def yf_to_t212_ticker(yf_ticker: str,
     if short_matches:
         if len(short_matches) == 1:
             return short_matches[0]["ticker"]
-        # Multiple shortName matches — filter by currency
         if expected_currencies:
             currency_short = [
                 m for m in short_matches
@@ -255,10 +352,8 @@ def yf_to_t212_ticker(yf_ticker: str,
                 return currency_short[0]["ticker"]
         return short_matches[0]["ticker"]
 
-    # Stage 4 — fall back to ticker root matching
-    matches = [inst for inst in instruments
-               if _instrument_root(inst) == base_symbol]
-
+    # Stage 3: Ticker root match
+    matches = [inst for inst in instruments if _instrument_root(inst) == base_symbol]
     if not matches:
         matches = [inst for inst in instruments
                    if inst.get("ticker", "").upper().startswith(base_symbol + "_")]
@@ -271,16 +366,15 @@ def yf_to_t212_ticker(yf_ticker: str,
     if len(matches) == 1:
         return matches[0]["ticker"]
 
-    # Stage 5 — currency filter
+    # Stage 4: Currency filter
     if expected_currencies:
         currency_matches = [
-            m for m in matches
-            if _instrument_currency(m) in expected_currencies
+            m for m in matches if _instrument_currency(m) in expected_currencies
         ]
         if currency_matches:
             matches = currency_matches
 
-    # Stage 6 — exchange marker heuristic
+    # Stage 5: Exchange heuristic (US vs non-US)
     is_us = (yf_suffix == "")
     for inst in matches:
         t = inst.get("ticker", "")
@@ -293,34 +387,72 @@ def yf_to_t212_ticker(yf_ticker: str,
     return matches[0]["ticker"]
 
 
-def t212_to_yf_ticker(t212_ticker: str,
-                      instruments: list[dict]) -> Optional[str]:
+def t212_to_yf_ticker(t212_ticker: str, instruments: list[dict]) -> Optional[str]:
     """
     Reverse translation: T212 ticker → yfinance ticker.
-    Useful for price lookup on existing positions.
+
+    Used by the sync logic to convert T212 position tickers back to yfinance format
+    for price lookups and shadow ledger keying.
+
+    Strategy: find the instrument by exact T212 ticker match, then use shortName
+    (T212's current market symbol) as the yfinance root — not the ticker root.
+    This correctly handles:
+      - Renamed stocks: FB_US_EQ → "META" (shortName), not "FB" (ticker root)
+      - NatWest: RBSl_EQ → "NWG" (shortName), not "RBSL" (mangled ticker root)
+      - BHP: BLTl_EQ → "BHP" (shortName), not "BLTL" (mangled ticker root)
+
+    Currency is used to pick the yfinance exchange suffix:
+      USD → bare symbol (e.g. "META")
+      GBP/GBX → ".L" suffix (e.g. "SHEL.L")
+      EUR → ".DE" suffix (first EUR entry; other Eurozone exchanges are a known
+            limitation — not an issue for the current UK/US-focused strategy)
+
+    Args:
+        t212_ticker:  T212 ticker string (e.g. "AAPL_US_EQ", "SHELl_EQ", "FB_US_EQ").
+        instruments:  T212 instruments list from _load_instruments().
+
+    Returns:
+        str: yfinance ticker (e.g. "AAPL", "SHEL.L", "META"), or None if not found.
     """
     for inst in instruments:
         if inst.get("ticker", "").upper() == t212_ticker.upper():
-            root = _instrument_root(inst)
-            currency = _instrument_currency(inst)
-            # Find the yfinance suffix that matches this currency
+            # Prefer shortName (current market symbol) over ticker root.
+            # shortName is the live, correct symbol; the ticker root can be stale
+            # for renamed companies (e.g. FB→META, RBS→NWG, BLT→BHP).
+            short_name = (inst.get("shortName") or "").upper().strip()
+            root       = short_name if short_name else _instrument_root(inst)
+            currency   = _instrument_currency(inst)
             for suffix, currencies in YF_SUFFIX_TO_CURRENCIES.items():
                 if currency in currencies:
                     return f"{root}.{suffix}" if suffix else root
-            return root  # Unknown currency — just return the root
+            return root  # Unknown currency — return symbol without suffix
     return None
 
 
-# -----------------------------------------------------------------------------
-# Account state
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Account state queries
+# =============================================================================
+
 def get_pending_buy_tickers(instruments: list[dict], t212_to_yf_fn) -> set[str]:
     """
     Return yfinance tickers that have an open (unfilled) buy order in T212.
 
-    Used by sync_from_t212 to avoid removing positions whose T212 order was
-    placed outside market hours and is merely queued, not failed.
-    Returns empty set on any API error so callers degrade gracefully.
+    Used by sync_from_t212 to avoid removing positions whose T212 buy order was
+    placed outside market hours. The order is queued, not failed — the shadow
+    position is correct and should be kept.
+
+    Terminal statuses (FILLED, CANCELLED, CANCELLING, REJECTED, REPLACED) are
+    excluded — only truly open orders count as "pending".
+
+    On any API error, returns an empty set so the caller degrades gracefully
+    (the sync will be conservative rather than crashing the run).
+
+    Args:
+        instruments:    T212 instruments list for reverse ticker translation.
+        t212_to_yf_fn:  Callable(t212_ticker) -> yfinance_ticker.
+
+    Returns:
+        set[str]: yfinance tickers with pending buy orders. Empty set on error.
     """
     try:
         r = requests.get(
@@ -341,7 +473,7 @@ def get_pending_buy_tickers(instruments: list[dict], t212_to_yf_fn) -> set[str]:
     for order in orders:
         if not isinstance(order, dict):
             continue
-        side = (order.get("side") or "").upper()
+        side   = (order.get("side") or "").upper()
         status = (order.get("status") or "").upper()
         if "BUY" not in side or status in terminal:
             continue
@@ -358,7 +490,19 @@ def get_pending_buy_tickers(instruments: list[dict], t212_to_yf_fn) -> set[str]:
 
 
 def get_t212_positions_map() -> dict[str, dict]:
-    """Returns {t212_ticker: position_data} for all open positions."""
+    """
+    Fetch all open T212 positions and return them keyed by T212 ticker.
+
+    Used during order execution to look up current quantities for SELL/TRIM
+    orders — we need to know how many shares are actually held before placing
+    a sell order.
+
+    Returns:
+        dict: {t212_ticker: position_data_dict} for all open positions.
+
+    Raises:
+        requests.HTTPError: If the /equity/positions endpoint returns non-2xx.
+    """
     r = requests.get(
         f"{T212_BASE_URL}/equity/positions",
         headers=_headers(), timeout=20,
@@ -369,7 +513,6 @@ def get_t212_positions_map() -> dict[str, dict]:
     for p in positions:
         if not isinstance(p, dict):
             continue
-        # T212 API returns flat {"ticker": ...} or nested {"instrument": {"ticker": ...}}
         ticker = (
             p["instrument"]["ticker"] if "instrument" in p
             else p.get("ticker", "")
@@ -379,17 +522,98 @@ def get_t212_positions_map() -> dict[str, dict]:
     return result
 
 
-# -----------------------------------------------------------------------------
-# Orders
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Order placement
+# =============================================================================
+
+def _place_market_order(t212_ticker: str, quantity: float) -> dict:
+    """
+    Place a market order on T212.
+
+    Positive quantity = BUY, negative quantity = SELL. The extendedHours flag
+    allows orders to queue for the next market open when placed outside trading
+    hours — without it, out-of-hours orders would be rejected.
+
+    Args:
+        t212_ticker: T212 instrument ticker string (e.g. "AAPL_US_EQ").
+        quantity:    Number of shares. Positive for buy, negative for sell.
+
+    Returns:
+        dict: T212 order response JSON (includes "id" and "status" fields).
+
+    Raises:
+        requests.HTTPError: If T212 rejects the order (e.g. 404 bad ticker,
+                            400 insufficient funds, 429 rate limit).
+    """
+    qty = round(abs(quantity), 4)
+    if quantity < 0:
+        qty = -qty
+    payload = {
+        "ticker":        t212_ticker,
+        "quantity":      qty,
+        "extendedHours": True,
+    }
+    r = requests.post(
+        f"{T212_BASE_URL}/equity/orders/market",
+        headers=_headers(),
+        json=payload,
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+# =============================================================================
+# Input validation
+# =============================================================================
+
+def _is_valid_ticker(yf_ticker: str) -> bool:
+    """
+    Reject obviously malformed ticker strings before attempting translation.
+
+    Guards against Claude occasionally outputting garbled tickers like "BA..L"
+    (double dots), empty strings, or excessively long strings that would never
+    match anything in T212's catalogue.
+
+    Args:
+        yf_ticker: Ticker string to validate (from Claude's JSON output).
+
+    Returns:
+        bool: True if the ticker looks plausibly valid, False to skip it.
+    """
+    if not yf_ticker or len(yf_ticker) > 15:
+        return False
+    t = yf_ticker.upper().strip()
+    if ".." in t:
+        return False
+    for c in t:
+        if not (c.isalnum() or c in ".-"):
+            return False
+    return True
+
+
+# =============================================================================
+# Order execution helpers
+# =============================================================================
+
 def _search_translate(yf_ticker: str, instruments: list[dict]) -> Optional[str]:
-    """Translation using only the search logic, bypassing aliases.
-    Used as fallback when an alias returns 404."""
+    """
+    Translate using the search logic only, bypassing the TICKER_ALIASES map.
+
+    Used as a fallback when an alias ticker returns 404 from T212 — maybe the
+    alias is stale. We try the instrument search directly instead.
+
+    Args:
+        yf_ticker:   yfinance ticker string.
+        instruments: T212 instruments list.
+
+    Returns:
+        str: T212 ticker, or None if no match found.
+    """
     upper = yf_ticker.upper().strip()
     base_symbol, yf_suffix = _parse_yf_ticker(upper)
     expected_currencies = YF_SUFFIX_TO_CURRENCIES.get(yf_suffix, set())
-    matches = [inst for inst in instruments
-               if _instrument_root(inst) == base_symbol]
+    matches = [inst for inst in instruments if _instrument_root(inst) == base_symbol]
     if not matches:
         return None
     if len(matches) == 1:
@@ -409,56 +633,139 @@ def _search_translate(yf_ticker: str, instruments: list[dict]) -> Optional[str]:
     return matches[0]["ticker"]
 
 
-def _place_market_order(t212_ticker: str, quantity: float) -> dict:
-    """Market order. Positive quantity = BUY, negative = SELL."""
-    qty = round(abs(quantity), 4)
-    if quantity < 0:
-        qty = -qty
-    payload = {
-        "ticker": t212_ticker,
-        "quantity": qty,
-        "extendedHours": True,
-    }
-    r = requests.post(
-        f"{T212_BASE_URL}/equity/orders/market",
-        headers=_headers(),
-        json=payload,
-        timeout=20,
+def _execute_buy(rec: dict, yf_ticker: str, t212_ticker: str,
+                 instruments: list, events: list, confirmed_recs: list) -> None:
+    """
+    Execute a single BUY recommendation as a T212 market order.
+
+    Calculates the share quantity from the GBP amount and current price, places
+    the order, and on success appends to both events and confirmed_recs.
+    Includes a 404 retry: if the T212 ticker came from an alias and returned 404,
+    falls back to instrument search to find the correct ticker.
+
+    A 1.2s sleep between orders prevents T212 rate-limiting on bulk runs.
+
+    Args:
+        rec:           Recommendation dict from Claude.
+        yf_ticker:     yfinance ticker (for price lookup and error messages).
+        t212_ticker:   T212 ticker (from yf_to_t212_ticker).
+        instruments:   T212 instruments list (for alias-404 fallback search).
+        events:        List to append human-readable result strings to.
+        confirmed_recs: List to append successful recs to (for shadow mirroring).
+    """
+    amount_gbp = float(rec.get("amount_gbp") or 0)
+    if amount_gbp <= 0:
+        events.append(f"SKIP BUY {yf_ticker}: no amount specified")
+        return
+
+    price_gbp = fetch_price_gbp(yf_ticker)
+    if not price_gbp or price_gbp <= 0:
+        events.append(f"SKIP BUY {yf_ticker}: couldn't fetch price")
+        return
+
+    shares = amount_gbp / price_gbp
+    effective_t212_ticker = t212_ticker
+
+    try:
+        result = _place_market_order(t212_ticker, shares)
+    except requests.HTTPError as e:
+        # If the alias returned 404, try searching the instrument list directly
+        if e.response.status_code == 404 and yf_ticker.upper() in TICKER_ALIASES:
+            print(f"  ! Alias {t212_ticker} returned 404, retrying with instrument search...")
+            fallback = _search_translate(yf_ticker, instruments)
+            if fallback:
+                effective_t212_ticker = fallback
+                result = _place_market_order(fallback, shares)
+            else:
+                events.append(f"SKIP BUY {yf_ticker}: alias 404 and search found nothing")
+                return
+        else:
+            raise  # Re-raise for the outer try/except in execute_recommendations
+
+    events.append(
+        f"T212 BUY {shares:.4f} {effective_t212_ticker} "
+        f"(order {result.get('id', '?')})"
     )
-    r.raise_for_status()
-    return r.json()
+    confirmed_recs.append(rec)
+    time.sleep(1.2)  # Rate-limit guard between orders
 
 
-# -----------------------------------------------------------------------------
-# Input validation
-# -----------------------------------------------------------------------------
-def _is_valid_ticker(yf_ticker: str) -> bool:
-    """Reject obviously malformed tickers (double dots, weird chars, etc.)."""
-    if not yf_ticker or len(yf_ticker) > 15:
-        return False
-    t = yf_ticker.upper().strip()
-    # Reject double dots (e.g. "BA..L")
-    if ".." in t:
-        return False
-    # Must be alphanumeric plus dots/hyphens only
-    for c in t:
-        if not (c.isalnum() or c in ".-"):
-            return False
-    return True
+def _execute_sell_or_trim(rec: dict, yf_ticker: str, t212_ticker: str,
+                           action: str, positions_map: dict,
+                           events: list, confirmed_recs: list) -> None:
+    """
+    Execute a single SELL or TRIM recommendation as a T212 market order.
+
+    Looks up the current quantity held in T212, computes the shares to sell
+    (100% for SELL, trim_pct% for TRIM), places a negative-quantity market order,
+    and on success appends to events and confirmed_recs.
+
+    Args:
+        rec:           Recommendation dict from Claude.
+        yf_ticker:     yfinance ticker (for error messages).
+        t212_ticker:   T212 ticker (for order placement + positions_map lookup).
+        action:        "SELL" or "TRIM".
+        positions_map: {t212_ticker: position_dict} from get_t212_positions_map().
+        events:        List to append human-readable result strings to.
+        confirmed_recs: List to append successful recs to (for shadow mirroring).
+    """
+    pos = positions_map.get(t212_ticker)
+    if not pos:
+        events.append(
+            f"SKIP {action} {yf_ticker}: "
+            f"no T212 position found for {t212_ticker}"
+        )
+        return
+
+    held = float(pos.get("quantity", 0))
+    if held <= 0:
+        events.append(f"SKIP {action} {yf_ticker}: zero quantity held")
+        return
+
+    qty_to_sell = (
+        held if action == "SELL"
+        else held * (float(rec.get("trim_pct") or 50) / 100)
+    )
+    result = _place_market_order(t212_ticker, -qty_to_sell)
+    events.append(
+        f"T212 {action} {qty_to_sell:.4f} {t212_ticker} "
+        f"(order {result.get('id', '?')})"
+    )
+    confirmed_recs.append(rec)
+    time.sleep(1.2)  # Rate-limit guard between orders
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Main entry point
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
     """
-    Mirror recommendations as real T212 demo orders.
+    Mirror Claude's recommendations as real T212 demo market orders.
 
-    Returns (events, confirmed_recs). confirmed_recs contains only the recs
-    T212 successfully accepted — shadow must apply these only, to prevent drift
-    when T212 fails (e.g. insufficient funds, ticker not found).
+    Returns (events, confirmed_recs). confirmed_recs contains ONLY the
+    recommendations T212 successfully accepted — shadow must apply only these,
+    not the full rec list. This prevents ledger drift when T212 rejects an order
+    (e.g. insufficient funds, bad ticker, market closed).
 
-    When T212_DEMO_EXECUTE=false, returns ([], all_recs) so shadow applies everything.
+    When T212_DEMO_EXECUTE=false: returns ([], all_recs) so shadow applies
+    everything regardless, running in paper-only mode.
+
+    Safety guard: refuses to execute if T212_ENV=live and T212_DEMO_EXECUTE=true —
+    live execution requires explicitly setting T212_ENV=live AND understanding the risk.
+
+    For each recommendation:
+      1. Validate the ticker format (rejects malformed strings like "BA..L").
+      2. Translate yfinance → T212 ticker via yf_to_t212_ticker().
+      3. Delegate to _execute_buy() or _execute_sell_or_trim().
+      4. Catch HTTPError and generic exceptions per-rec so one failure doesn't
+         abort the entire run.
+
+    Args:
+        recs: List of recommendation dicts from extract_recommendations().
+
+    Returns:
+        tuple: (events list of str, confirmed_recs list of dict)
     """
     if not T212_DEMO_EXECUTE:
         return [], list(recs)
@@ -470,11 +777,11 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
 
     events: list[str] = []
     confirmed_recs: list[dict] = []
-    instruments = _load_instruments()
+    instruments   = _load_instruments()
     positions_map = get_t212_positions_map()
 
     for rec in recs:
-        action = rec.get("action", "").upper().strip()
+        action    = rec.get("action", "").upper().strip()
         yf_ticker = (rec.get("yfinance_ticker") or rec.get("ticker") or "").strip()
         if not yf_ticker or action not in ("BUY", "SELL", "TRIM"):
             continue
@@ -490,64 +797,11 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
 
         try:
             if action == "BUY":
-                amount_gbp = float(rec.get("amount_gbp") or 0)
-                if amount_gbp <= 0:
-                    events.append(f"SKIP BUY {yf_ticker}: no amount specified")
-                    continue
-                price_gbp = fetch_price_gbp(yf_ticker)
-                if not price_gbp or price_gbp <= 0:
-                    events.append(f"SKIP BUY {yf_ticker}: couldn't fetch price")
-                    continue
-                shares = amount_gbp / price_gbp
-                order_placed = False
-                try:
-                    result = _place_market_order(t212_ticker, shares)
-                    order_placed = True
-                except requests.HTTPError as e:
-                    if e.response.status_code == 404 and yf_ticker.upper() in TICKER_ALIASES:
-                        print(f"  ! Alias {t212_ticker} returned 404, "
-                              f"retrying with instrument search...")
-                        t212_ticker = _search_translate(yf_ticker, instruments)
-                        if t212_ticker:
-                            result = _place_market_order(t212_ticker, shares)
-                            order_placed = True
-                        else:
-                            events.append(f"SKIP BUY {yf_ticker}: "
-                                          f"alias 404 and search found nothing")
-                            continue
-                    else:
-                        raise
-                if order_placed:
-                    events.append(
-                        f"T212 BUY {shares:.4f} {t212_ticker} "
-                        f"(order {result.get('id', '?')})"
-                    )
-                    confirmed_recs.append(rec)
-                    time.sleep(1.2)
-
-            elif action in ("SELL", "TRIM"):
-                pos = positions_map.get(t212_ticker)
-                if not pos:
-                    events.append(
-                        f"SKIP {action} {yf_ticker}: "
-                        f"no T212 position found for {t212_ticker}"
-                    )
-                    continue
-                held = float(pos.get("quantity", 0))
-                if held <= 0:
-                    events.append(f"SKIP {action} {yf_ticker}: zero quantity held")
-                    continue
-                qty_to_sell = (
-                    held if action == "SELL"
-                    else held * (float(rec.get("trim_pct") or 50) / 100)
-                )
-                result = _place_market_order(t212_ticker, -qty_to_sell)
-                events.append(
-                    f"T212 {action} {qty_to_sell:.4f} {t212_ticker} "
-                    f"(order {result.get('id', '?')})"
-                )
-                confirmed_recs.append(rec)
-                time.sleep(1.2)
+                _execute_buy(rec, yf_ticker, t212_ticker, instruments,
+                             events, confirmed_recs)
+            else:
+                _execute_sell_or_trim(rec, yf_ticker, t212_ticker, action,
+                                      positions_map, events, confirmed_recs)
 
         except requests.HTTPError as e:
             events.append(

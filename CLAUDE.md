@@ -90,10 +90,16 @@ BENCHMARK_TICKER=VUSA.L   # Vanguard S&P 500 GBP ETF
 
 ## Known ticker issues
 
-- **META**: Has never successfully executed on T212 demo. Ticker not found in
-  instrument list under any variant tried. If Claude recommends META, T212 will
-  skip it and the bidirectional sync will remove it from shadow next run.
-  Do not waste time retrying META — it appears to be unavailable on T212 demo.
+- **META**: T212 lists Meta Platforms under the old Facebook ticker `FB_US_EQ`
+  (shortName="META", ISIN US30303M1027). This is confirmed tradable on demo.
+  The alias `"META": "FB_US_EQ"` is now hardcoded in `TICKER_ALIASES` so
+  translation is explicit and reliable. Previous failures were due to an older
+  version of the translation code before the alias and shortName matching were added.
+
+- **NWG.L / BHP.L**: T212 uses old tickers `RBSl_EQ` (NatWest) and `BLTl_EQ`
+  (BHP). The `shortName` field correctly shows "NWG" / "BHP" so forward
+  translation works. If these are ever recommended, add them to `TICKER_ALIASES`
+  to make it explicit.
 
 ## Shadow vs T212 sync — the core design
 
