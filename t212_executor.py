@@ -596,6 +596,75 @@ def _is_valid_ticker(yf_ticker: str) -> bool:
 # Order execution helpers
 # =============================================================================
 
+def _get_available_cash() -> float:
+    """
+    Fetch the current available-to-trade cash balance from T212.
+
+    Called at the start of execute_recommendations to seed the expected-cash
+    budget tracker. Returns 0.0 on any API error so callers degrade gracefully.
+
+    Returns:
+        float: Available cash in GBP, or 0.0 on error.
+    """
+    try:
+        r = requests.get(
+            f"{T212_BASE_URL}/equity/account/summary",
+            headers=_headers(), timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return float(
+            data.get("cash", {}).get("availableToTrade")
+            or data.get("free")
+            or 0
+        )
+    except Exception as e:
+        print(f"  ! Couldn't fetch available cash for budget tracking: {e}")
+        return 0.0
+
+
+def _estimate_sell_proceeds_gbp(rec: dict, t212_ticker: str,
+                                 positions_map: dict) -> float:
+    """
+    Estimate the GBP proceeds from a SELL or TRIM order before it is placed.
+
+    Used to update the expected-cash budget so subsequent BUY orders can be
+    validated against post-sell funds, not just the current pre-sell balance.
+
+    Uses walletImpact.currentValue (already in GBP) from the T212 position
+    data — no FX conversion needed. Returns 0.0 if the position isn't found
+    or data is incomplete, so budget tracking degrades conservatively.
+
+    Args:
+        rec:           Recommendation dict (needs "action" and optionally "trim_pct").
+        t212_ticker:   T212 ticker string for the position to look up.
+        positions_map: {t212_ticker: position_dict} from get_t212_positions_map().
+
+    Returns:
+        float: Estimated GBP proceeds, or 0.0 if unknown.
+    """
+    pos = positions_map.get(t212_ticker)
+    if not pos:
+        return 0.0
+    held = float(pos.get("quantity") or 0)
+    if held <= 0:
+        return 0.0
+
+    action = rec.get("action", "").upper().strip()
+    qty_to_sell = (
+        held if action == "SELL"
+        else held * (float(rec.get("trim_pct") or 50) / 100)
+    )
+
+    # walletImpact.currentValue is the full position's current value in GBP
+    wallet = pos.get("walletImpact", {}) or {}
+    current_value_gbp = float(wallet.get("currentValue") or 0)
+    if current_value_gbp > 0 and held > 0:
+        return current_value_gbp * (qty_to_sell / held)
+
+    return 0.0
+
+
 def _search_translate(yf_ticker: str, instruments: list[dict]) -> Optional[str]:
     """
     Translate using the search logic only, bypassing the TICKER_ALIASES map.
@@ -751,15 +820,21 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
     When T212_DEMO_EXECUTE=false: returns ([], all_recs) so shadow applies
     everything regardless, running in paper-only mode.
 
-    Safety guard: refuses to execute if T212_ENV=live and T212_DEMO_EXECUTE=true —
-    live execution requires explicitly setting T212_ENV=live AND understanding the risk.
+    Safety guard: refuses to execute if T212_ENV=live and T212_DEMO_EXECUTE=true.
 
-    For each recommendation:
-      1. Validate the ticker format (rejects malformed strings like "BA..L").
-      2. Translate yfinance → T212 ticker via yf_to_t212_ticker().
-      3. Delegate to _execute_buy() or _execute_sell_or_trim().
-      4. Catch HTTPError and generic exceptions per-rec so one failure doesn't
-         abort the entire run.
+    Execution order:
+      All SELL/TRIM orders are placed before any BUY orders, regardless of the
+      order Claude listed them. This is critical for out-of-hours runs where T212
+      queues all orders for the next market open: sells must be queued first so
+      their proceeds are available before buys execute at market open.
+
+      A running "expected_cash" budget is maintained:
+        - Starts at the current T212 available balance.
+        - Each confirmed SELL/TRIM adds estimated GBP proceeds.
+        - Each BUY pre-validates against expected_cash before being attempted,
+          and deducts on success.
+      This prevents pointless 400 "insufficient funds" errors on buys that would
+      only fail because sell proceeds haven't settled yet at placement time.
 
     Args:
         recs: List of recommendation dicts from extract_recommendations().
@@ -780,7 +855,20 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
     instruments   = _load_instruments()
     positions_map = get_t212_positions_map()
 
-    for rec in recs:
+    # Sort: all SELL/TRIM before BUY, preserving relative order within each group.
+    # This guarantees sell orders are queued first so they execute at market open
+    # before any buys, making their proceeds available for the buy orders.
+    ordered_recs = sorted(
+        recs,
+        key=lambda r: 0 if r.get("action", "").upper().strip() in ("SELL", "TRIM") else 1
+    )
+
+    # Seed the expected-cash budget from the current T212 available balance.
+    # This is updated as each sell is confirmed (+proceeds) and each buy succeeds (-amount).
+    expected_cash = _get_available_cash()
+    print(f"  T212 available cash for order budget: £{expected_cash:.2f}")
+
+    for rec in ordered_recs:
         action    = rec.get("action", "").upper().strip()
         yf_ticker = (rec.get("yfinance_ticker") or rec.get("ticker") or "").strip()
         if not yf_ticker or action not in ("BUY", "SELL", "TRIM"):
@@ -796,12 +884,34 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
             continue
 
         try:
-            if action == "BUY":
-                _execute_buy(rec, yf_ticker, t212_ticker, instruments,
-                             events, confirmed_recs)
-            else:
+            if action in ("SELL", "TRIM"):
+                # Estimate proceeds before placing so budget is updated if the order succeeds
+                proceeds_estimate = _estimate_sell_proceeds_gbp(rec, t212_ticker, positions_map)
+                prev_confirmed = len(confirmed_recs)
                 _execute_sell_or_trim(rec, yf_ticker, t212_ticker, action,
                                       positions_map, events, confirmed_recs)
+                if len(confirmed_recs) > prev_confirmed:
+                    expected_cash += proceeds_estimate
+                    print(f"  Budget after {action} {yf_ticker}: "
+                          f"£{expected_cash:.2f} (+£{proceeds_estimate:.2f} estimated)")
+
+            else:  # BUY
+                amount_gbp = float(rec.get("amount_gbp") or 0)
+                # Pre-validate against expected post-sell cash before hitting the T212 API.
+                # Avoids a guaranteed 400 when the buy clearly exceeds available funds.
+                if amount_gbp > 0 and expected_cash < amount_gbp - 0.01:
+                    events.append(
+                        f"SKIP BUY {yf_ticker}: insufficient funds after sells "
+                        f"(need £{amount_gbp:.2f}, expected £{expected_cash:.2f})"
+                    )
+                    continue
+                prev_confirmed = len(confirmed_recs)
+                _execute_buy(rec, yf_ticker, t212_ticker, instruments,
+                             events, confirmed_recs)
+                if len(confirmed_recs) > prev_confirmed:
+                    expected_cash -= amount_gbp
+                    print(f"  Budget after BUY {yf_ticker}: "
+                          f"£{expected_cash:.2f} (-£{amount_gbp:.2f})")
 
         except requests.HTTPError as e:
             events.append(

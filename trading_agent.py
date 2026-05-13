@@ -289,6 +289,12 @@ investor who runs a small experimental portfolio (~£5,000) on Trading 212.
   one position at a time. A fresh £5,000 portfolio should be 70–80% invested
   within the first two runs.
 - Each individual BUY should be £400–£1,250. No smaller, no larger.
+- IMPORTANT — settlement constraint: sell proceeds are NOT available for buys
+  in the same run. Orders are queued for market open; the cash from a sell only
+  becomes available AFTER it executes. Size your BUY amounts to fit within the
+  CURRENT available cash only, ignoring any proceeds from sells you recommend
+  this week. If you want to sell-and-reinvest, the reinvestment happens the
+  following week.
 - If you cannot find enough conviction buys to deploy the cash, say so
   explicitly in section 5 — but this should be rare. There are always
   fundamentally sound stocks available somewhere.
