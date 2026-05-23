@@ -128,11 +128,15 @@ permanently until next week's sync cleaned it out).
 
 ## Strategy constraints (baked into Claude prompt)
 
+All sizing rules are percentage-based so they scale as the portfolio grows.
+
 - Fundamentals only — no technical/momentum signals
 - 5–10 concentrated positions
-- Max 25% per position (~£1,250 at £5k scale)
-- Cash reserve 5–15% (£250–£750) — uninvested cash is a deliberate choice
-- Minimum position size ~£400
+- Max 25% of total portfolio value per position
+- Cash reserve 5–15% of total portfolio value — uninvested cash is a deliberate choice
+- Deploy trigger: cash > 15% → must buy
+- Minimum position size: 8% of total portfolio value (scales with portfolio)
+- Each buy: 8–25% of total portfolio value
 - Holding period: weeks to months
 - Universe: UK/US listed stocks and ETFs on Trading 212
 - Benchmark: VUSA.L (Vanguard S&P 500 GBP)
