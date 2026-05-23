@@ -23,7 +23,7 @@ sync_watch.py          — file watcher for the old zip-based sync workflow (ign
 # Activate venv first
 venv\Scripts\activate
 
-# Weekly run (what Task Scheduler does every Sunday at 18:00)
+# Weekly run (what Task Scheduler does every Monday at 10:00)
 python trading_agent.py
 
 # Force a monthly deep review alongside the weekly run

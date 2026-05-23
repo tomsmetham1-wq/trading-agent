@@ -715,14 +715,14 @@ def run_deep_review(ledger: dict, valuation: dict) -> str:
     return call_claude(prompt, model=CLAUDE_MODEL_DEEP)
 
 
-def is_first_sunday_of_month(d: datetime) -> bool:
+def is_first_monday_of_month(d: datetime) -> bool:
     """
-    Return True if d falls on the first Sunday of its month.
+    Return True if d falls on the first Monday of its month.
 
     Used to automatically trigger the monthly deep review without needing the
     --deep-review flag — Task Scheduler only needs to run one command.
     """
-    return d.weekday() == 6 and d.day <= 7
+    return d.weekday() == 0 and d.day <= 7
 
 
 def fetch_deep_review_price_map() -> dict:
@@ -1074,7 +1074,7 @@ def main() -> None:
 
     run_weekly(started)
 
-    if args.deep_review or is_first_sunday_of_month(started):
+    if args.deep_review or is_first_monday_of_month(started):
         print("  Running monthly deep review...")
         run_monthly_deep_review(started)
 
