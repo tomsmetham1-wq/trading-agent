@@ -756,6 +756,8 @@ def snapshot(ledger: dict, val: dict, run_date: str) -> None:
         val:      Valuation dict from valuation().
         run_date: ISO date string (YYYY-MM-DD) for the snapshot label.
     """
+    if ledger["weekly_snapshots"] and ledger["weekly_snapshots"][-1]["date"] == run_date:
+        return
     ledger["weekly_snapshots"].append({
         "date":                 run_date,
         "total_value_gbp":      val["total_value_gbp"],

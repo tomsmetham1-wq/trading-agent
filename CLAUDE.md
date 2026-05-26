@@ -147,7 +147,7 @@ All sizing rules are percentage-based so they scale as the portfolio grows.
   prose report + JSON recommendations block
 - **Monthly (Opus)**: strategic critique of the agent itself — not picking new
   trades, but reviewing whether the strategy/reasoning is sound. Runs on first
-  Sunday of each month, or with `--deep-review` flag.
+  Monday of each month, or with `--deep-review` flag.
 
 ## Current portfolio state (as of 2026-05-10)
 
