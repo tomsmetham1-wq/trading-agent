@@ -813,6 +813,10 @@ def build_weekly_email_body(started: datetime, post_val: dict,
             f" since {prev_snapshot['date']}"
         )
 
+    attribution = sp.format_attribution_for_email(post_val)
+    if attribution:
+        perf_section += "\n\n" + attribution
+
     t212_section = (
         f"=== T212 Demo Account ===\n"
         f"  Account value:  £{t212_total:.2f}\n"
@@ -1011,13 +1015,13 @@ def run_weekly(started: datetime) -> None:
 
     # Step 7: Post-trade valuation, persist ledger with snapshot
     prev_snapshot = (ledger.get("weekly_snapshots") or [None])[-1]
+    t212_total, _ = extract_t212_totals(t212_cash)
     post_val = sp.valuation(ledger, t212_price_map=t212_price_map)
-    sp.snapshot(ledger, post_val, run_date)
+    sp.snapshot(ledger, post_val, run_date, t212_total_gbp=t212_total)
     sp.save_ledger(ledger)
 
     # Step 8: Build and send the weekly email
     prose = strip_json_block(response)
-    t212_total, _ = extract_t212_totals(t212_cash)
     body = build_weekly_email_body(
         started, post_val, t212_cash, t212_positions, shadow_events, t212_events, prose,
         prev_snapshot=prev_snapshot,

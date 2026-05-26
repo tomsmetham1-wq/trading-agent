@@ -480,8 +480,13 @@ def apply_recommendations(ledger: dict, recs: list, run_date: str) -> list[str]:
         if not ticker or action not in ("BUY", "SELL", "TRIM"):
             continue
 
-        # Fetch price once here — both _apply_buy and _apply_sell_or_trim need it
-        price = fetch_price_gbp(ticker)
+        # For BUY: use T212 actual fill price if available (most accurate cost basis).
+        # _fill_price_native/_fill_price_currency are injected by t212_executor when
+        # the order response contains a fill price. Falls back to yfinance otherwise.
+        if action == "BUY" and rec.get("_fill_price_native") and rec.get("_fill_price_currency"):
+            price = _native_to_gbp(rec["_fill_price_native"], rec["_fill_price_currency"])
+        else:
+            price = fetch_price_gbp(ticker)
         if price is None:
             events.append(f"SKIP {action} {ticker}: no price available")
             continue
@@ -743,7 +748,8 @@ def valuation(ledger: dict, t212_price_map: Optional[dict] = None) -> dict:
 # Snapshots and reporting
 # =============================================================================
 
-def snapshot(ledger: dict, val: dict, run_date: str) -> None:
+def snapshot(ledger: dict, val: dict, run_date: str,
+             t212_total_gbp: float = None) -> None:
     """
     Append a weekly valuation snapshot to the ledger for long-term tracking.
 
@@ -752,13 +758,14 @@ def snapshot(ledger: dict, val: dict, run_date: str) -> None:
     benchmark consistently or just got lucky on one trade.
 
     Args:
-        ledger:   Shadow portfolio ledger dict. Mutated in-place.
-        val:      Valuation dict from valuation().
-        run_date: ISO date string (YYYY-MM-DD) for the snapshot label.
+        ledger:          Shadow portfolio ledger dict. Mutated in-place.
+        val:             Valuation dict from valuation().
+        run_date:        ISO date string (YYYY-MM-DD) for the snapshot label.
+        t212_total_gbp:  T212 account total value in GBP, for shadow vs T212 tracking.
     """
     if ledger["weekly_snapshots"] and ledger["weekly_snapshots"][-1]["date"] == run_date:
         return
-    ledger["weekly_snapshots"].append({
+    entry = {
         "date":                 run_date,
         "total_value_gbp":      val["total_value_gbp"],
         "total_return_pct":     val["total_return_pct"],
@@ -766,7 +773,10 @@ def snapshot(ledger: dict, val: dict, run_date: str) -> None:
         "vs_benchmark_pct":     val["vs_benchmark_pct"],
         "position_count":       len(val["positions"]),
         "positions":            sorted(val["positions"].keys()),
-    })
+    }
+    if t212_total_gbp is not None:
+        entry["t212_total_gbp"] = round(t212_total_gbp, 2)
+    ledger["weekly_snapshots"].append(entry)
 
 
 def build_thesis_review(ledger: dict, current_val: dict) -> str:
@@ -832,6 +842,45 @@ def build_thesis_review(ledger: dict, current_val: dict) -> str:
         "or is still pending. This is your primary accountability check.\n"
     )
 
+    return "\n".join(lines)
+
+
+def format_attribution_for_email(val: dict) -> str:
+    """
+    Format a per-position P&L attribution table for the weekly email.
+
+    Shows each position sorted by total P&L contribution (highest first), with
+    portfolio weight, absolute P&L, P&L %, and contribution in percentage points
+    relative to starting capital. Contribution points sum to the total return pts
+    from equities (cash drag excluded).
+
+    Args:
+        val: Valuation dict from valuation().
+
+    Returns:
+        str: Multi-line attribution table, or empty string if no priced positions.
+    """
+    positions = {
+        t: p for t, p in val["positions"].items()
+        if p.get("pnl_gbp") is not None and p.get("current_value_gbp") is not None
+    }
+    if not positions:
+        return ""
+
+    start = val.get("starting_capital_gbp") or 1
+    total = val.get("total_value_gbp") or 1
+
+    sorted_pos = sorted(positions.items(), key=lambda x: x[1]["pnl_gbp"], reverse=True)
+
+    lines = ["Position attribution (vs entry cost):"]
+    for ticker, p in sorted_pos:
+        weight  = p["current_value_gbp"] / total * 100
+        contrib = p["pnl_gbp"] / start * 100
+        lines.append(
+            f"  {ticker:<6}  £{p['current_value_gbp']:>8.2f} ({weight:>4.1f}%)  "
+            f"P&L: £{p['pnl_gbp']:>+8.2f} ({p['pnl_pct']:>+6.2f}%)  "
+            f"contrib: {contrib:>+5.2f}pts"
+        )
     return "\n".join(lines)
 
 

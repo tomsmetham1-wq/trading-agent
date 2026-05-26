@@ -719,7 +719,30 @@ def _execute_buy(rec: dict, yf_ticker: str, t212_ticker: str,
         f"T212 BUY {shares:.4f} {effective_t212_ticker} "
         f"(order {result.get('id', '?')})"
     )
-    confirmed_recs.append(rec)
+
+    # Inject fill price into the rec so shadow can use the actual execution price
+    # as cost basis rather than a fresh yfinance quote. Market-hours orders fill
+    # immediately and include a price; out-of-hours (queued) orders typically don't.
+    rec_to_confirm = {**rec}
+    fill_price_native = (
+        result.get("fillPrice")
+        or result.get("filledPrice")
+        or result.get("averagePrice")
+        or result.get("price")
+    )
+    if fill_price_native:
+        currency = next(
+            (
+                (inst.get("currencyCode") or inst.get("currency") or "USD").upper()
+                for inst in instruments
+                if inst.get("ticker") == effective_t212_ticker
+            ),
+            "USD",
+        )
+        rec_to_confirm["_fill_price_native"]   = float(fill_price_native)
+        rec_to_confirm["_fill_price_currency"] = currency
+
+    confirmed_recs.append(rec_to_confirm)
     time.sleep(1.2)  # Rate-limit guard between orders
 
 
