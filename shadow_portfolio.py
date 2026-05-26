@@ -482,10 +482,12 @@ def apply_recommendations(ledger: dict, recs: list, run_date: str) -> list[str]:
 
         # For BUY: use T212 actual fill price if available (most accurate cost basis).
         # _fill_price_native/_fill_price_currency are injected by t212_executor when
-        # the order response contains a fill price. Falls back to yfinance otherwise.
+        # the order response contains a fill price. Falls back to yfinance if the fill
+        # price is absent or if FX conversion fails (e.g. rate temporarily unavailable).
+        price = None
         if action == "BUY" and rec.get("_fill_price_native") and rec.get("_fill_price_currency"):
             price = _native_to_gbp(rec["_fill_price_native"], rec["_fill_price_currency"])
-        else:
+        if price is None:
             price = fetch_price_gbp(ticker)
         if price is None:
             events.append(f"SKIP {action} {ticker}: no price available")

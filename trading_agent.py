@@ -809,11 +809,12 @@ def build_weekly_email_body(started: datetime, post_val: dict,
         wow_gbp  = post_val["total_value_gbp"] - prev_val
         wow_pct  = ((post_val["total_value_gbp"] / prev_val) - 1) * 100
         perf_section += (
-            f"\nWeek-on-week:     £{wow_gbp:+.2f} ({wow_pct:+.2f}%)"
+            f"\n\nWeek-on-week:     £{wow_gbp:+.2f} ({wow_pct:+.2f}%)"
             f" since {prev_snapshot['date']}"
         )
 
     attribution = sp.format_attribution_for_email(post_val)
+
     if attribution:
         perf_section += "\n\n" + attribution
 
