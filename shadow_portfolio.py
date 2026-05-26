@@ -677,10 +677,26 @@ def _value_position(ticker: str, pos: dict,
         "current_price_gbp": round(price_gbp, 4),
         "current_value_gbp": round(value, 2),
         "pnl_gbp":           round(value - cost_basis, 2),
-        "pnl_pct":           round(((price_gbp / pos["avg_cost_gbp"]) - 1) * 100, 2),
+        "pnl_pct":           round(((price_gbp / pos["avg_cost_gbp"]) - 1) * 100, 2) if pos.get("avg_cost_gbp") else 0.0,
         "first_bought":      pos["first_bought"],
         "price_source":      price_source,
     }
+
+
+def init_benchmark_start_price(ledger: dict) -> None:
+    """
+    Record the benchmark start price the first time the agent runs.
+
+    Idempotent — does nothing if already set. Called once per run before
+    valuation() so that valuation() itself is a pure read-only function.
+
+    Args:
+        ledger: Shadow portfolio ledger dict. Mutated in-place on first call only.
+    """
+    if ledger.get("benchmark_start_price_gbp") is None:
+        price = fetch_price_gbp(ledger["benchmark_ticker"])
+        if price:
+            ledger["benchmark_start_price_gbp"] = price
 
 
 def valuation(ledger: dict, t212_price_map: Optional[dict] = None) -> dict:
@@ -717,8 +733,6 @@ def valuation(ledger: dict, t212_price_map: Optional[dict] = None) -> dict:
 
     # Benchmark always uses yfinance (VUSA.L not typically held)
     benchmark_price_now = fetch_price_gbp(ledger["benchmark_ticker"])
-    if ledger.get("benchmark_start_price_gbp") is None and benchmark_price_now:
-        ledger["benchmark_start_price_gbp"] = benchmark_price_now
     start_bm = ledger.get("benchmark_start_price_gbp")
 
     if start_bm and benchmark_price_now:

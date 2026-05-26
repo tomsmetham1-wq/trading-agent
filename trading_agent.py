@@ -466,12 +466,15 @@ def build_prompt(shadow_val: dict, shadow_ledger: dict,
     Returns:
         str: Fully formatted prompt string, ready to send to Claude.
     """
+    _total = shadow_val["total_value_gbp"] or 1
     shadow_summary = {
         "cash_gbp":             shadow_val["cash_gbp"],
+        "cash_pct":             round(shadow_val["cash_gbp"] / _total * 100, 1),
         "total_value_gbp":      shadow_val["total_value_gbp"],
         "total_return_pct":     shadow_val["total_return_pct"],
         "benchmark_return_pct": shadow_val["benchmark_return_pct"],
         "vs_benchmark_pct":     shadow_val["vs_benchmark_pct"],
+        "position_count":       len(shadow_val["positions"]),
         "positions": {
             ticker: {k: v for k, v in pos.items() if k not in ("price_source", "pnl_gbp")}
             for ticker, pos in shadow_val["positions"].items()
@@ -535,8 +538,15 @@ def build_deep_review_prompt(ledger: dict, valuation: dict) -> str:
     Returns:
         str: Fully formatted DEEP_REVIEW_PROMPT string.
     """
+    filtered_ledger = {
+        **ledger,
+        "trades": [
+            t for t in ledger.get("trades", [])
+            if t.get("action") != "SYNC_FROM_T212"
+        ],
+    }
     return DEEP_REVIEW_PROMPT.format(
-        ledger_json=json.dumps(ledger, indent=2, default=str),
+        ledger_json=json.dumps(filtered_ledger, indent=2, default=str),
         snapshots_json=json.dumps(
             ledger.get("weekly_snapshots", []), indent=2, default=str
         ),
@@ -1000,6 +1010,7 @@ def run_weekly(started: datetime) -> None:
 
     # Steps 2–3: Load ledger, sync shadow with T212, build live price map
     ledger = sp.load_ledger()
+    sp.init_benchmark_start_price(ledger)
     t212_price_map = sync_shadow_with_t212(ledger, t212_cash, t212_positions)
 
     # Step 4: Pre-trade valuation — passed into Claude prompt as portfolio context
@@ -1028,8 +1039,11 @@ def run_weekly(started: datetime) -> None:
         prev_snapshot=prev_snapshot,
     )
     subject = build_weekly_email_subject(started, t212_total, post_val)
-    send_email(subject, body)
-    print(f"  Weekly email sent to {EMAIL_RECIPIENT}")
+    try:
+        send_email(subject, body)
+        print(f"  Weekly email sent to {EMAIL_RECIPIENT}")
+    except Exception as e:
+        print(f"  ! Email failed (trades were executed and ledger saved): {e}")
 
 
 def run_monthly_deep_review(started: datetime) -> None:
@@ -1047,6 +1061,7 @@ def run_monthly_deep_review(started: datetime) -> None:
         started: Datetime the run started (for email timestamps).
     """
     ledger = sp.load_ledger()
+    sp.init_benchmark_start_price(ledger)
     t212_price_map = fetch_deep_review_price_map()
     val = sp.valuation(ledger, t212_price_map=t212_price_map)
 
@@ -1058,8 +1073,11 @@ def run_monthly_deep_review(started: datetime) -> None:
 
     body = build_deep_review_email_body(started, val, critique)
     subject = build_deep_review_email_subject(started, val)
-    send_email(subject, body)
-    print(f"  Deep review email sent to {EMAIL_RECIPIENT}")
+    try:
+        send_email(subject, body)
+        print(f"  Deep review email sent to {EMAIL_RECIPIENT}")
+    except Exception as e:
+        print(f"  ! Deep review email failed: {e}")
 
 
 def main() -> None:
