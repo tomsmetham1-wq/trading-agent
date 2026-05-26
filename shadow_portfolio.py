@@ -765,6 +765,7 @@ def snapshot(ledger: dict, val: dict, run_date: str) -> None:
         "benchmark_return_pct": val["benchmark_return_pct"],
         "vs_benchmark_pct":     val["vs_benchmark_pct"],
         "position_count":       len(val["positions"]),
+        "positions":            sorted(val["positions"].keys()),
     })
 
 

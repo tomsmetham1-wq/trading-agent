@@ -472,9 +472,15 @@ def build_prompt(shadow_val: dict, shadow_ledger: dict,
         "total_return_pct":     shadow_val["total_return_pct"],
         "benchmark_return_pct": shadow_val["benchmark_return_pct"],
         "vs_benchmark_pct":     shadow_val["vs_benchmark_pct"],
-        "positions":            shadow_val["positions"],
+        "positions": {
+            ticker: {k: v for k, v in pos.items() if k not in ("price_source", "pnl_gbp")}
+            for ticker, pos in shadow_val["positions"].items()
+        },
     }
-    recent_trades = shadow_ledger.get("trades", [])[-15:]
+    recent_trades = [
+        t for t in shadow_ledger.get("trades", [])
+        if t.get("action") != "SYNC_FROM_T212"
+    ][-15:]
 
     # Compact T212 summary — only send what Claude needs, not the full raw response.
     # T212 account summary returns flat {"free": ..., "total": ...}
@@ -775,7 +781,7 @@ def check_deep_review_prerequisites(ledger: dict) -> bool:
 def build_weekly_email_body(started: datetime, post_val: dict,
                              t212_cash: dict, t212_positions: list,
                              shadow_events: list, t212_events: list,
-                             prose: str) -> str:
+                             prose: str, prev_snapshot: dict = None) -> str:
     """
     Assemble the full weekly report email body.
 
@@ -790,11 +796,22 @@ def build_weekly_email_body(started: datetime, post_val: dict,
         shadow_events:  Human-readable strings from sp.apply_recommendations().
         t212_events:    Human-readable strings from t212ex.execute_recommendations().
         prose:          Claude's analysis text with the JSON block already stripped.
+        prev_snapshot:  Last weekly snapshot dict (for week-on-week comparison).
 
     Returns:
         str: Complete plain-text email body.
     """
     t212_total, t212_cash_available = extract_t212_totals(t212_cash)
+
+    perf_section = sp.format_valuation_for_email(post_val)
+    if prev_snapshot and prev_snapshot.get("total_value_gbp"):
+        prev_val = prev_snapshot["total_value_gbp"]
+        wow_gbp  = post_val["total_value_gbp"] - prev_val
+        wow_pct  = ((post_val["total_value_gbp"] / prev_val) - 1) * 100
+        perf_section += (
+            f"\nWeek-on-week:     £{wow_gbp:+.2f} ({wow_pct:+.2f}%)"
+            f" since {prev_snapshot['date']}"
+        )
 
     t212_section = (
         f"=== T212 Demo Account ===\n"
@@ -819,7 +836,7 @@ def build_weekly_email_body(started: datetime, post_val: dict,
         f"Environment: {T212_ENV.upper()}\n"
         f"Model: {CLAUDE_MODEL_WEEKLY}\n"
         f"Generated: {started.strftime('%A, %d %B %Y at %H:%M')}\n\n"
-        f"{sp.format_valuation_for_email(post_val)}\n\n"
+        f"{perf_section}\n\n"
         f"{t212_section}\n"
         f"=== This week's applied trades (shadow) ===\n"
         + ("\n".join(f"  {e}" for e in shadow_events) if shadow_events else "  (none)")
@@ -993,6 +1010,7 @@ def run_weekly(started: datetime) -> None:
     t212_events, shadow_events = execute_and_apply_trades(ledger, recs, run_date)
 
     # Step 7: Post-trade valuation, persist ledger with snapshot
+    prev_snapshot = (ledger.get("weekly_snapshots") or [None])[-1]
     post_val = sp.valuation(ledger, t212_price_map=t212_price_map)
     sp.snapshot(ledger, post_val, run_date)
     sp.save_ledger(ledger)
@@ -1001,7 +1019,8 @@ def run_weekly(started: datetime) -> None:
     prose = strip_json_block(response)
     t212_total, _ = extract_t212_totals(t212_cash)
     body = build_weekly_email_body(
-        started, post_val, t212_cash, t212_positions, shadow_events, t212_events, prose
+        started, post_val, t212_cash, t212_positions, shadow_events, t212_events, prose,
+        prev_snapshot=prev_snapshot,
     )
     subject = build_weekly_email_subject(started, t212_total, post_val)
     send_email(subject, body)
