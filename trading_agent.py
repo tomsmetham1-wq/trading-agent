@@ -274,17 +274,23 @@ def sync_shadow_with_t212(ledger: dict,
 # Claude API calls
 # =============================================================================
 
-def call_claude(prompt: str, model: str = CLAUDE_MODEL_WEEKLY) -> str:
+def call_claude(prompt: str, model: str = CLAUDE_MODEL_WEEKLY,
+                use_web_search: bool = True) -> str:
     """
     Send a prompt to Claude and return the combined text response.
 
-    Enables the web_search tool so Claude can look up live market data and news.
+    Enables the web_search tool by default so Claude can look up live market data
+    and news. Pass use_web_search=False for retrospective prompts (e.g. deep review)
+    that don't need live data — this avoids stale web results polluting the critique
+    and reduces cost.
+
     Automatically retries on rate-limit errors (HTTP 429) with exponential backoff:
     60s → 120s → 240s (up to 4 attempts total). Other errors are re-raised immediately.
 
     Args:
-        prompt: Full text prompt to send to the model.
-        model:  Claude model ID. Defaults to CLAUDE_MODEL_WEEKLY (Sonnet).
+        prompt:         Full text prompt to send to the model.
+        model:          Claude model ID. Defaults to CLAUDE_MODEL_WEEKLY (Sonnet).
+        use_web_search: Whether to enable the web_search tool. Default True.
 
     Returns:
         str: All text content blocks from Claude's response joined with double newlines.
@@ -295,12 +301,13 @@ def call_claude(prompt: str, model: str = CLAUDE_MODEL_WEEKLY) -> str:
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
     max_retries = 4
     wait = 60  # seconds — doubles on each retry (exponential backoff)
+    tools = [{"type": "web_search_20250305", "name": "web_search"}] if use_web_search else []
     for attempt in range(max_retries):
         try:
             response = client.messages.create(
                 model=model,
                 max_tokens=8000,
-                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                **({"tools": tools} if tools else {}),
                 messages=[{"role": "user", "content": prompt}],
             )
             parts = [b.text for b in response.content if getattr(b, "type", "") == "text"]
@@ -441,7 +448,7 @@ def run_deep_review(ledger: dict, valuation: dict) -> str:
         str: Opus's full prose critique.
     """
     prompt = build_deep_review_prompt(ledger, valuation)
-    return call_claude(prompt, model=CLAUDE_MODEL_DEEP)
+    return call_claude(prompt, model=CLAUDE_MODEL_DEEP, use_web_search=False)
 
 
 def is_first_monday_of_month(d: datetime) -> bool:
