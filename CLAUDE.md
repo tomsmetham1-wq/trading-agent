@@ -132,14 +132,26 @@ All sizing rules are percentage-based so they scale as the portfolio grows.
 
 - Fundamentals only — no technical/momentum signals
 - 5–10 concentrated positions
-- Max 25% of total portfolio value per position
+- Hard position cap: 20% of total portfolio value. Soft cap: 18%.
+  When 20% is hit, trim to 15% — not to 19.9%.
 - Cash reserve 5–15% of total portfolio value — uninvested cash is a deliberate choice
 - Deploy trigger: cash > 15% → must buy
-- Minimum position size: 8% of total portfolio value (scales with portfolio)
-- Each buy: 8–25% of total portfolio value
+- Each buy: 8–20% of total portfolio value
+- Do NOT exit a position solely because it shrank below 8% — only exit if thesis broken
+- Theme concentration cap: max 60% in any single macro theme; must hold ≥1 non-dominant-theme position
+- Flip-flop rule: no BUY within 5 trading days of a SELL/TRIM of the same ticker
+- Pre-commit trim levels at BUY entry — mechanical, not reactive
 - Holding period: weeks to months
 - Universe: UK/US listed stocks and ETFs on Trading 212
 - Benchmark: VUSA.L (Vanguard S&P 500 GBP)
+
+## Kill criteria (June 2026 deep review — evaluate monthly)
+
+- **3 consecutive months cumulative underperformance vs VUSA** → shut down
+- **Top contributor gives back >50% of gains AND rest of book hasn't compensated** → shut down
+- **Any single-week drawdown >15% with no thesis explanation** → risk-management failure
+- **Buy-sell-rebuy flip-flop on same ticker >2× in a month** → agent is reacting to price, not fundamentals
+- **End of August 2026: remove top contributor, rest still underperforms VUSA** → lottery-ticket buyer, not stock-picker → shut down
 
 ## Two-model design
 
@@ -149,7 +161,7 @@ All sizing rules are percentage-based so they scale as the portfolio grows.
   trades, but reviewing whether the strategy/reasoning is sound. Runs on first
   Monday of each month, or with `--deep-review` flag.
 
-## Current portfolio state (as of 2026-05-10)
+## Current portfolio state (as of 2026-06-01)
 
 - Starting capital: £5,000 (22 Apr 2026)
 - Shadow: ~£5,119 (+2.4%) after META removal
