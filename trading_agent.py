@@ -15,6 +15,7 @@ This script:
 """
 
 import json
+import logging
 import os
 import re
 import base64
@@ -36,25 +37,15 @@ import shadow_portfolio as sp
 import t212_executor as t212ex
 from prompts import build_prompt, build_deep_review_prompt
 
+logger = logging.getLogger(__name__)
+
 
 # =============================================================================
 # Helpers
 # =============================================================================
 
 def _clean(s: str) -> str:
-    """
-    Strip whitespace, quotes, and non-ASCII characters from a string.
-
-    HTTP headers must be latin-1 encodable. This prevents Unicode errors caused by
-    copy-paste artefacts (smart quotes, invisible characters) in API keys or other
-    config values read from .env files.
-
-    Args:
-        s: Raw string to clean, typically an env var value.
-
-    Returns:
-        ASCII-safe string (printable chars 32–126 only), or empty string if falsy.
-    """
+    """Strip whitespace, quotes, and non-ASCII from a string for safe HTTP header use."""
     if not s:
         return ""
     s = s.strip().strip('"').strip("'")
@@ -88,16 +79,7 @@ EMAIL_RECIPIENT    = _clean(os.getenv("EMAIL_RECIPIENT", ""))
 # =============================================================================
 
 def t212_headers() -> dict:
-    """
-    Build the Authorization header for T212 API requests.
-
-    T212 uses HTTP Basic auth with a base64-encoded "key:secret" pair.
-    Falls back to a legacy single-token header if T212_API_SECRET is not set
-    (some older API key formats only used a single token).
-
-    Returns:
-        dict: Headers dict ready to pass to requests.
-    """
+    """Build the Authorization header for T212 API requests (Basic auth)."""
     if T212_API_SECRET:
         token = base64.b64encode(
             f"{T212_API_KEY}:{T212_API_SECRET}".encode("ascii")
@@ -107,20 +89,7 @@ def t212_headers() -> dict:
 
 
 def get_t212_cash() -> dict:
-    """
-    Fetch the T212 account summary, which includes cash balance fields.
-
-    The /equity/account/summary endpoint returns a flat dict. Key fields:
-      - "free":  available cash to trade
-      - "total": total account value (cash + positions)
-      - "currency": account currency (always GBP for UK demo accounts)
-
-    Returns:
-        dict: Raw T212 account summary JSON.
-
-    Raises:
-        requests.HTTPError: If the API returns a non-2xx status.
-    """
+    """Fetch T212 account summary (cash balance fields)."""
     r = requests.get(
         f"{T212_BASE_URL}/equity/account/summary",
         headers=t212_headers(), timeout=20
@@ -130,20 +99,7 @@ def get_t212_cash() -> dict:
 
 
 def get_t212_positions() -> list:
-    """
-    Fetch all currently open positions from the T212 account.
-
-    The /equity/positions endpoint returns a list of position dicts. The current
-    T212 API uses a flat structure {"ticker": "AAPL_US_EQ", "quantity": ...},
-    but older API versions used nested {"instrument": {"ticker": ...}}.
-    Both formats are handled throughout the codebase.
-
-    Returns:
-        list: List of position dicts from T212.
-
-    Raises:
-        requests.HTTPError: If the API returns a non-2xx status.
-    """
+    """Fetch all currently open positions from T212."""
     r = requests.get(
         f"{T212_BASE_URL}/equity/positions",
         headers=t212_headers(), timeout=20
@@ -153,38 +109,17 @@ def get_t212_positions() -> list:
 
 
 def fetch_t212_account() -> tuple[dict, list]:
-    """
-    Fetch both the T212 account summary and open positions in one call.
-
-    Convenience wrapper around get_t212_cash() and get_t212_positions() that
-    also logs a summary line so progress is visible in Task Scheduler output.
-
-    Returns:
-        tuple: (t212_cash dict, t212_positions list)
-    """
+    """Fetch T212 account summary and open positions."""
     t212_cash = get_t212_cash()
     t212_positions = get_t212_positions()
     total = t212_cash.get("total", t212_cash.get("totalValue", t212_cash.get("free", "?")))
     currency = t212_cash.get("currency", "GBP")
-    print(f"  T212: {total} {currency} | {len(t212_positions)} positions")
+    logger.info("T212: %s %s | %d positions", total, currency, len(t212_positions))
     return t212_cash, t212_positions
 
 
 def extract_t212_totals(t212_cash: dict) -> tuple[float, float]:
-    """
-    Safely extract total account value and available cash from the T212 summary.
-
-    The T212 API has changed field names across versions, so we try several
-    alternatives before defaulting to 0.0. This prevents crashes when T212
-    updates its response schema.
-
-    Args:
-        t212_cash: Raw account summary dict from get_t212_cash().
-
-    Returns:
-        tuple: (total_account_value_gbp, available_cash_gbp).
-               Both default to 0.0 if the fields are absent or non-numeric.
-    """
+    """Extract total account value and available cash from the T212 summary."""
     try:
         t212_total = float(
             t212_cash.get("total")
@@ -208,33 +143,7 @@ def extract_t212_totals(t212_cash: dict) -> tuple[float, float]:
 def sync_shadow_with_t212(ledger: dict,
                            t212_cash: dict,
                            t212_positions: list) -> dict:
-    """
-    Build a live T212 price map and run the bidirectional shadow sync.
-
-    Called once per weekly run, before Claude is consulted, so the shadow ledger
-    reflects T212 reality before new recommendations are generated.
-
-    Steps performed:
-      1. Load the T212 instruments list (24h cached in t212_instruments.json).
-      2. Build a live price map from T212 position data (avoids the 15-min yfinance delay).
-      3. Fetch pending buy orders so queued positions aren't wrongly removed.
-      4. Run sp.sync_from_t212() — bidirectional when T212_DEMO_EXECUTE=true:
-           - Adds positions T212 holds that shadow is missing.
-           - Removes phantom shadow positions T212 never successfully executed.
-           - Syncs shadow cash to T212's actual available balance.
-
-    On any T212 data error, degrades gracefully: returns an empty price map and
-    logs a warning. The valuation step then falls back to yfinance for all tickers.
-
-    Args:
-        ledger: Shadow portfolio ledger dict. Mutated in-place if sync changes it.
-        t212_cash: T212 account summary from get_t212_cash().
-        t212_positions: T212 open positions list from get_t212_positions().
-
-    Returns:
-        dict: Live price map {yf_ticker: {price_native, currency, ppl_gbp, qty}},
-              or empty dict if T212 data was unavailable.
-    """
+    """Build a live T212 price map and run the bidirectional shadow sync."""
     t212_price_map = {}
     try:
         instruments = t212ex._load_instruments()
@@ -244,8 +153,6 @@ def sync_shadow_with_t212(ledger: dict,
 
         t212_price_map = sp._build_t212_price_map(t212_positions, _t212_to_yf, instruments)
 
-        # Fetch pending orders — prevents removing positions whose T212 buy was placed
-        # outside market hours (queued, not failed)
         pending_yf_tickers = (
             t212ex.get_pending_buy_tickers(instruments, _t212_to_yf)
             if t212ex.T212_DEMO_EXECUTE else set()
@@ -261,64 +168,61 @@ def sync_shadow_with_t212(ledger: dict,
             sp.save_ledger(ledger)
 
     except Exception as e:
-        print(f"  ! T212 data error, falling back to yfinance: {e}")
+        logger.warning("T212 data error, falling back to yfinance: %s", e)
 
     return t212_price_map
 
 
 # =============================================================================
-# Claude prompts
-# =============================================================================
-
-# =============================================================================
 # Claude API calls
 # =============================================================================
 
-def call_claude(prompt: str, model: str = CLAUDE_MODEL_WEEKLY,
-                use_web_search: bool = True) -> str:
+def call_claude(user_prompt: str, model: str = CLAUDE_MODEL_WEEKLY,
+                use_web_search: bool = True,
+                system_prompt: str = None) -> str:
     """
     Send a prompt to Claude and return the combined text response.
 
-    Enables the web_search tool by default so Claude can look up live market data
-    and news. Pass use_web_search=False for retrospective prompts (e.g. deep review)
-    that don't need live data — this avoids stale web results polluting the critique
-    and reduces cost.
+    When system_prompt is provided it is sent with cache_control=ephemeral so
+    Anthropic can cache the static strategy rules between runs, reducing cost.
 
-    Automatically retries on rate-limit errors (HTTP 429) with exponential backoff:
-    60s → 120s → 240s (up to 4 attempts total). Other errors are re-raised immediately.
-
-    Args:
-        prompt:         Full text prompt to send to the model.
-        model:          Claude model ID. Defaults to CLAUDE_MODEL_WEEKLY (Sonnet).
-        use_web_search: Whether to enable the web_search tool. Default True.
-
-    Returns:
-        str: All text content blocks from Claude's response joined with double newlines.
-
-    Raises:
-        Exception: On non-rate-limit errors, or after exhausting all retries.
+    Retries on rate-limit (HTTP 429) with exponential backoff: 60s → 120s → 240s.
     """
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
     max_retries = 4
-    wait = 60  # seconds — doubles on each retry (exponential backoff)
+    wait = 60
     tools = [{"type": "web_search_20250305", "name": "web_search"}] if use_web_search else []
+
+    # Build system param with cache_control when a system prompt is provided
+    system_param = None
+    if system_prompt:
+        system_param = [{"type": "text", "text": system_prompt,
+                         "cache_control": {"type": "ephemeral"}}]
+
     for attempt in range(max_retries):
         try:
-            response = client.messages.create(
+            kwargs = dict(
                 model=model,
                 max_tokens=8000,
-                **({"tools": tools} if tools else {}),
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "user", "content": user_prompt}],
             )
+            if system_param:
+                kwargs["system"] = system_param
+            if tools:
+                kwargs["tools"] = tools
+
+            response = client.messages.create(**kwargs)
             parts = [b.text for b in response.content if getattr(b, "type", "") == "text"]
             return "\n\n".join(parts).strip()
         except Exception as e:
             if "rate_limit" in str(e).lower() or "429" in str(e):
                 if attempt < max_retries - 1:
-                    print(f"  Rate limit hit — waiting {wait}s then retrying "
-                          f"(attempt {attempt + 1}/{max_retries})...")
+                    logger.warning(
+                        "Rate limit hit — waiting %ds then retrying (attempt %d/%d)...",
+                        wait, attempt + 1, max_retries,
+                    )
                     time.sleep(wait)
-                    wait *= 2  # backoff: 60s, 120s, 240s
+                    wait *= 2
                 else:
                     raise
             else:
@@ -326,69 +230,35 @@ def call_claude(prompt: str, model: str = CLAUDE_MODEL_WEEKLY,
 
 
 def extract_recommendations(text: str) -> list:
-    """
-    Extract the structured JSON recommendations block from Claude's prose response.
-
-    Claude is instructed to end its response with a ```json ... ``` block containing
-    a "recommendations" array. This function finds that block via regex, parses it,
-    and returns the list. Returns [] on any parse failure rather than crashing the run.
-
-    Args:
-        text: Full text returned by call_claude().
-
-    Returns:
-        list: Recommendation dicts (action, ticker, amount_gbp, etc.),
-              or empty list if no valid JSON block was found.
-    """
+    """Extract the structured JSON recommendations block from Claude's prose response."""
     match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
     if not match:
         match = re.search(r"```\s*(\{[^`]*?\"recommendations\".*?\})\s*```",
                           text, re.DOTALL)
     if not match:
-        print("  ! No JSON block found in Claude response")
+        logger.warning("No JSON block found in Claude response")
         return []
     try:
         return json.loads(match.group(1)).get("recommendations", [])
     except json.JSONDecodeError as e:
-        print(f"  ! JSON parse error: {e}")
+        logger.warning("JSON parse error: %s", e)
         return []
 
 
 def strip_json_block(text: str) -> str:
-    """
-    Remove the trailing ```json ... ``` block from Claude's response.
-
-    The JSON recommendations block is embedded in the response for machine
-    consumption but should not appear in the email body that Tom reads.
-
-    Args:
-        text: Claude's full response text.
-
-    Returns:
-        str: Prose portion only, with the JSON code block removed.
-    """
+    """Remove the trailing ```json ... ``` block from Claude's response."""
     return re.sub(r"```json.*?```", "", text, flags=re.DOTALL).strip()
 
 
 def get_claude_recommendations(pre_val: dict, ledger: dict,
                                 t212_cash: dict, t212_positions: list) -> tuple[str, list]:
-    """
-    Build the weekly prompt, call Claude (with web search), and extract recommendations.
-
-    Args:
-        pre_val:        Pre-trade shadow portfolio valuation (for context in the prompt).
-        ledger:         Shadow portfolio ledger dict.
-        t212_cash:      T212 account summary dict.
-        t212_positions: T212 open positions list.
-
-    Returns:
-        tuple: (full_response_text, list_of_recommendation_dicts)
-    """
-    print(f"  Calling Claude ({CLAUDE_MODEL_WEEKLY}) with web search...")
-    prompt = build_prompt(pre_val, ledger, t212_cash, t212_positions)
-    response = call_claude(prompt, model=CLAUDE_MODEL_WEEKLY)
+    """Build the weekly prompt, call Claude (with web search), and extract recommendations."""
+    logger.info("Calling Claude (%s) with web search...", CLAUDE_MODEL_WEEKLY)
+    system_prompt, user_prompt = build_prompt(pre_val, ledger, t212_cash, t212_positions)
+    response = call_claude(user_prompt, model=CLAUDE_MODEL_WEEKLY,
+                           system_prompt=system_prompt)
     recs = extract_recommendations(response)
-    print(f"  Claude made {len(recs)} actionable recommendations")
+    logger.info("Claude made %d actionable recommendation(s)", len(recs))
     return response, recs
 
 
@@ -397,33 +267,17 @@ def get_claude_recommendations(pre_val: dict, ledger: dict,
 # =============================================================================
 
 def execute_and_apply_trades(ledger: dict, recs: list, run_date: str) -> tuple[list, list]:
-    """
-    Execute recommendations on T212 first, then mirror only confirmed trades to shadow.
-
-    The T212-first order is critical to preventing ledger drift. If T212 fails a trade
-    (insufficient funds, bad ticker, market closed), we do NOT write it to shadow.
-    In the old design, shadow applied all recs then T212 tried to execute — if T212
-    failed, the position appeared in shadow permanently until next week's sync removed it.
-
-    Args:
-        ledger:   Shadow portfolio ledger dict. Mutated in-place by apply_recommendations.
-        recs:     Recommendation dicts from extract_recommendations().
-        run_date: ISO date string (YYYY-MM-DD) for trade log entries.
-
-    Returns:
-        tuple: (t212_events list, shadow_events list).
-               Both are human-readable strings describing what happened to each trade.
-    """
+    """Execute recommendations on T212 first, then mirror only confirmed trades to shadow."""
     t212_events, confirmed_recs = t212ex.execute_recommendations(recs)
     for e in t212_events:
-        print(f"    [T212] {e}")
+        logger.info("[T212] %s", e)
 
     shadow_events = (
         sp.apply_recommendations(ledger, confirmed_recs, run_date)
         if confirmed_recs else []
     )
     for e in shadow_events:
-        print(f"    - {e}")
+        logger.info("Shadow: %s", e)
 
     return t212_events, shadow_events
 
@@ -433,46 +287,19 @@ def execute_and_apply_trades(ledger: dict, recs: list, run_date: str) -> tuple[l
 # =============================================================================
 
 def run_deep_review(ledger: dict, valuation: dict) -> str:
-    """
-    Run the monthly strategic critique using Claude Opus.
-
-    Opus reviews the full trade history and snapshot data to assess whether the
-    strategy is working — not to pick new trades, but to critique the agent itself:
-    performance attribution, rule adherence, behavioural biases, thesis quality.
-
-    Args:
-        ledger:    Full shadow portfolio ledger dict.
-        valuation: Current valuation from sp.valuation().
-
-    Returns:
-        str: Opus's full prose critique.
-    """
-    prompt = build_deep_review_prompt(ledger, valuation)
-    return call_claude(prompt, model=CLAUDE_MODEL_DEEP, use_web_search=False)
+    """Run the monthly strategic critique using Claude Opus (no web search)."""
+    system_prompt, user_prompt = build_deep_review_prompt(ledger, valuation)
+    return call_claude(user_prompt, model=CLAUDE_MODEL_DEEP,
+                       use_web_search=False, system_prompt=system_prompt)
 
 
 def is_first_monday_of_month(d: datetime) -> bool:
-    """
-    Return True if d falls on the first Monday of its month.
-
-    Used to automatically trigger the monthly deep review without needing the
-    --deep-review flag — Task Scheduler only needs to run one command.
-    """
+    """Return True if d falls on the first Monday of its month."""
     return d.weekday() == 0 and d.day <= 7
 
 
 def fetch_deep_review_price_map() -> dict:
-    """
-    Fetch T212 live prices for use in the deep review valuation.
-
-    Mirrors the price-map logic in sync_shadow_with_t212 but without the sync
-    step — we only need current prices for an accurate valuation snapshot to
-    pass into the Opus prompt.
-
-    Returns:
-        dict: Live price map {yf_ticker: price_data}, or empty dict on any error.
-              An empty dict causes sp.valuation() to fall back to yfinance prices.
-    """
+    """Fetch T212 live prices for deep review valuation (no sync step)."""
     try:
         t212_positions = get_t212_positions()
         instruments = t212ex._load_instruments()
@@ -480,28 +307,19 @@ def fetch_deep_review_price_map() -> dict:
             return t212ex.t212_to_yf_ticker(t212_ticker, instruments)
         return sp._build_t212_price_map(t212_positions, _t212_to_yf, instruments)
     except Exception as e:
-        print(f"  ! T212 price map failed for deep review: {e}")
+        logger.warning("T212 price map failed for deep review: %s", e)
         return {}
 
 
 def check_deep_review_prerequisites(ledger: dict) -> bool:
-    """
-    Verify there is enough history for a meaningful deep review.
-
-    The Opus review is only worth running after at least 2 weekly snapshots and
-    3 trades — with less data it would speculate without a real performance signal.
-
-    Args:
-        ledger: Shadow portfolio ledger dict.
-
-    Returns:
-        bool: True if the review should proceed, False if it should be skipped.
-    """
+    """Verify there is enough history for a meaningful deep review."""
     n_snapshots = len(ledger.get("weekly_snapshots", []))
     n_trades = len(ledger.get("trades", []))
     if n_snapshots < 2 or n_trades < 3:
-        print(f"  ! Not enough history for deep review "
-              f"(snapshots={n_snapshots}, trades={n_trades}). Skipping.")
+        logger.warning(
+            "Not enough history for deep review (snapshots=%d, trades=%d). Skipping.",
+            n_snapshots, n_trades,
+        )
         return False
     return True
 
@@ -514,25 +332,7 @@ def build_weekly_email_body(started: datetime, post_val: dict,
                              t212_cash: dict, t212_positions: list,
                              shadow_events: list, t212_events: list,
                              prose: str, prev_snapshot: dict = None) -> str:
-    """
-    Assemble the full weekly report email body.
-
-    Combines: run metadata header, shadow performance summary, T212 account snapshot,
-    shadow trade events log, T212 order events, and Claude's prose analysis.
-
-    Args:
-        started:        Datetime the run started (for the header timestamp).
-        post_val:       Post-trade shadow portfolio valuation.
-        t212_cash:      T212 account summary dict (for account value + cash line).
-        t212_positions: T212 open positions list (for position count).
-        shadow_events:  Human-readable strings from sp.apply_recommendations().
-        t212_events:    Human-readable strings from t212ex.execute_recommendations().
-        prose:          Claude's analysis text with the JSON block already stripped.
-        prev_snapshot:  Last weekly snapshot dict (for week-on-week comparison).
-
-    Returns:
-        str: Complete plain-text email body.
-    """
+    """Assemble the full weekly report email body."""
     t212_total, t212_cash_available = extract_t212_totals(t212_cash)
 
     perf_section = sp.format_valuation_for_email(post_val)
@@ -546,7 +346,6 @@ def build_weekly_email_body(started: datetime, post_val: dict,
         )
 
     attribution = sp.format_attribution_for_email(post_val)
-
     if attribution:
         perf_section += "\n\n" + attribution
 
@@ -587,20 +386,7 @@ def build_weekly_email_body(started: datetime, post_val: dict,
 
 
 def build_weekly_email_subject(started: datetime, t212_total: float, post_val: dict) -> str:
-    """
-    Build the weekly report email subject line.
-
-    The key numbers (T212 value, shadow return) are visible in the inbox without
-    opening the email, which is useful for a quick weekly sanity check.
-
-    Args:
-        started:     Run start datetime.
-        t212_total:  T212 total account value in GBP.
-        post_val:    Post-trade shadow portfolio valuation.
-
-    Returns:
-        str: Email subject string.
-    """
+    """Build the weekly report email subject line."""
     return (
         f"Trading Review — {started.strftime('%d %b %Y')} | "
         f"T212: £{t212_total:.0f} | Shadow: £{post_val['total_value_gbp']:.0f} "
@@ -609,17 +395,7 @@ def build_weekly_email_subject(started: datetime, t212_total: float, post_val: d
 
 
 def build_deep_review_email_body(started: datetime, val: dict, critique: str) -> str:
-    """
-    Assemble the monthly deep review email body.
-
-    Args:
-        started:  Datetime the run started.
-        val:      Current shadow portfolio valuation.
-        critique: Opus's full strategic critique prose.
-
-    Returns:
-        str: Complete plain-text email body.
-    """
+    """Assemble the monthly deep review email body."""
     return (
         f"Monthly Deep Review (Strategic Critique)\n"
         f"Model: {CLAUDE_MODEL_DEEP}\n"
@@ -632,16 +408,7 @@ def build_deep_review_email_body(started: datetime, val: dict, critique: str) ->
 
 
 def build_deep_review_email_subject(started: datetime, val: dict) -> str:
-    """
-    Build the monthly deep review email subject line.
-
-    Args:
-        started: Run start datetime.
-        val:     Current shadow portfolio valuation.
-
-    Returns:
-        str: Email subject string.
-    """
+    """Build the monthly deep review email subject line."""
     return (
         f"Monthly Deep Review — {started.strftime('%d %b %Y')} | "
         f"£{val['total_value_gbp']:.2f} "
@@ -654,20 +421,7 @@ def build_deep_review_email_subject(started: datetime, val: dict) -> str:
 # =============================================================================
 
 def send_email(subject: str, body: str) -> None:
-    """
-    Send a plain-text email via Gmail's SMTP SSL service (port 465).
-
-    Uses EMAIL_SENDER with a Gmail App Password — a 16-character code generated
-    in Google Account → Security → App Passwords. App Passwords bypass 2FA and
-    work with third-party SMTP clients; they are NOT the account password.
-
-    Args:
-        subject: Email subject line.
-        body:    Plain-text email body.
-
-    Raises:
-        smtplib.SMTPException: On authentication failure or network error.
-    """
+    """Send a plain-text email via Gmail SMTP SSL (port 465)."""
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = EMAIL_SENDER
@@ -684,15 +438,7 @@ def send_email(subject: str, body: str) -> None:
 # =============================================================================
 
 def validate_config() -> None:
-    """
-    Verify all required environment variables are set before the run begins.
-
-    Fails fast with a clear message rather than crashing mid-run with a cryptic
-    auth error after Claude has already been called and API credits consumed.
-
-    Raises:
-        RuntimeError: If any required env var is missing or empty.
-    """
+    """Fail fast with a clear message if any required env var is missing."""
     missing = [n for n, v in [
         ("T212_API_KEY",        T212_API_KEY),
         ("ANTHROPIC_API_KEY",   ANTHROPIC_API_KEY),
@@ -713,33 +459,38 @@ def run_weekly(started: datetime) -> None:
 
     Execution order (do not change — each step feeds the next):
       1. Fetch T212 account state (cash + positions)
-      2. Load shadow ledger
+      2. Load shadow ledger; idempotency check (skip if already ran today)
       3. Sync shadow ↔ T212 and build live price map
       4. Pre-trade valuation (passed to Claude as portfolio context)
       5. Call Claude (Sonnet + web search) → prose report + JSON recommendations
       6. Execute on T212 first → shadow mirrors only confirmed trades
       7. Post-trade valuation, weekly snapshot, save ledger
       8. Build and send the weekly email report
-
-    Args:
-        started: Datetime the run started. Used for run_date labelling and
-                 email timestamps.
     """
     run_date = started.strftime("%Y-%m-%d")
 
     # Step 1: Fetch current T212 state
     t212_cash, t212_positions = fetch_t212_account()
 
-    # Steps 2–3: Load ledger, sync shadow with T212, build live price map
+    # Steps 2–3: Load ledger, idempotency guard, sync, build live price map
     ledger = sp.load_ledger()
+    if ledger.get("last_run_date") == run_date:
+        logger.warning(
+            "Weekly run already completed today (%s) — skipping to avoid duplicate trades.",
+            run_date,
+        )
+        return
     sp.init_benchmark_start_price(ledger)
     t212_price_map = sync_shadow_with_t212(ledger, t212_cash, t212_positions)
 
     # Step 4: Pre-trade valuation — passed into Claude prompt as portfolio context
     pre_val = sp.valuation(ledger, t212_price_map=t212_price_map)
-    print(f"  Shadow: £{pre_val['total_value_gbp']:.2f} "
-          f"({pre_val['total_return_pct']:+.2f}%) "
-          f"vs benchmark {pre_val['benchmark_return_pct']}%")
+    logger.info(
+        "Shadow: £%.2f (%+.2f%%) vs benchmark %.2f%%",
+        pre_val["total_value_gbp"],
+        pre_val["total_return_pct"],
+        pre_val["benchmark_return_pct"] or 0,
+    )
 
     # Step 5: Claude analysis
     response, recs = get_claude_recommendations(pre_val, ledger, t212_cash, t212_positions)
@@ -747,11 +498,12 @@ def run_weekly(started: datetime) -> None:
     # Step 6: T212 executes first — shadow mirrors only confirmed trades
     t212_events, shadow_events = execute_and_apply_trades(ledger, recs, run_date)
 
-    # Step 7: Post-trade valuation, persist ledger with snapshot
+    # Step 7: Post-trade valuation, persist ledger with snapshot and last_run_date
     prev_snapshot = (ledger.get("weekly_snapshots") or [None])[-1]
     t212_total, _ = extract_t212_totals(t212_cash)
     post_val = sp.valuation(ledger, t212_price_map=t212_price_map)
     sp.snapshot(ledger, post_val, run_date, t212_total_gbp=t212_total)
+    ledger["last_run_date"] = run_date
     sp.save_ledger(ledger)
 
     # Step 8: Build and send the weekly email
@@ -763,9 +515,9 @@ def run_weekly(started: datetime) -> None:
     subject = build_weekly_email_subject(started, t212_total, post_val)
     try:
         send_email(subject, body)
-        print(f"  Weekly email sent to {EMAIL_RECIPIENT}")
+        logger.info("Weekly email sent to %s", EMAIL_RECIPIENT)
     except Exception as e:
-        print(f"  ! Email failed (trades were executed and ledger saved): {e}")
+        logger.error("Email failed (trades were executed and ledger saved): %s", e)
 
 
 def run_monthly_deep_review(started: datetime) -> None:
@@ -773,14 +525,7 @@ def run_monthly_deep_review(started: datetime) -> None:
     Monthly strategic critique using Claude Opus.
 
     Loads the full ledger, values the portfolio with live T212 prices, and calls
-    Opus to assess whether the strategy is working — not to pick trades, but to
-    critique the agent's reasoning, rule adherence, and performance attribution.
-
-    Automatically skipped if there is insufficient history (fewer than 2 weekly
-    snapshots or fewer than 3 trades) — Opus needs real data, not speculation.
-
-    Args:
-        started: Datetime the run started (for email timestamps).
+    Opus to assess whether the strategy is working. Skipped if insufficient history.
     """
     ledger = sp.load_ledger()
     sp.init_benchmark_start_price(ledger)
@@ -790,16 +535,16 @@ def run_monthly_deep_review(started: datetime) -> None:
     if not check_deep_review_prerequisites(ledger):
         return
 
-    print(f"  Calling Claude ({CLAUDE_MODEL_DEEP}) for deep review...")
+    logger.info("Calling Claude (%s) for deep review...", CLAUDE_MODEL_DEEP)
     critique = run_deep_review(ledger, val)
 
     body = build_deep_review_email_body(started, val, critique)
     subject = build_deep_review_email_subject(started, val)
     try:
         send_email(subject, body)
-        print(f"  Deep review email sent to {EMAIL_RECIPIENT}")
+        logger.info("Deep review email sent to %s", EMAIL_RECIPIENT)
     except Exception as e:
-        print(f"  ! Deep review email failed: {e}")
+        logger.error("Deep review email failed: %s", e)
 
 
 def main() -> None:
@@ -812,9 +557,15 @@ def main() -> None:
       --skip-weekly   With --deep-review: run the critique only, skip weekly analysis.
 
     Automatic behaviour (no flags needed):
-      The monthly deep review also runs automatically on the first Sunday of each
+      The monthly deep review also runs automatically on the first Monday of each
       month, so Task Scheduler only needs one command: python trading_agent.py
     """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+
     parser = argparse.ArgumentParser(
         description="UK retail trading agent — weekly review with shadow tracking."
     )
@@ -826,21 +577,20 @@ def main() -> None:
 
     validate_config()
     started = datetime.now()
-    print(f"[{started.isoformat(timespec='seconds')}] Run starting "
-          f"(env={T212_ENV})")
+    logger.info("Run starting (env=%s)", T212_ENV)
 
     if args.deep_review and args.skip_weekly:
         run_monthly_deep_review(started)
-        print(f"[{datetime.now().isoformat(timespec='seconds')}] Done.")
+        logger.info("Done.")
         return
 
     run_weekly(started)
 
     if args.deep_review or is_first_monday_of_month(started):
-        print("  Running monthly deep review...")
+        logger.info("Running monthly deep review...")
         run_monthly_deep_review(started)
 
-    print(f"[{datetime.now().isoformat(timespec='seconds')}] Done.")
+    logger.info("Done.")
 
 
 if __name__ == "__main__":

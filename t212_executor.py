@@ -33,8 +33,12 @@ import base64
 from pathlib import Path
 from typing import Optional
 
+import logging
+
 import requests
 from shadow_portfolio import fetch_price_gbp
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -192,7 +196,7 @@ def _load_instruments() -> list[dict]:
             with open(INSTRUMENTS_CACHE_PATH) as f:
                 return json.load(f)
 
-    print("  Fetching T212 instrument list (cached for 24h)...")
+    logger.info("Fetching T212 instrument list (cached for 24h)...")
     r = requests.get(
         f"{T212_BASE_URL}/equity/metadata/instruments",
         headers=_headers(), timeout=30,
@@ -201,7 +205,7 @@ def _load_instruments() -> list[dict]:
     instruments = r.json()
     with open(INSTRUMENTS_CACHE_PATH, "w") as f:
         json.dump(instruments, f)
-    print(f"  Fetched {len(instruments)} instruments.")
+    logger.info("Fetched %d instruments.", len(instruments))
     return instruments
 
 
@@ -303,7 +307,8 @@ def _instrument_root(inst: dict) -> str:
 # Ticker translation: yfinance → T212
 # =============================================================================
 
-def yf_to_t212_ticker(yf_ticker: str, instruments: list[dict]) -> Optional[str]:
+def yf_to_t212_ticker(yf_ticker: str, instruments: list[dict],
+                      skip_alias: bool = False) -> Optional[str]:
     """
     Translate a yfinance-style ticker to the correct T212 instrument ticker.
 
@@ -329,7 +334,7 @@ def yf_to_t212_ticker(yf_ticker: str, instruments: list[dict]) -> Optional[str]:
     upper = yf_ticker.upper().strip()
 
     # Stage 1: Manual alias overrides
-    if upper in TICKER_ALIASES:
+    if not skip_alias and upper in TICKER_ALIASES:
         return TICKER_ALIASES[upper]
 
     base_symbol, yf_suffix = _parse_yf_ticker(upper)
@@ -359,8 +364,10 @@ def yf_to_t212_ticker(yf_ticker: str, instruments: list[dict]) -> Optional[str]:
                    if inst.get("ticker", "").upper().startswith(base_symbol + "_")]
 
     if not matches:
-        print(f"  ! No T212 instrument found for '{yf_ticker}' "
-              f"(tried shortName='{base_symbol}' and ticker root)")
+        logger.warning(
+            "No T212 instrument found for '%s' (tried shortName='%s' and ticker root)",
+            yf_ticker, base_symbol,
+        )
         return None
 
     if len(matches) == 1:
@@ -383,7 +390,7 @@ def yf_to_t212_ticker(yf_ticker: str, instruments: list[dict]) -> Optional[str]:
         if not is_us and "_US_" not in t:
             return t
 
-    print(f"  ! Ambiguous match for '{yf_ticker}' — using {matches[0]['ticker']}")
+    logger.warning("Ambiguous match for '%s' — using %s", yf_ticker, matches[0]["ticker"])
     return matches[0]["ticker"]
 
 
@@ -462,7 +469,7 @@ def get_pending_buy_tickers(instruments: list[dict], t212_to_yf_fn) -> set[str]:
         r.raise_for_status()
         orders = r.json()
     except Exception as e:
-        print(f"  ! Couldn't fetch pending orders (sync will be conservative): {e}")
+        logger.warning("Couldn't fetch pending orders (sync will be conservative): %s", e)
         return set()
 
     if not isinstance(orders, list):
@@ -485,7 +492,7 @@ def get_pending_buy_tickers(instruments: list[dict], t212_to_yf_fn) -> set[str]:
             pending.add(yf_ticker)
 
     if pending:
-        print(f"  Pending T212 buy orders: {sorted(pending)}")
+        logger.info("Pending T212 buy orders: %s", sorted(pending))
     return pending
 
 
@@ -624,46 +631,17 @@ def _get_available_cash() -> float:
             or data.get("cash", {}).get("availableToTrade", 0)
         )
     except Exception as e:
-        print(f"  ! Couldn't fetch available cash for budget tracking: {e}")
+        logger.warning("Couldn't fetch available cash for budget tracking: %s", e)
         return 0.0
 
 
 
 def _search_translate(yf_ticker: str, instruments: list[dict]) -> Optional[str]:
     """
-    Translate using the search logic only, bypassing the TICKER_ALIASES map.
-
-    Used as a fallback when an alias ticker returns 404 from T212 — maybe the
-    alias is stale. We try the instrument search directly instead.
-
-    Args:
-        yf_ticker:   yfinance ticker string.
-        instruments: T212 instruments list.
-
-    Returns:
-        str: T212 ticker, or None if no match found.
+    Translate bypassing TICKER_ALIASES — used when an alias 404s and we fall back
+    to instrument search (including shortName matching, which the old alias skipped).
     """
-    upper = yf_ticker.upper().strip()
-    base_symbol, yf_suffix = _parse_yf_ticker(upper)
-    expected_currencies = YF_SUFFIX_TO_CURRENCIES.get(yf_suffix, set())
-    matches = [inst for inst in instruments if _instrument_root(inst) == base_symbol]
-    if not matches:
-        return None
-    if len(matches) == 1:
-        return matches[0]["ticker"]
-    if expected_currencies:
-        currency_matches = [m for m in matches
-                            if _instrument_currency(m) in expected_currencies]
-        if currency_matches:
-            matches = currency_matches
-    is_us = (yf_suffix == "")
-    for inst in matches:
-        t = inst.get("ticker", "")
-        if is_us and "_US_EQ" in t:
-            return t
-        if not is_us and "_US_" not in t:
-            return t
-    return matches[0]["ticker"]
+    return yf_to_t212_ticker(yf_ticker, instruments, skip_alias=True)
 
 
 def _execute_buy(rec: dict, yf_ticker: str, t212_ticker: str,
@@ -704,7 +682,7 @@ def _execute_buy(rec: dict, yf_ticker: str, t212_ticker: str,
     except requests.HTTPError as e:
         # If the alias returned 404, try searching the instrument list directly
         if e.response.status_code == 404 and yf_ticker.upper() in TICKER_ALIASES:
-            print(f"  ! Alias {t212_ticker} returned 404, retrying with instrument search...")
+            logger.warning("Alias %s returned 404, retrying with instrument search...", t212_ticker)
             fallback = _search_translate(yf_ticker, instruments)
             if fallback:
                 effective_t212_ticker = fallback
@@ -830,7 +808,7 @@ def _wait_for_orders_filled(order_ids: list, timeout: int = 60) -> None:
     pending = {str(oid) for oid in order_ids}
     deadline = time.time() + timeout
 
-    print(f"  Waiting for {len(pending)} sell order(s) to fill (up to {timeout}s)...")
+    logger.info("Waiting for %d sell order(s) to fill (up to %ds)...", len(pending), timeout)
     while pending and time.time() < deadline:
         time.sleep(3)
         try:
@@ -841,24 +819,34 @@ def _wait_for_orders_filled(order_ids: list, timeout: int = 60) -> None:
             r.raise_for_status()
             orders = r.json()
         except Exception as e:
-            print(f"  ! Order status poll failed: {e}")
+            logger.warning("Order status poll failed: %s", e)
             continue
 
         if not isinstance(orders, list):
             continue
 
+        seen_ids: set[str] = set()
         for order in orders:
             if not isinstance(order, dict):
                 continue
             oid = str(order.get("id", ""))
             status = (order.get("status") or "").upper()
+            seen_ids.add(oid)
             if oid in pending and status in terminal:
-                print(f"  Order {oid}: {status}")
+                logger.info("Order %s: %s", oid, status)
                 pending.discard(oid)
 
+        # IDs not present in the response at all are assumed settled (paginated away).
+        missing = pending - seen_ids
+        if missing:
+            logger.info("Order IDs not in response (assumed settled/paginated): %s", missing)
+            pending -= missing
+
     if pending:
-        print(f"  ! Sell orders still pending after {timeout}s, proceeding with "
-              f"whatever cash T212 shows: {pending}")
+        logger.warning(
+            "Sell orders still pending after %ds, proceeding with whatever cash T212 shows: %s",
+            timeout, pending,
+        )
 
 
 # =============================================================================
@@ -897,7 +885,7 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
     if not T212_DEMO_EXECUTE:
         return [], list(recs)
     if T212_ENV == "live":
-        print("  ! T212_DEMO_EXECUTE=true but T212_ENV=live — refusing to execute.")
+        logger.warning("T212_DEMO_EXECUTE=true but T212_ENV=live — refusing to execute.")
         return ["SKIPPED: T212_DEMO_EXECUTE refused on live account."], []
     if not recs:
         return [], []
@@ -945,7 +933,7 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
         _wait_for_orders_filled(sell_order_ids)
 
     expected_cash = _get_available_cash()
-    print(f"  T212 available cash for buy orders: £{expected_cash:.2f}")
+    logger.info("T212 available cash for buy orders: £%.2f", expected_cash)
 
     # --- Pass 2: execute all buys ---
     for rec in buy_recs:
@@ -972,8 +960,7 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
                          events, confirmed_recs)
             if len(confirmed_recs) > prev_confirmed:
                 expected_cash -= amount_gbp
-                print(f"  Budget after BUY {yf_ticker}: "
-                      f"£{expected_cash:.2f} (-£{amount_gbp:.2f})")
+                logger.info("Budget after BUY %s: £%.2f (-£%.2f)", yf_ticker, expected_cash, amount_gbp)
         except requests.HTTPError as e:
             events.append(
                 f"T212 ORDER FAILED BUY {t212_ticker}: "

@@ -13,8 +13,11 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
 
+import logging
+
 import yfinance as yf
 
+logger = logging.getLogger(__name__)
 
 LEDGER_PATH = Path(os.getenv("SHADOW_LEDGER_PATH", "shadow_portfolio.json"))
 STARTING_CAPITAL_GBP = float(os.getenv("STARTING_CAPITAL_GBP", "5000"))
@@ -195,7 +198,7 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
 
     # Step 1: Add positions T212 holds that shadow is missing
     if missing_in_shadow:
-        print(f"  Sync: adding to shadow (held in T212): {sorted(missing_in_shadow)}")
+        logger.info("Sync: adding to shadow (held in T212): %s", sorted(missing_in_shadow))
         for yf_ticker in missing_in_shadow:
             entry = t212_by_yf[yf_ticker]
 
@@ -214,7 +217,7 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
                 avg_cost_gbp = fetch_price_gbp(yf_ticker)
 
             if avg_cost_gbp is None:
-                print(f"  ! {yf_ticker}: couldn't determine GBP price, skipping sync")
+                logger.warning("%s: couldn't determine GBP price, skipping sync", yf_ticker)
                 continue
 
             ledger["positions"][yf_ticker] = {
@@ -232,9 +235,9 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
         queued    = (pending_yf_tickers or set()) & extra_in_shadow
         to_remove = extra_in_shadow - queued
         if queued:
-            print(f"  Sync: keeping in shadow (T212 buy order pending): {sorted(queued)}")
+            logger.info("Sync: keeping in shadow (T212 buy order pending): %s", sorted(queued))
         if to_remove:
-            print(f"  Sync: removing from shadow (not in T212): {sorted(to_remove)}")
+            logger.info("Sync: removing from shadow (not in T212): %s", sorted(to_remove))
             for yf_ticker in to_remove:
                 del ledger["positions"][yf_ticker]
             changed = True
@@ -308,7 +311,7 @@ def fetch_price_gbp(yf_ticker: str) -> Optional[float]:
         price = info.last_price
         currency = (info.currency or "").upper()
     except Exception as e:
-        print(f"  ! price fetch failed for {yf_ticker}: {e}")
+        logger.warning("price fetch failed for %s: %s", yf_ticker, e)
         return None
 
     if price is None or price <= 0:
@@ -326,13 +329,21 @@ def fetch_price_gbp(yf_ticker: str) -> Optional[float]:
         fx = _fx_rate("GBPEUR=X")
         return float(price) / fx if fx else None
     # Unknown currency — return as-is and warn so the issue is visible in logs
-    print(f"  ! unknown currency {currency} for {yf_ticker}, treating as GBP")
+    logger.warning("unknown currency %s for %s, treating as GBP", currency, yf_ticker)
     return float(price)
 
 
 # =============================================================================
 # Applying recommendations to the shadow ledger
 # =============================================================================
+
+def _find_entry_thesis(ledger: dict, ticker: str) -> str:
+    """Search trade history in reverse for the last BUY thesis recorded for ticker."""
+    for t in reversed(ledger.get("trades", [])):
+        if t.get("action") == "BUY" and t.get("ticker") == ticker and t.get("thesis"):
+            return t["thesis"]
+    return ""
+
 
 def _apply_buy(ledger: dict, rec: dict, ticker: str,
                price: float, run_date: str) -> str:
@@ -433,6 +444,9 @@ def _apply_sell_or_trim(ledger: dict, rec: dict, ticker: str,
     ledger["cash_gbp"] += proceeds
 
     exit_thesis = rec.get("thesis_oneline", "")
+    pos_thesis = pos.get("thesis", "")
+    if not pos_thesis or pos_thesis == "(synced from T212)":
+        pos_thesis = _find_entry_thesis(ledger, ticker)
     ledger["trades"].append({
         "date":         run_date,
         "action":       action,
@@ -441,7 +455,7 @@ def _apply_sell_or_trim(ledger: dict, rec: dict, ticker: str,
         "price_gbp":    round(price, 4),
         "amount_gbp":   round(proceeds, 2),
         "exit_thesis":  exit_thesis,
-        "entry_thesis": pos.get("thesis", ""),
+        "entry_thesis": pos_thesis,
     })
 
     # Remove dust positions left after a partial trim
@@ -602,7 +616,7 @@ def _native_to_gbp(price: float, currency: str) -> Optional[float]:
     """
     if currency == "GBP":
         return float(price)
-    if currency in ("GBX", "GBp"):
+    if currency in ("GBX", "GBp", "GBP."):
         return float(price) / 100
     if currency == "USD":
         fx = _fx_rate("GBPUSD=X")
@@ -625,7 +639,7 @@ def _native_to_gbp(price: float, currency: str) -> Optional[float]:
     if currency == "CHF":
         fx = _fx_rate("GBPCHF=X")
         return float(price) / fx if fx else None
-    print(f"  ! unknown currency {currency}, treating as GBP")
+    logger.warning("unknown currency %s, treating as GBP", currency)
     return float(price)
 
 
