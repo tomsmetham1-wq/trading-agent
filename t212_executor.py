@@ -781,7 +781,7 @@ def _execute_sell_or_trim(rec: dict, yf_ticker: str, t212_ticker: str,
 # Order fill polling
 # =============================================================================
 
-def _wait_for_orders_filled(order_ids: list, timeout: int = 60) -> bool:
+def _wait_for_orders_filled(order_ids: list, timeout: int = 120) -> bool:
     """
     Poll T212 until all specified sell orders reach a terminal status.
 
@@ -790,7 +790,7 @@ def _wait_for_orders_filled(order_ids: list, timeout: int = 60) -> bool:
     balance before buys are placed, enabling same-run sell-and-reinvest when
     markets are open.
 
-    Polls every 3 seconds up to `timeout` seconds. Returns True if every order
+    Polls every 15 seconds up to `timeout` seconds. Returns True if every order
     was positively confirmed as terminal; False if the timeout expired with any
     order still unconfirmed.
 
@@ -804,8 +804,8 @@ def _wait_for_orders_filled(order_ids: list, timeout: int = 60) -> bool:
 
     Args:
         order_ids: T212 order ID strings returned by _execute_sell_or_trim().
-        timeout:   Maximum seconds to wait. Default 60s is generous for
-                   market-hours execution where fills are typically near-instant.
+        timeout:   Maximum seconds to wait. Default 120s covers market-hours
+                   fills with room to spare while keeping poll count low.
 
     Returns:
         bool: True if all orders confirmed terminal, False if timeout expired.
@@ -819,7 +819,7 @@ def _wait_for_orders_filled(order_ids: list, timeout: int = 60) -> bool:
 
     logger.info("Waiting for %d sell order(s) to fill (up to %ds)...", len(pending), timeout)
     while pending and time.time() < deadline:
-        time.sleep(3)
+        time.sleep(15)
         try:
             r = requests.get(
                 f"{T212_BASE_URL}/equity/orders",
