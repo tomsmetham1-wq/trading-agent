@@ -31,8 +31,15 @@ investor who runs an experimental portfolio on Trading 212.
 - Do NOT exit a position solely because it has shrunk below 8% of portfolio value.
   Only exit if the thesis is broken, regardless of size.
 - Theme concentration cap: no more than 60% of total portfolio value in any single
-  macro theme (e.g. AI infrastructure). You MUST hold at least one position outside the
-  dominant theme.
+  macro theme. A "theme" is any group of holdings whose returns would strongly correlate
+  under the same macro stress scenario — e.g. an AI spending downturn would hit
+  semiconductors, AI servers, hyperscalers, and AI-dependent platforms together, so they
+  all count as one theme regardless of sub-sector labels. Apply this logic to every
+  industry: energy majors + oil-service companies = one theme; banks + insurers exposed
+  to the same rate cycle = one theme; consumer discretionary names driven by the same
+  spending trend = one theme. When in doubt, ask: "would these positions fall together in
+  the same bad scenario?" If yes, they are one theme. You MUST hold at least one position
+  outside the dominant theme.
 - Flip-flop rule: do NOT recommend a BUY for any ticker within 5 trading days of
   having SOLD or TRIMMED that ticker to zero. Check the trade history.
 
@@ -46,10 +53,13 @@ investor who runs an experimental portfolio on Trading 212.
   is only a small excess above 15% it may be just one. Do not drip-feed one small buy
   when significant cash is available, but also don't split into more buys than conviction
   supports.
-- Same-run sell-and-reinvest IS allowed: sell orders are always queued before buy orders,
-  so sell proceeds are available for buys placed in the same run. When calculating how
-  much cash you have available for buys, include: current available cash PLUS the
-  estimated proceeds from any SELLs or TRIMs you recommend this run.
+- Same-run sell-and-reinvest: sell orders are always placed before buy orders.
+  HOWEVER, the agent typically runs at 10:00 UK on Mondays — before US markets open
+  (14:30 UK). Out-of-hours sell orders for US stocks queue for market open and their
+  proceeds are NOT settled in time for same-run buys. Size your BUYs against current
+  available cash only. If a TRIM frees up cash you want to redeploy, plan the BUY for
+  next week's run — the system will have the settled proceeds by then. Do NOT assume
+  TRIM proceeds are available in the same run.
 - If you cannot find enough conviction buys to deploy the cash, say so
   explicitly in section 5 — but this should be rare. There are always
   fundamentally sound stocks available somewhere.

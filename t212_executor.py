@@ -781,7 +781,7 @@ def _execute_sell_or_trim(rec: dict, yf_ticker: str, t212_ticker: str,
 # Order fill polling
 # =============================================================================
 
-def _wait_for_orders_filled(order_ids: list, timeout: int = 60) -> None:
+def _wait_for_orders_filled(order_ids: list, timeout: int = 60) -> bool:
     """
     Poll T212 until all specified sell orders reach a terminal status.
 
@@ -790,19 +790,28 @@ def _wait_for_orders_filled(order_ids: list, timeout: int = 60) -> None:
     balance before buys are placed, enabling same-run sell-and-reinvest when
     markets are open.
 
-    Polls every 3 seconds up to `timeout` seconds. If orders are still pending
-    when the timeout expires, logs a warning and continues — the caller will
-    re-fetch the actual cash balance and proceed with whatever is available.
+    Polls every 3 seconds up to `timeout` seconds. Returns True if every order
+    was positively confirmed as terminal; False if the timeout expired with any
+    order still unconfirmed.
 
     Terminal statuses: FILLED, CANCELLED, CANCELLING, REJECTED, REPLACED.
+
+    NOTE: We deliberately do NOT treat orders missing from the /equity/orders
+    response as "settled". T212 moves out-of-hours queued orders to a separate
+    internal queue that does not appear in this endpoint. Treating missing orders
+    as settled was causing spurious buy orders when T212 inflated the "free" cash
+    balance with pending (unfilled) sell proceeds.
 
     Args:
         order_ids: T212 order ID strings returned by _execute_sell_or_trim().
         timeout:   Maximum seconds to wait. Default 60s is generous for
                    market-hours execution where fills are typically near-instant.
+
+    Returns:
+        bool: True if all orders confirmed terminal, False if timeout expired.
     """
     if not order_ids:
-        return
+        return True
 
     terminal = {"FILLED", "CANCELLED", "CANCELLING", "REJECTED", "REPLACED"}
     pending = {str(oid) for oid in order_ids}
@@ -825,28 +834,22 @@ def _wait_for_orders_filled(order_ids: list, timeout: int = 60) -> None:
         if not isinstance(orders, list):
             continue
 
-        seen_ids: set[str] = set()
         for order in orders:
             if not isinstance(order, dict):
                 continue
             oid = str(order.get("id", ""))
             status = (order.get("status") or "").upper()
-            seen_ids.add(oid)
             if oid in pending and status in terminal:
                 logger.info("Order %s: %s", oid, status)
                 pending.discard(oid)
 
-        # IDs not present in the response at all are assumed settled (paginated away).
-        missing = pending - seen_ids
-        if missing:
-            logger.info("Order IDs not in response (assumed settled/paginated): %s", missing)
-            pending -= missing
-
     if pending:
         logger.warning(
-            "Sell orders still pending after %ds, proceeding with whatever cash T212 shows: %s",
+            "Sell orders still pending after %ds: %s",
             timeout, pending,
         )
+        return False
+    return True
 
 
 # =============================================================================
@@ -900,6 +903,12 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
     sell_recs = [r for r in recs if r.get("action", "").upper().strip() in ("SELL", "TRIM")]
     buy_recs  = [r for r in recs if r.get("action", "").upper().strip() == "BUY"]
 
+    # Snapshot cash BEFORE any sells. Used as the buy budget cap when sells are
+    # queued out of hours — T212 may inflate "free" with pending sell proceeds,
+    # causing a buy order to pass the budget check but fail at T212 with
+    # "insufficient funds" because the proceeds haven't actually settled.
+    pre_sell_cash = _get_available_cash() if sell_recs else 0.0
+
     # --- Pass 1: execute all sells ---
     sell_order_ids: list[str] = []
     for rec in sell_recs:
@@ -927,12 +936,24 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
         except Exception as e:
             events.append(f"T212 ORDER ERROR {action} {t212_ticker}: {e}")
 
-    # Wait for all sell orders to fill, then read the real post-sell cash balance.
-    # This replaces the proceeds-estimation approach and gives an exact number.
+    # Wait for sell orders to fill, then read the real post-sell cash balance.
+    all_fills_confirmed = True
     if sell_order_ids:
-        _wait_for_orders_filled(sell_order_ids)
+        all_fills_confirmed = _wait_for_orders_filled(sell_order_ids)
 
-    expected_cash = _get_available_cash()
+    if all_fills_confirmed:
+        expected_cash = _get_available_cash()
+    else:
+        # Sells are queued for market open and haven't settled yet. T212 may
+        # credit pending sell proceeds to "free" cash, inflating the apparent
+        # balance. Cap the buy budget at the pre-sell cash to avoid placing
+        # buys that T212 will reject with "insufficient funds".
+        expected_cash = pre_sell_cash
+        if sell_recs:
+            events.append(
+                f"NOTE: Sell orders queued for market open — "
+                f"buy budget capped at pre-sell cash £{pre_sell_cash:.2f}"
+            )
     logger.info("T212 available cash for buy orders: £%.2f", expected_cash)
 
     # --- Pass 2: execute all buys ---
