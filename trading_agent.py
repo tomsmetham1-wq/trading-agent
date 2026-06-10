@@ -27,6 +27,7 @@ from datetime import datetime
 from email.message import EmailMessage
 
 import requests
+import anthropic
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
@@ -67,7 +68,7 @@ T212_BASE_URL   = (
 
 ANTHROPIC_API_KEY    = _clean(os.getenv("ANTHROPIC_API_KEY", ""))
 CLAUDE_MODEL_WEEKLY  = _clean(os.getenv("CLAUDE_MODEL_WEEKLY", "claude-sonnet-4-6"))
-CLAUDE_MODEL_DEEP    = _clean(os.getenv("CLAUDE_MODEL_DEEP", "claude-opus-4-7"))
+CLAUDE_MODEL_DEEP    = _clean(os.getenv("CLAUDE_MODEL_DEEP", "claude-opus-4-8"))
 
 EMAIL_SENDER       = _clean(os.getenv("EMAIL_SENDER", ""))
 EMAIL_APP_PASSWORD = _clean(os.getenv("EMAIL_APP_PASSWORD", ""))
@@ -177,56 +178,96 @@ def sync_shadow_with_t212(ledger: dict,
 # Claude API calls
 # =============================================================================
 
+def _create_with_retry(client: Anthropic, **kwargs):
+    """
+    Call messages.create with retries on rate-limit (429), overload (529), and
+    server errors (5xx), using exponential backoff: 60s → 120s → 240s.
+    Client errors (4xx other than 429) are raised immediately — retrying them
+    would just repeat the same failure.
+    """
+    max_retries = 4
+    wait = 60
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            return client.messages.create(**kwargs)
+        except (anthropic.RateLimitError, anthropic.APIConnectionError) as e:
+            last_exc = e
+        except anthropic.APIStatusError as e:
+            if e.status_code < 500:
+                raise
+            last_exc = e
+        if attempt < max_retries - 1:
+            logger.warning(
+                "API error (%s) — waiting %ds then retrying (attempt %d/%d)...",
+                type(last_exc).__name__, wait, attempt + 1, max_retries,
+            )
+            time.sleep(wait)
+            wait *= 2
+    raise last_exc
+
+
 def call_claude(user_prompt: str, model: str = CLAUDE_MODEL_WEEKLY,
                 use_web_search: bool = True,
                 system_prompt: str = None) -> str:
     """
     Send a prompt to Claude and return the combined text response.
 
-    When system_prompt is provided it is sent with cache_control=ephemeral so
-    Anthropic can cache the static strategy rules between runs, reducing cost.
-
-    Retries on rate-limit (HTTP 429) with exponential backoff: 60s → 120s → 240s.
+    - system_prompt is sent with cache_control=ephemeral so retries within a
+      run can reuse the cached prefix.
+    - Adaptive thinking is enabled — the model decides how much to reason,
+      which materially helps the quality of the weekly analysis.
+    - Web search uses the dynamic-filtering tool version, capped at 8 searches
+      per call to bound cost.
+    - Handles stop_reason="pause_turn": the server-side web search loop can
+      pause mid-turn; we resend the paused content so the model resumes and
+      finishes (critically, so the trailing JSON block isn't lost).
     """
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
-    max_retries = 4
-    wait = 60
-    tools = [{"type": "web_search_20250305", "name": "web_search"}] if use_web_search else []
+    tools = (
+        [{"type": "web_search_20260209", "name": "web_search", "max_uses": 8}]
+        if use_web_search else []
+    )
 
-    # Build system param with cache_control when a system prompt is provided
     system_param = None
     if system_prompt:
         system_param = [{"type": "text", "text": system_prompt,
                          "cache_control": {"type": "ephemeral"}}]
 
-    for attempt in range(max_retries):
-        try:
-            kwargs = dict(
-                model=model,
-                max_tokens=8000,
-                messages=[{"role": "user", "content": user_prompt}],
-            )
-            if system_param:
-                kwargs["system"] = system_param
-            if tools:
-                kwargs["tools"] = tools
+    messages = [{"role": "user", "content": user_prompt}]
+    text_parts: list[str] = []
+    max_continuations = 5
 
-            response = client.messages.create(**kwargs)
-            parts = [b.text for b in response.content if getattr(b, "type", "") == "text"]
-            return "\n\n".join(parts).strip()
-        except Exception as e:
-            if "rate_limit" in str(e).lower() or "429" in str(e):
-                if attempt < max_retries - 1:
-                    logger.warning(
-                        "Rate limit hit — waiting %ds then retrying (attempt %d/%d)...",
-                        wait, attempt + 1, max_retries,
-                    )
-                    time.sleep(wait)
-                    wait *= 2
-                else:
-                    raise
-            else:
-                raise
+    for continuation in range(max_continuations + 1):
+        kwargs = dict(
+            model=model,
+            max_tokens=16000,
+            thinking={"type": "adaptive"},
+            messages=messages,
+        )
+        if system_param:
+            kwargs["system"] = system_param
+        if tools:
+            kwargs["tools"] = tools
+
+        response = _create_with_retry(client, **kwargs)
+        text_parts.extend(
+            b.text for b in response.content if getattr(b, "type", "") == "text"
+        )
+
+        if response.stop_reason == "pause_turn" and continuation < max_continuations:
+            # Server tool loop paused — append the paused assistant content and
+            # resend; the API resumes where it left off.
+            messages = messages + [{"role": "assistant", "content": response.content}]
+            continue
+        if response.stop_reason == "max_tokens":
+            logger.warning(
+                "Claude response hit max_tokens — output may be truncated "
+                "(the JSON recommendations block may be missing this run)."
+            )
+        break
+
+    return "\n\n".join(text_parts).strip()
 
 
 def extract_recommendations(text: str) -> list:
@@ -260,6 +301,86 @@ def get_claude_recommendations(pre_val: dict, ledger: dict,
     recs = extract_recommendations(response)
     logger.info("Claude made %d actionable recommendation(s)", len(recs))
     return response, recs
+
+
+# =============================================================================
+# Strategy guards — mechanical enforcement of rules Claude sometimes misses
+# =============================================================================
+
+FLIP_FLOP_CALENDAR_DAYS = 7   # ≈ 5 trading days
+POSITION_HARD_CAP = 0.20      # max 20% of total portfolio value per position
+
+
+def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[list, list]:
+    """
+    Filter Claude's recommendations against the hard strategy rules in code.
+
+    The rules already exist in the prompt, but prompt-only rules get violated
+    occasionally (e.g. the NVDA buy-rebuy in May 2026). This enforces them
+    mechanically before any order reaches T212:
+
+      1. Flip-flop rule: a BUY is BLOCKED if the same ticker was fully SOLD
+         within the last ~5 trading days (7 calendar days).
+      2. Position cap: a BUY that would push a position above 20% of total
+         portfolio value is REDUCED to land exactly at the cap (or blocked if
+         the position is already at/over it).
+
+    Returns:
+        tuple: (filtered_recs, guard_events) — guard_events are human-readable
+               strings for the email report.
+    """
+    guard_events: list[str] = []
+    allowed: list[dict] = []
+    total = pre_val.get("total_value_gbp") or 0
+    positions_val = pre_val.get("positions", {})
+    today = datetime.now().date()
+
+    for rec in recs:
+        action = (rec.get("action") or "").upper().strip()
+        ticker = (rec.get("yfinance_ticker") or rec.get("ticker") or "").strip()
+
+        if action == "BUY" and ticker:
+            # Rule 1: flip-flop — look for the most recent SELL of this ticker
+            blocked = False
+            for t in reversed(ledger.get("trades", [])):
+                if t.get("ticker") != ticker or t.get("action") != "SELL":
+                    continue
+                try:
+                    sell_date = datetime.strptime(t.get("date", ""), "%Y-%m-%d").date()
+                except ValueError:
+                    break
+                if (today - sell_date).days < FLIP_FLOP_CALENDAR_DAYS:
+                    # ASCII only — these strings hit the cp1252 Windows console
+                    guard_events.append(
+                        f"BLOCKED BUY {ticker}: flip-flop rule - "
+                        f"sold on {t['date']}, within 5 trading days"
+                    )
+                    blocked = True
+                break
+            if blocked:
+                continue
+
+            # Rule 2: position cap — reduce or block buys that breach 20%
+            if total > 0:
+                amount = float(rec.get("amount_gbp") or 0)
+                current = (positions_val.get(ticker, {}) or {}).get("current_value_gbp") or 0
+                max_amount = POSITION_HARD_CAP * total - current
+                if max_amount <= 0:
+                    guard_events.append(
+                        f"BLOCKED BUY {ticker}: position already at/above the "
+                        f"20% cap ({current / total * 100:.1f}% of portfolio)"
+                    )
+                    continue
+                if amount > max_amount + 0.01:
+                    rec = {**rec, "amount_gbp": round(max_amount, 2)}
+                    guard_events.append(
+                        f"REDUCED BUY {ticker}: £{amount:.2f} -> £{max_amount:.2f} "
+                        f"to stay within the 20% position cap"
+                    )
+
+        allowed.append(rec)
+
+    return allowed, guard_events
 
 
 # =============================================================================
@@ -331,7 +452,8 @@ def check_deep_review_prerequisites(ledger: dict) -> bool:
 def build_weekly_email_body(started: datetime, post_val: dict,
                              t212_cash: dict, t212_positions: list,
                              shadow_events: list, t212_events: list,
-                             prose: str, prev_snapshot: dict = None) -> str:
+                             prose: str, prev_snapshot: dict = None,
+                             guard_events: list = None) -> str:
     """Assemble the full weekly report email body."""
     t212_total, t212_cash_available = extract_t212_totals(t212_cash)
 
@@ -367,6 +489,12 @@ def build_weekly_email_body(started: datetime, post_val: dict,
     else:
         demo_section = ""
 
+    guard_section = (
+        "\n=== Strategy guard actions (rules enforced in code) ===\n"
+        + "\n".join(f"  {e}" for e in guard_events)
+        + "\n"
+    ) if guard_events else ""
+
     return (
         f"Weekly Portfolio Review\n"
         f"Environment: {T212_ENV.upper()}\n"
@@ -376,6 +504,7 @@ def build_weekly_email_body(started: datetime, post_val: dict,
         f"{t212_section}\n"
         f"=== This week's applied trades (shadow) ===\n"
         + ("\n".join(f"  {e}" for e in shadow_events) if shadow_events else "  (none)")
+        + guard_section
         + demo_section
         + "\n\n"
         f"=== Claude's full analysis ===\n\n{prose}\n\n"
@@ -495,6 +624,11 @@ def run_weekly(started: datetime) -> None:
     # Step 5: Claude analysis
     response, recs = get_claude_recommendations(pre_val, ledger, t212_cash, t212_positions)
 
+    # Step 5b: mechanical strategy guards (flip-flop rule, 20% position cap)
+    recs, guard_events = enforce_strategy_guards(recs, ledger, pre_val)
+    for e in guard_events:
+        logger.warning("[GUARD] %s", e)
+
     # Step 6: T212 executes first — shadow mirrors only confirmed trades
     t212_events, shadow_events = execute_and_apply_trades(ledger, recs, run_date)
 
@@ -510,7 +644,7 @@ def run_weekly(started: datetime) -> None:
     prose = strip_json_block(response)
     body = build_weekly_email_body(
         started, post_val, t212_cash, t212_positions, shadow_events, t212_events, prose,
-        prev_snapshot=prev_snapshot,
+        prev_snapshot=prev_snapshot, guard_events=guard_events,
     )
     subject = build_weekly_email_subject(started, t212_total, post_val)
     try:

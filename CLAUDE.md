@@ -68,7 +68,7 @@ T212_ENV=demo              # "demo" or "live" — NEVER change to live without c
 T212_DEMO_EXECUTE=true     # Set true to mirror shadow trades to T212 demo account
 ANTHROPIC_API_KEY=...      # Anthropic API key (same account as Claude.ai)
 CLAUDE_MODEL_WEEKLY=claude-sonnet-4-6   # Weekly analysis model
-CLAUDE_MODEL_DEEP=claude-opus-4-7       # Monthly deep review model
+CLAUDE_MODEL_DEEP=claude-opus-4-8       # Monthly deep review model
 EMAIL_SENDER=...
 EMAIL_APP_PASSWORD=...     # Gmail app password (16 chars, not account password)
 EMAIL_RECIPIENT=...
@@ -152,6 +152,39 @@ All sizing rules are percentage-based so they scale as the portfolio grows.
 - **Any single-week drawdown >15% with no thesis explanation** → risk-management failure
 - **Buy-sell-rebuy flip-flop on same ticker >2× in a month** → agent is reacting to price, not fundamentals
 - **End of August 2026: remove top contributor, rest still underperforms VUSA** → lottery-ticket buyer, not stock-picker → shut down
+
+## Code-level strategy guards (added June 2026 code review)
+
+`enforce_strategy_guards()` in trading_agent.py runs after Claude's recs and
+before execution — prompt rules that were being violated are now mechanical:
+
+- **Flip-flop rule**: BUY blocked if the same ticker was SOLD within 7 calendar
+  days (~5 trading days).
+- **20% position cap**: BUY amounts are reduced to land at the cap, or blocked
+  if the position is already over it.
+- Guard actions appear in the weekly email under "Strategy guard actions".
+
+Theme tracking: every BUY rec now carries a `theme` label, persisted on the
+position and trade. `build_prompt()` computes per-theme exposure and flags any
+theme over the 60% cap in the position-size alert section. `pre_commit_trims`
+is also persisted and surfaced in the thesis review as binding.
+
+Robustness fixes from the same review (do not regress):
+- All JSON file IO uses `encoding="utf-8"` (Windows cp1252 was corrupting em-dashes).
+- `fetch_price_gbp` checks pence ("GBp"/"GBX") BEFORE "GBP" — yfinance reports
+  LSE prices in pence with currency "GBp", which uppercases to "GBP" (100x bug).
+- `_get_available_cash()` returns None (not 0.0) on API error; the buy budget
+  check is skipped when cash is unknown instead of blocking all buys.
+- Bidirectional sync refuses to wipe the ledger if T212 returns 0 positions
+  while shadow holds ≥2 (API-glitch guard).
+- Sell orders that end REJECTED/CANCELLED are removed from confirmed_recs so
+  shadow never mirrors a sell that didn't execute.
+- `call_claude` handles `stop_reason="pause_turn"` (server web-search loop can
+  pause mid-turn; without resuming, the trailing JSON block is lost), warns on
+  `max_tokens` truncation, uses adaptive thinking, and retries with typed
+  exceptions (429/5xx/529 only).
+- Weekly snapshots carry `pricing_incomplete: true` when any position had no
+  price — don't read those as real drawdowns.
 
 ## Two-model design
 

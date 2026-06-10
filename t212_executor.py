@@ -193,7 +193,7 @@ def _load_instruments() -> list[dict]:
     if INSTRUMENTS_CACHE_PATH.exists():
         age = time.time() - INSTRUMENTS_CACHE_PATH.stat().st_mtime
         if age < 86400:  # 24 hours
-            with open(INSTRUMENTS_CACHE_PATH) as f:
+            with open(INSTRUMENTS_CACHE_PATH, encoding="utf-8") as f:
                 return json.load(f)
 
     logger.info("Fetching T212 instrument list (cached for 24h)...")
@@ -203,7 +203,7 @@ def _load_instruments() -> list[dict]:
     )
     r.raise_for_status()
     instruments = r.json()
-    with open(INSTRUMENTS_CACHE_PATH, "w") as f:
+    with open(INSTRUMENTS_CACHE_PATH, "w", encoding="utf-8") as f:
         json.dump(instruments, f)
     logger.info("Fetched %d instruments.", len(instruments))
     return instruments
@@ -603,12 +603,15 @@ def _is_valid_ticker(yf_ticker: str) -> bool:
 # Order execution helpers
 # =============================================================================
 
-def _get_available_cash() -> float:
+def _get_available_cash() -> Optional[float]:
     """
     Fetch the current available-to-trade cash balance from T212.
 
     Called at the start of execute_recommendations to seed the expected-cash
-    budget tracker. Returns 0.0 on any API error so callers degrade gracefully.
+    budget tracker. Returns None on any API error — callers must treat None as
+    "cash unknown" and skip the local budget check (T212 itself still rejects
+    genuine overdrafts). Returning 0.0 here would silently block ALL buys on a
+    transient API blip, which is worse than letting T212 arbitrate.
 
     Field lookup order matches extract_t212_totals() in trading_agent.py:
       1. top-level "free"  (current T212 flat format)
@@ -616,7 +619,7 @@ def _get_available_cash() -> float:
       3. cash.availableToTrade (legacy field name)
 
     Returns:
-        float: Available cash in GBP, or 0.0 on error.
+        float: Available cash in GBP, or None if the balance couldn't be fetched.
     """
     try:
         r = requests.get(
@@ -632,7 +635,7 @@ def _get_available_cash() -> float:
         )
     except Exception as e:
         logger.warning("Couldn't fetch available cash for budget tracking: %s", e)
-        return 0.0
+        return None
 
 
 
@@ -781,7 +784,7 @@ def _execute_sell_or_trim(rec: dict, yf_ticker: str, t212_ticker: str,
 # Order fill polling
 # =============================================================================
 
-def _wait_for_orders_filled(order_ids: list, timeout: int = 120) -> bool:
+def _wait_for_orders_filled(order_ids: list, timeout: int = 120) -> tuple[bool, dict]:
     """
     Poll T212 until all specified sell orders reach a terminal status.
 
@@ -790,11 +793,12 @@ def _wait_for_orders_filled(order_ids: list, timeout: int = 120) -> bool:
     balance before buys are placed, enabling same-run sell-and-reinvest when
     markets are open.
 
-    Polls every 15 seconds up to `timeout` seconds. Returns True if every order
-    was positively confirmed as terminal; False if the timeout expired with any
-    order still unconfirmed.
+    Polls every 15 seconds up to `timeout` seconds (default 120s).
 
     Terminal statuses: FILLED, CANCELLED, CANCELLING, REJECTED, REPLACED.
+    The per-order statuses are returned so the caller can un-confirm any sell
+    that terminated WITHOUT filling (REJECTED/CANCELLED) — those must not be
+    mirrored to the shadow ledger.
 
     NOTE: We deliberately do NOT treat orders missing from the /equity/orders
     response as "settled". T212 moves out-of-hours queued orders to a separate
@@ -808,10 +812,13 @@ def _wait_for_orders_filled(order_ids: list, timeout: int = 120) -> bool:
                    fills with room to spare while keeping poll count low.
 
     Returns:
-        bool: True if all orders confirmed terminal, False if timeout expired.
+        tuple: (all_terminal, statuses) where all_terminal is True if every
+               order was positively confirmed terminal before the timeout, and
+               statuses maps order_id -> last observed terminal status string.
     """
+    statuses: dict = {}
     if not order_ids:
-        return True
+        return True, statuses
 
     terminal = {"FILLED", "CANCELLED", "CANCELLING", "REJECTED", "REPLACED"}
     pending = {str(oid) for oid in order_ids}
@@ -841,6 +848,7 @@ def _wait_for_orders_filled(order_ids: list, timeout: int = 120) -> bool:
             status = (order.get("status") or "").upper()
             if oid in pending and status in terminal:
                 logger.info("Order %s: %s", oid, status)
+                statuses[oid] = status
                 pending.discard(oid)
 
     if pending:
@@ -848,8 +856,8 @@ def _wait_for_orders_filled(order_ids: list, timeout: int = 120) -> bool:
             "Sell orders still pending after %ds: %s",
             timeout, pending,
         )
-        return False
-    return True
+        return False, statuses
+    return True, statuses
 
 
 # =============================================================================
@@ -872,12 +880,14 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
 
     Execution order — two passes with a fill-wait in between:
       Pass 1: all SELL/TRIM orders are placed.
-      Wait:   polls T212 until every sell order reaches a terminal status (up to 60s).
+      Wait:   polls T212 until every sell order reaches a terminal status (up to 120s).
+              Sells that terminate REJECTED/CANCELLED are removed from
+              confirmed_recs — they never executed, so shadow must not apply them.
       Re-fetch: reads the actual T212 cash balance after sells have settled.
       Pass 2: all BUY orders are placed against the real post-sell cash balance.
 
       This enables same-run sell-and-reinvest when running during market hours.
-      The 60-second wait is generous — market-hours fills are typically near-instant.
+      The 120-second wait is generous — market-hours fills are typically near-instant.
 
     Args:
         recs: List of recommendation dicts from extract_recommendations().
@@ -907,10 +917,12 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
     # queued out of hours — T212 may inflate "free" with pending sell proceeds,
     # causing a buy order to pass the budget check but fail at T212 with
     # "insufficient funds" because the proceeds haven't actually settled.
-    pre_sell_cash = _get_available_cash() if sell_recs else 0.0
+    pre_sell_cash = _get_available_cash() if sell_recs else None
 
     # --- Pass 1: execute all sells ---
-    sell_order_ids: list[str] = []
+    # Track order_id -> rec so sells that terminate REJECTED/CANCELLED can be
+    # un-confirmed before shadow mirrors them.
+    sell_orders: list[tuple[str, dict, str]] = []  # (order_id, rec, t212_ticker)
     for rec in sell_recs:
         action    = rec.get("action", "").upper().strip()
         yf_ticker = (rec.get("yfinance_ticker") or rec.get("ticker") or "").strip()
@@ -927,7 +939,7 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
             order_id = _execute_sell_or_trim(rec, yf_ticker, t212_ticker, action,
                                              positions_map, events, confirmed_recs)
             if order_id:
-                sell_order_ids.append(order_id)
+                sell_orders.append((order_id, rec, t212_ticker))
         except requests.HTTPError as e:
             events.append(
                 f"T212 ORDER FAILED {action} {t212_ticker}: "
@@ -938,8 +950,22 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
 
     # Wait for sell orders to fill, then read the real post-sell cash balance.
     all_fills_confirmed = True
-    if sell_order_ids:
-        all_fills_confirmed = _wait_for_orders_filled(sell_order_ids)
+    sell_statuses: dict = {}
+    if sell_orders:
+        all_fills_confirmed, sell_statuses = _wait_for_orders_filled(
+            [oid for oid, _, _ in sell_orders]
+        )
+
+    # Un-confirm sells that terminated without filling — T212 accepted the
+    # order but it never executed, so mirroring it to shadow would cause drift.
+    for order_id, rec, t212_ticker in sell_orders:
+        if sell_statuses.get(order_id) in ("REJECTED", "CANCELLED"):
+            if rec in confirmed_recs:
+                confirmed_recs.remove(rec)
+            events.append(
+                f"UNCONFIRMED {rec.get('action', 'SELL')} {t212_ticker}: "
+                f"order {order_id} ended {sell_statuses[order_id]} — not mirrored to shadow"
+            )
 
     if all_fills_confirmed:
         expected_cash = _get_available_cash()
@@ -949,12 +975,19 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
         # balance. Cap the buy budget at the pre-sell cash to avoid placing
         # buys that T212 will reject with "insufficient funds".
         expected_cash = pre_sell_cash
-        if sell_recs:
+        if sell_recs and pre_sell_cash is not None:
             events.append(
                 f"NOTE: Sell orders queued for market open — "
                 f"buy budget capped at pre-sell cash £{pre_sell_cash:.2f}"
             )
-    logger.info("T212 available cash for buy orders: £%.2f", expected_cash)
+
+    if expected_cash is None:
+        # Balance fetch failed — don't block all buys on a transient API error.
+        # T212 itself rejects genuine overdrafts, so skip the local budget check.
+        logger.warning("T212 cash balance unavailable — buy budget check disabled this run")
+        events.append("NOTE: T212 cash balance unavailable — relying on T212 to reject overdrafts")
+    else:
+        logger.info("T212 available cash for buy orders: £%.2f", expected_cash)
 
     # --- Pass 2: execute all buys ---
     for rec in buy_recs:
@@ -970,7 +1003,9 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
             continue
         try:
             amount_gbp = float(rec.get("amount_gbp") or 0)
-            if amount_gbp > 0 and expected_cash < amount_gbp - 0.01:
+            if (expected_cash is not None
+                    and amount_gbp > 0
+                    and expected_cash < amount_gbp - 0.01):
                 events.append(
                     f"SKIP BUY {yf_ticker}: insufficient funds "
                     f"(need £{amount_gbp:.2f}, have £{expected_cash:.2f})"
@@ -979,7 +1014,7 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
             prev_confirmed = len(confirmed_recs)
             _execute_buy(rec, yf_ticker, t212_ticker, instruments,
                          events, confirmed_recs)
-            if len(confirmed_recs) > prev_confirmed:
+            if len(confirmed_recs) > prev_confirmed and expected_cash is not None:
                 expected_cash -= amount_gbp
                 logger.info("Budget after BUY %s: £%.2f (-£%.2f)", yf_ticker, expected_cash, amount_gbp)
         except requests.HTTPError as e:

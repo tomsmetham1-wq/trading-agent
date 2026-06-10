@@ -59,7 +59,9 @@ def load_ledger() -> dict:
     """
     if not LEDGER_PATH.exists():
         return _default_ledger()
-    with open(LEDGER_PATH) as f:
+    # Explicit UTF-8: Windows defaults to cp1252, which corrupts any non-ASCII
+    # characters (em-dashes in theses were previously mangled this way).
+    with open(LEDGER_PATH, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -70,7 +72,7 @@ def save_ledger(ledger: dict) -> None:
     Args:
         ledger: The ledger dict to save. Overwrites the existing file.
     """
-    with open(LEDGER_PATH, "w") as f:
+    with open(LEDGER_PATH, "w", encoding="utf-8") as f:
         json.dump(ledger, f, indent=2, default=str)
 
 
@@ -231,6 +233,19 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
     # Step 2: Remove positions shadow holds that T212 doesn't — bidirectional only.
     # Positions with a pending T212 buy order are excluded: the order is queued
     # (placed outside market hours), not failed, so the shadow position is correct.
+    #
+    # Wipe guard: if T212 reports ZERO positions while shadow holds several, that
+    # is far more likely a T212 API glitch (empty 200 response) than a real
+    # liquidation — skip the removal step rather than wiping the whole ledger.
+    if bidirectional and extra_in_shadow and not t212_tickers and len(shadow_tickers) >= 2:
+        logger.warning(
+            "Sync: T212 returned 0 positions but shadow holds %d — "
+            "skipping removals this run (possible API glitch). "
+            "If the account really is empty, this will need manual review.",
+            len(shadow_tickers),
+        )
+        extra_in_shadow = set()
+
     if bidirectional and extra_in_shadow:
         queued    = (pending_yf_tickers or set()) & extra_in_shadow
         to_remove = extra_in_shadow - queued
@@ -309,7 +324,8 @@ def fetch_price_gbp(yf_ticker: str) -> Optional[float]:
     try:
         info = yf.Ticker(yf_ticker).fast_info
         price = info.last_price
-        currency = (info.currency or "").upper()
+        raw_currency = info.currency or ""
+        currency = raw_currency.upper()
     except Exception as e:
         logger.warning("price fetch failed for %s: %s", yf_ticker, e)
         return None
@@ -317,11 +333,13 @@ def fetch_price_gbp(yf_ticker: str) -> Optional[float]:
     if price is None or price <= 0:
         return None
 
+    # Pence check MUST come before the GBP check: yfinance reports LSE prices
+    # with currency "GBp" (pence), which uppercases to "GBP" and would otherwise
+    # be treated as pounds — a silent 100x overvaluation.
+    if raw_currency == "GBp" or currency in ("GBX", "GBP."):
+        return float(price) / 100
     if currency == "GBP":
         return float(price)
-    if currency in ("GBX", "GBP.", "GBp"):
-        # LSE stocks sometimes report in pence — convert to pounds
-        return float(price) / 100
     if currency == "USD":
         fx = _fx_rate("GBPUSD=X")
         return float(price) / fx if fx else None
@@ -375,6 +393,8 @@ def _apply_buy(ledger: dict, rec: dict, ticker: str,
 
     shares = amount_gbp / price
     thesis = rec.get("thesis_oneline", "")
+    theme  = (rec.get("theme") or "").strip()
+    pre_commit_trims = (rec.get("pre_commit_trims") or "").strip()
     positions = ledger["positions"]
 
     if ticker in positions:
@@ -387,6 +407,10 @@ def _apply_buy(ledger: dict, rec: dict, ticker: str,
         if thesis:
             existing = pos.get("thesis", "")
             pos["thesis"] = f"{existing} | [{run_date}] {thesis}".strip(" |")
+        if theme:
+            pos["theme"] = theme
+        if pre_commit_trims:
+            pos["pre_commit_trims"] = pre_commit_trims
     else:
         positions[ticker] = {
             "shares":       shares,
@@ -394,9 +418,13 @@ def _apply_buy(ledger: dict, rec: dict, ticker: str,
             "first_bought": run_date,
             "thesis":       thesis,
         }
+        if theme:
+            positions[ticker]["theme"] = theme
+        if pre_commit_trims:
+            positions[ticker]["pre_commit_trims"] = pre_commit_trims
 
     ledger["cash_gbp"] -= amount_gbp
-    ledger["trades"].append({
+    trade = {
         "date":       run_date,
         "action":     "BUY",
         "ticker":     ticker,
@@ -404,7 +432,12 @@ def _apply_buy(ledger: dict, rec: dict, ticker: str,
         "price_gbp":  round(price, 4),
         "amount_gbp": round(amount_gbp, 2),
         "thesis":     thesis,
-    })
+    }
+    if theme:
+        trade["theme"] = theme
+    if pre_commit_trims:
+        trade["pre_commit_trims"] = pre_commit_trims
+    ledger["trades"].append(trade)
     return f"BOUGHT £{amount_gbp:.2f} of {ticker} @ £{price:.4f}"
 
 
@@ -614,10 +647,12 @@ def _native_to_gbp(price: float, currency: str) -> Optional[float]:
     Returns:
         float: Price converted to GBP, or None if the FX rate is unavailable.
     """
-    if currency == "GBP":
-        return float(price)
+    # Pence check first — "GBp" (pence notation) must be caught before the GBP
+    # check because an upstream .upper() would make it indistinguishable.
     if currency in ("GBX", "GBp", "GBP."):
         return float(price) / 100
+    if currency == "GBP":
+        return float(price)
     if currency == "USD":
         fx = _fx_rate("GBPUSD=X")
         return float(price) / fx if fx else None
@@ -756,6 +791,13 @@ def valuation(ledger: dict, t212_price_map: Optional[dict] = None) -> dict:
         benchmark_value = None
         benchmark_pct   = None
 
+    # Flag valuations where any position couldn't be priced — its value counts
+    # as £0, so the total understates reality. Downstream consumers (snapshots,
+    # the deep review) must not treat such a run as a real drawdown.
+    pricing_incomplete = any(
+        pv.get("current_value_gbp") is None for pv in position_values.values()
+    )
+
     return {
         "cash_gbp":              round(ledger["cash_gbp"], 2),
         "positions_value_gbp":   round(total_positions_gbp, 2),
@@ -764,12 +806,13 @@ def valuation(ledger: dict, t212_price_map: Optional[dict] = None) -> dict:
         "total_return_gbp":      round(total_value - start, 2),
         "total_return_pct":      round(((total_value / start) - 1) * 100, 2) if start else 0,
         "benchmark_ticker":      ledger["benchmark_ticker"],
-        "benchmark_value_gbp":   round(benchmark_value, 2) if benchmark_value else None,
-        "benchmark_return_pct":  round(benchmark_pct, 2) if benchmark_pct else None,
+        "benchmark_value_gbp":   round(benchmark_value, 2) if benchmark_value is not None else None,
+        "benchmark_return_pct":  round(benchmark_pct, 2) if benchmark_pct is not None else None,
         "vs_benchmark_pct": (
             round(((total_value / start) - 1) * 100 - benchmark_pct, 2)
             if benchmark_pct is not None else None
         ),
+        "pricing_incomplete":    pricing_incomplete,
         "positions": position_values,
     }
 
@@ -806,6 +849,10 @@ def snapshot(ledger: dict, val: dict, run_date: str,
     }
     if t212_total_gbp is not None:
         entry["t212_total_gbp"] = round(t212_total_gbp, 2)
+    if val.get("pricing_incomplete"):
+        # One or more positions had no price this run — the total is understated.
+        # Recorded so the deep review doesn't read this as a genuine drawdown.
+        entry["pricing_incomplete"] = True
     ledger["weekly_snapshots"].append(entry)
 
 
@@ -840,10 +887,19 @@ def build_thesis_review(ledger: dict, current_val: dict) -> str:
             pnl_pct = val.get("pnl_pct")
             bought  = pos.get("first_bought", "?")
             pnl_str = f"{pnl_pct:+.2f}%" if pnl_pct is not None else "unknown"
-            lines.append(
-                f"  {ticker} (bought {bought}, P&L: {pnl_str})\n"
-                f"    Entry thesis: {thesis}"
+            theme   = pos.get("theme")
+            entry = (
+                f"  {ticker} (bought {bought}, P&L: {pnl_str}"
+                + (f", theme: {theme}" if theme else "")
+                + f")\n    Entry thesis: {thesis}"
             )
+            trims = pos.get("pre_commit_trims")
+            if trims:
+                entry += (
+                    f"\n    Pre-committed trim levels (BINDING — check against "
+                    f"current P&L): {trims}"
+                )
+            lines.append(entry)
         lines.append("")
 
     # Last 5 closed positions — shows entry reasoning vs actual exit reason

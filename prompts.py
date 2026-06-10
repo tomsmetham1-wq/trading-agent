@@ -108,6 +108,7 @@ Then, on a new line, output a JSON code block with ONLY the actionable items
       "yfinance_ticker": "AAPL",
       "amount_gbp": 500.00,
       "thesis_oneline": "Services margin expansion + buyback cadence.",
+      "theme": "consumer tech",
       "pre_commit_trims": "Trim 1/3 at +40%, trim another 1/3 at +80%."
     },
     {
@@ -144,6 +145,15 @@ Rules:
   - ONE dot only between symbol and suffix (never BA..L — that's malformed).
   - If you're not 100% certain a ticker exists on Yahoo Finance, don't include it.
   - Prefer UK/US listings over foreign ones for simplicity.
+  - Every BUY MUST include a "theme" field: a short macro-theme label using the
+    correlation test above (e.g. "AI infrastructure", "pharma", "energy",
+    "UK domestic"). Use the SAME label as existing holdings when the new
+    position would fall in the same bad scenario — the theme cap is computed
+    from these labels, so do not invent fine-grained sub-themes to dodge it.
+
+Note: the flip-flop rule and the 20% position cap are also enforced
+mechanically in code — a BUY violating them will be blocked or reduced, so
+don't propose one expecting it to slip through.
 
 IMPORTANT: You MUST end your response with the JSON block, even if you need to
 shorten the prose sections. The JSON block is required for trade execution.
@@ -307,6 +317,31 @@ def build_prompt(shadow_val: dict, shadow_ledger: dict,
     else:
         cap_alert = "All positions within limits (none above 18% soft cap)."
 
+    # Theme concentration — computed from the theme labels stored on each
+    # position at BUY time. Positions without a label are listed so Claude
+    # classifies them this run.
+    theme_exposure: dict[str, float] = {}
+    unclassified: list[str] = []
+    for ticker, pos in shadow_ledger.get("positions", {}).items():
+        value = (shadow_val["positions"].get(ticker, {}) or {}).get("current_value_gbp") or 0
+        theme = (pos.get("theme") or "").strip()
+        if theme:
+            theme_exposure[theme] = theme_exposure.get(theme, 0) + value
+        else:
+            unclassified.append(ticker)
+    if theme_exposure:
+        theme_lines = ["", "Theme exposure (cap: 60% in any single theme):"]
+        for theme, value in sorted(theme_exposure.items(), key=lambda x: -x[1]):
+            pct = value / _total * 100
+            flag = "  *** OVER 60% CAP — REBALANCING REQUIRED ***" if pct > 60 else ""
+            theme_lines.append(f"  {theme}: {pct:.1f}% (£{value:.2f}){flag}")
+        if unclassified:
+            theme_lines.append(
+                f"  Unclassified (assign a theme in this run's analysis): "
+                f"{', '.join(sorted(unclassified))}"
+            )
+        cap_alert += "\n" + "\n".join(theme_lines)
+
     # Compact T212 summary — only send what Claude needs, not the full raw response
     t212_available = float(
         t212_cash.get("free", 0)
@@ -339,7 +374,8 @@ def build_prompt(shadow_val: dict, shadow_ledger: dict,
         cap_alert=cap_alert,
         shadow_state=json.dumps(shadow_summary, indent=2, default=str),
         t212_state=json.dumps(t212_summary, indent=2, default=str),
-        trade_history=json.dumps(recent_trades, indent=2, default=str) or "(none yet)",
+        trade_history=(json.dumps(recent_trades, indent=2, default=str)
+                       if recent_trades else "(none yet)"),
         thesis_review=sp.build_thesis_review(shadow_ledger, shadow_val),
         today=datetime.now().strftime("%A, %d %B %Y"),
     )
@@ -368,13 +404,16 @@ def build_deep_review_prompt(ledger: dict, valuation: dict) -> tuple[str, str]:
         if top_pnl and top_pnl > 0:
             top_contributor = f"{top_ticker} (unrealised P&L: £{top_pnl:+.2f})"
 
+    # Strip sync noise from trades and drop weekly_snapshots from the ledger
+    # copy — snapshots are passed separately below, so including them here
+    # would just duplicate tokens.
     filtered_ledger = {
-        **ledger,
-        "trades": [
-            t for t in ledger.get("trades", [])
-            if t.get("action") != "SYNC_FROM_T212"
-        ],
+        k: v for k, v in ledger.items() if k != "weekly_snapshots"
     }
+    filtered_ledger["trades"] = [
+        t for t in ledger.get("trades", [])
+        if t.get("action") != "SYNC_FROM_T212"
+    ]
 
     user_prompt = DEEP_REVIEW_USER_TEMPLATE.format(
         ledger_json=json.dumps(filtered_ledger, indent=2, default=str),
