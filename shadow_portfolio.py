@@ -476,11 +476,15 @@ def _apply_sell_or_trim(ledger: dict, rec: dict, ticker: str,
     pos["shares"] -= shares_to_sell
     ledger["cash_gbp"] += proceeds
 
+    # A TRIM that leaves only dust is a full exit in all but name — flag it so
+    # the flip-flop guard treats it the same as a SELL.
+    closes_position = pos["shares"] < 1e-4
+
     exit_thesis = rec.get("thesis_oneline", "")
     pos_thesis = pos.get("thesis", "")
     if not pos_thesis or pos_thesis == "(synced from T212)":
         pos_thesis = _find_entry_thesis(ledger, ticker)
-    ledger["trades"].append({
+    trade = {
         "date":         run_date,
         "action":       action,
         "ticker":       ticker,
@@ -489,10 +493,13 @@ def _apply_sell_or_trim(ledger: dict, rec: dict, ticker: str,
         "amount_gbp":   round(proceeds, 2),
         "exit_thesis":  exit_thesis,
         "entry_thesis": pos_thesis,
-    })
+    }
+    if closes_position:
+        trade["closed_position"] = True
+    ledger["trades"].append(trade)
 
     # Remove dust positions left after a partial trim
-    if pos["shares"] < 1e-4:
+    if closes_position:
         del positions[ticker]
 
     return (
@@ -814,6 +821,75 @@ def valuation(ledger: dict, t212_price_map: Optional[dict] = None) -> dict:
         ),
         "pricing_incomplete":    pricing_incomplete,
         "positions": position_values,
+    }
+
+
+def compute_realized_pnl(ledger: dict) -> dict:
+    """
+    Compute realised P&L per ticker by replaying the trade log chronologically.
+
+    BUYs accumulate shares and cost; SELLs/TRIMs realise (proceeds - average
+    cost of the shares sold). This gives the deep review hard numbers instead
+    of asking the model to derive them from the raw trade log.
+
+    Positions that entered via T212 sync have no BUY trade, so their cost
+    basis is unknown — sells of such shares are skipped and the ticker is
+    listed under "tickers_with_incomplete_basis" so the deep review knows the
+    figure is partial rather than silently wrong.
+
+    Args:
+        ledger: Shadow portfolio ledger dict.
+
+    Returns:
+        dict: {
+            "total_gbp": float,                      # sum of realised P&L
+            "by_ticker": {ticker: realised_gbp},     # sorted best-first
+            "tickers_with_incomplete_basis": [str],  # cost basis partly unknown
+        }
+    """
+    holdings: dict[str, list[float]] = {}   # ticker -> [shares_held, total_cost_gbp]
+    realized: dict[str, float] = {}
+    incomplete: set[str] = set()
+
+    for t in ledger.get("trades", []):
+        action = t.get("action")
+        ticker = t.get("ticker")
+        if not ticker or ticker == "-":
+            continue
+        shares = float(t.get("shares") or 0)
+
+        if action == "BUY":
+            amount = float(t.get("amount_gbp") or 0)
+            h = holdings.setdefault(ticker, [0.0, 0.0])
+            h[0] += shares
+            h[1] += amount
+
+        elif action in ("SELL", "TRIM"):
+            proceeds = float(t.get("amount_gbp") or 0)
+            h = holdings.setdefault(ticker, [0.0, 0.0])
+            if h[0] <= 0 or shares <= 0:
+                # Selling shares we never saw bought (synced from T212) —
+                # cost basis unknown, can't realise anything meaningful.
+                incomplete.add(ticker)
+                continue
+            matched = min(shares, h[0])
+            avg_cost = h[1] / h[0]
+            matched_proceeds = proceeds * (matched / shares)
+            realized[ticker] = (
+                realized.get(ticker, 0.0) + matched_proceeds - matched * avg_cost
+            )
+            h[0] -= matched
+            h[1] -= matched * avg_cost
+            if matched < shares:
+                incomplete.add(ticker)
+
+    return {
+        "total_gbp": round(sum(realized.values()), 2),
+        "by_ticker": {
+            k: round(v, 2)
+            for k, v in sorted(realized.items(), key=lambda x: -x[1])
+        },
+        "tickers_with_incomplete_basis": sorted(incomplete),
     }
 
 

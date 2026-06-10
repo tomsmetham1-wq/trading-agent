@@ -258,6 +258,10 @@ DEEP_REVIEW_USER_TEMPLATE = """=== Full shadow portfolio ledger ===
 === Current valuation ===
 {valuation_json}
 
+=== Realised vs unrealised P&L (computed from the trade log — use these
+figures for section 1 rather than re-deriving them) ===
+{realized_pnl}
+
 Top contributor by unrealised P&L: {top_contributor}
 
 Today: {today}
@@ -415,12 +419,30 @@ def build_deep_review_prompt(ledger: dict, valuation: dict) -> tuple[str, str]:
         if t.get("action") != "SYNC_FROM_T212"
     ]
 
+    # Realised P&L computed in code; unrealised summed from the live valuation.
+    realized = sp.compute_realized_pnl(ledger)
+    unrealized_total = round(sum(
+        p.get("pnl_gbp") or 0 for p in positions_val.values()
+    ), 2)
+    realized_summary = {
+        "realized_total_gbp":   realized["total_gbp"],
+        "realized_by_ticker":   realized["by_ticker"],
+        "unrealized_total_gbp": unrealized_total,
+        "note": (
+            "Cost basis partly unknown (position entered via T212 sync, no BUY "
+            f"in trade log) for: {realized['tickers_with_incomplete_basis']}"
+            if realized["tickers_with_incomplete_basis"] else
+            "All sells matched against recorded buy cost basis."
+        ),
+    }
+
     user_prompt = DEEP_REVIEW_USER_TEMPLATE.format(
         ledger_json=json.dumps(filtered_ledger, indent=2, default=str),
         snapshots_json=json.dumps(
             ledger.get("weekly_snapshots", []), indent=2, default=str
         ),
         valuation_json=json.dumps(valuation, indent=2, default=str),
+        realized_pnl=json.dumps(realized_summary, indent=2, default=str),
         top_contributor=top_contributor,
         today=datetime.now().strftime("%A, %d %B %Y"),
     )

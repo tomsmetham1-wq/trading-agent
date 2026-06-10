@@ -1,5 +1,6 @@
 .env
 shadow_portfolio.json
+run_journal.json
 venv
 .sync_backups
 __pycache__

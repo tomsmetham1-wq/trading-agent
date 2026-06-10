@@ -25,6 +25,7 @@ import time
 import argparse
 from datetime import datetime
 from email.message import EmailMessage
+from pathlib import Path
 
 import requests
 import anthropic
@@ -73,6 +74,72 @@ CLAUDE_MODEL_DEEP    = _clean(os.getenv("CLAUDE_MODEL_DEEP", "claude-opus-4-8"))
 EMAIL_SENDER       = _clean(os.getenv("EMAIL_SENDER", ""))
 EMAIL_APP_PASSWORD = _clean(os.getenv("EMAIL_APP_PASSWORD", ""))
 EMAIL_RECIPIENT    = _clean(os.getenv("EMAIL_RECIPIENT", ""))
+
+# Crash-recovery journal: written just before T212 execution starts, cleared
+# after the ledger is saved. If a run dies in between, the journal survives
+# and blocks a same-day re-run from re-executing the same trades.
+RUN_JOURNAL_PATH = Path(os.getenv("RUN_JOURNAL_PATH", "run_journal.json"))
+
+
+# =============================================================================
+# Run journal — closes the crash window between T212 execution and ledger save
+# =============================================================================
+
+def journal_blocks_run(run_date: str) -> bool:
+    """
+    Return True if a previous run started executing trades today and never
+    finished (crash between order placement and ledger save). In that case
+    re-running would place the same orders twice — refuse, and tell the user
+    how to recover.
+
+    A journal from a previous day doesn't block: the ledger idempotency check
+    and the bidirectional sync handle stale state across days.
+    """
+    if not RUN_JOURNAL_PATH.exists():
+        return False
+    try:
+        with open(RUN_JOURNAL_PATH, encoding="utf-8") as f:
+            journal = json.load(f)
+    except Exception as e:
+        logger.error(
+            "Run journal %s is unreadable (%s). A previous run may have "
+            "crashed mid-execution. Verify T212 orders manually, then delete "
+            "the file to re-enable runs.", RUN_JOURNAL_PATH, e,
+        )
+        return True
+
+    if journal.get("date") == run_date and journal.get("status") == "executing":
+        logger.error(
+            "Run journal shows trade execution started today (%s) but never "
+            "completed — a previous run crashed after orders may have reached "
+            "T212. NOT re-running. Check the T212 order history, then delete "
+            "%s to re-enable runs (next week's sync will reconcile shadow).",
+            run_date, RUN_JOURNAL_PATH,
+        )
+        return True
+
+    # Stale journal from a previous day — safe to discard
+    clear_run_journal()
+    return False
+
+
+def write_run_journal(run_date: str, recs: list) -> None:
+    """Record that trade execution is about to start (crash marker)."""
+    with open(RUN_JOURNAL_PATH, "w", encoding="utf-8") as f:
+        json.dump({
+            "date":    run_date,
+            "status":  "executing",
+            "written": datetime.now().isoformat(timespec="seconds"),
+            "recs":    recs,
+        }, f, indent=2, default=str)
+
+
+def clear_run_journal() -> None:
+    """Remove the crash marker after the ledger has been saved successfully."""
+    try:
+        RUN_JOURNAL_PATH.unlink(missing_ok=True)
+    except OSError as e:
+        logger.warning("Couldn't remove run journal: %s", e)
 
 
 # =============================================================================
@@ -340,10 +407,17 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[li
         ticker = (rec.get("yfinance_ticker") or rec.get("ticker") or "").strip()
 
         if action == "BUY" and ticker:
-            # Rule 1: flip-flop — look for the most recent SELL of this ticker
+            # Rule 1: flip-flop — look for the most recent full exit of this
+            # ticker (a SELL, or a TRIM that closed the position)
             blocked = False
             for t in reversed(ledger.get("trades", [])):
-                if t.get("ticker") != ticker or t.get("action") != "SELL":
+                if t.get("ticker") != ticker:
+                    continue
+                is_full_exit = (
+                    t.get("action") == "SELL"
+                    or (t.get("action") == "TRIM" and t.get("closed_position"))
+                )
+                if not is_full_exit:
                     continue
                 try:
                     sell_date = datetime.strptime(t.get("date", ""), "%Y-%m-%d").date()
@@ -609,6 +683,8 @@ def run_weekly(started: datetime) -> None:
             run_date,
         )
         return
+    if journal_blocks_run(run_date):
+        return
     sp.init_benchmark_start_price(ledger)
     t212_price_map = sync_shadow_with_t212(ledger, t212_cash, t212_positions)
 
@@ -629,7 +705,12 @@ def run_weekly(started: datetime) -> None:
     for e in guard_events:
         logger.warning("[GUARD] %s", e)
 
-    # Step 6: T212 executes first — shadow mirrors only confirmed trades
+    # Step 6: T212 executes first — shadow mirrors only confirmed trades.
+    # The journal closes the crash window: if the process dies after orders
+    # reach T212 but before the ledger saves, a same-day re-run is blocked
+    # instead of placing the same orders twice.
+    if recs:
+        write_run_journal(run_date, recs)
     t212_events, shadow_events = execute_and_apply_trades(ledger, recs, run_date)
 
     # Step 7: Post-trade valuation, persist ledger with snapshot and last_run_date
@@ -639,6 +720,7 @@ def run_weekly(started: datetime) -> None:
     sp.snapshot(ledger, post_val, run_date, t212_total_gbp=t212_total)
     ledger["last_run_date"] = run_date
     sp.save_ledger(ledger)
+    clear_run_journal()
 
     # Step 8: Build and send the weekly email
     prose = strip_json_block(response)

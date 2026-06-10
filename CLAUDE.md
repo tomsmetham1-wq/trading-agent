@@ -31,6 +31,9 @@ python trading_agent.py --deep-review
 
 # Run only the deep review, skip weekly (no new trades)
 python trading_agent.py --deep-review --skip-weekly
+
+# Run the regression test suite (no network needed) — run after ANY code change
+python -m pytest test_trading_agent.py -q
 ```
 
 ## Architecture
@@ -158,11 +161,24 @@ All sizing rules are percentage-based so they scale as the portfolio grows.
 `enforce_strategy_guards()` in trading_agent.py runs after Claude's recs and
 before execution — prompt rules that were being violated are now mechanical:
 
-- **Flip-flop rule**: BUY blocked if the same ticker was SOLD within 7 calendar
-  days (~5 trading days).
+- **Flip-flop rule**: BUY blocked if the same ticker was fully exited within
+  7 calendar days (~5 trading days). Counts both SELLs and TRIMs that closed
+  the position (trades carry a `closed_position: true` flag).
 - **20% position cap**: BUY amounts are reduced to land at the cap, or blocked
   if the position is already over it.
 - Guard actions appear in the weekly email under "Strategy guard actions".
+
+Crash-recovery journal: `run_journal.json` (gitignored) is written just before
+T212 execution and deleted after the ledger saves. If a run crashes in between,
+same-day re-runs are blocked (orders may already be at T212) — check the T212
+order history, then delete the file to re-enable runs.
+
+Realised P&L: `sp.compute_realized_pnl()` replays the trade log and feeds
+computed realised-vs-unrealised figures into the deep review prompt (tickers
+whose cost basis came from T212 sync are flagged as incomplete).
+
+Test suite: `test_trading_agent.py` (56 tests, no network). Run it after any
+change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the
 position and trade. `build_prompt()` computes per-theme exposure and flags any

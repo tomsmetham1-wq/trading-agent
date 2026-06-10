@@ -2,3 +2,4 @@ anthropic>=0.40.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 yfinance>=0.2.40
+pytest>=9.0.0          # dev only — run: python -m pytest test_trading_agent.py
