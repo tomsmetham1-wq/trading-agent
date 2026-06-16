@@ -729,7 +729,7 @@ def _execute_buy(rec: dict, yf_ticker: str, t212_ticker: str,
 
 def _execute_sell_or_trim(rec: dict, yf_ticker: str, t212_ticker: str,
                            action: str, positions_map: dict,
-                           events: list, confirmed_recs: list) -> Optional[str]:
+                           events: list, confirmed_recs: list) -> Optional[tuple]:
     """
     Execute a single SELL or TRIM recommendation as a T212 market order.
 
@@ -737,8 +737,8 @@ def _execute_sell_or_trim(rec: dict, yf_ticker: str, t212_ticker: str,
     (100% for SELL, trim_pct% for TRIM), places a negative-quantity market order,
     and on success appends to events and confirmed_recs.
 
-    Returns the T212 order ID string on success, None on failure. The caller
-    collects these IDs to wait for fills before placing buy orders.
+    Returns (order_id, qty_to_sell) on success, None on failure/skip. The caller
+    uses these to confirm settlement (position dropping) before placing buys.
 
     Args:
         rec:           Recommendation dict from Claude.
@@ -750,7 +750,7 @@ def _execute_sell_or_trim(rec: dict, yf_ticker: str, t212_ticker: str,
         confirmed_recs: List to append successful recs to (for shadow mirroring).
 
     Returns:
-        str: T212 order ID on success, None on failure/skip.
+        tuple: (order_id, qty_to_sell) on success, None on failure/skip.
     """
     pos = positions_map.get(t212_ticker)
     if not pos:
@@ -777,87 +777,144 @@ def _execute_sell_or_trim(rec: dict, yf_ticker: str, t212_ticker: str,
     )
     confirmed_recs.append(rec)
     time.sleep(1.2)  # Rate-limit guard between orders
-    return str(order_id) if order_id else None
+    # qty_to_sell is returned so settlement can be confirmed by the position
+    # actually dropping by this amount (see _classify_sell_settlement).
+    return (str(order_id), qty_to_sell) if order_id else None
 
 
 # =============================================================================
-# Order fill polling
+# Sell settlement detection
 # =============================================================================
 
-def _wait_for_orders_filled(order_ids: list, timeout: int = 120) -> tuple[bool, dict]:
+def _fetch_order_statuses() -> dict:
+    """Return {order_id: STATUS} from /equity/orders, or {} on error."""
+    try:
+        r = requests.get(
+            f"{T212_BASE_URL}/equity/orders",
+            headers=_headers(), timeout=20,
+        )
+        r.raise_for_status()
+        orders = r.json()
+    except Exception as e:
+        logger.warning("Order status poll failed: %s", e)
+        return {}
+    if not isinstance(orders, list):
+        return {}
+    return {
+        str(o.get("id", "")): (o.get("status") or "").upper()
+        for o in orders if isinstance(o, dict)
+    }
+
+
+def _safe_positions_map() -> Optional[dict]:
+    """get_t212_positions_map() but returns None on error (not {}), so a fetch
+    failure is never mistaken for 'all positions gone'."""
+    try:
+        return get_t212_positions_map()
+    except Exception as e:
+        logger.warning("Positions poll failed: %s", e)
+        return None
+
+
+def _classify_sell_settlement(sell_orders: list, pre_positions: dict,
+                              cur_positions: dict, order_statuses: dict) -> dict:
     """
-    Poll T212 until all specified sell orders reach a terminal status.
+    Decide, for each placed sell/trim, whether it has SETTLED, was REJECTED /
+    CANCELLED, or is still PENDING. Pure function — no I/O, so it's unit-tested.
 
-    Called after all sell orders are placed and before any buy orders are
-    attempted. This guarantees sell proceeds are settled in the T212 cash
-    balance before buys are placed, enabling same-run sell-and-reinvest when
-    markets are open.
+    The settlement signal is the POSITION QUANTITY actually dropping. A holding
+    only shrinks after the sell executes, so a position that's gone (full SELL)
+    or reduced by ~the sold quantity (TRIM) is hard proof the cash is real. This
+    is reliable across:
+      - market-hours live fills (position drops within seconds → SETTLED),
+      - the instant-fill demo (drops immediately → SETTLED),
+      - out-of-hours live orders that queue without executing (position
+        unchanged → PENDING → caller keeps the buy budget at pre-sell cash).
 
-    Polls every 15 seconds up to `timeout` seconds (default 120s).
-
-    Terminal statuses: FILLED, CANCELLED, CANCELLING, REJECTED, REPLACED.
-    The per-order statuses are returned so the caller can un-confirm any sell
-    that terminated WITHOUT filling (REJECTED/CANCELLED) — those must not be
-    mirrored to the shadow ledger.
-
-    NOTE: We deliberately do NOT treat orders missing from the /equity/orders
-    response as "settled". T212 moves out-of-hours queued orders to a separate
-    internal queue that does not appear in this endpoint. Treating missing orders
-    as settled was causing spurious buy orders when T212 inflated the "free" cash
-    balance with pending (unfilled) sell proceeds.
+    Order status is used ONLY to distinguish REJECTED/CANCELLED (the order will
+    never execute, so shadow must un-mirror it) from a merely-queued PENDING
+    order (which stays mirrored and settles at the next market open). A position
+    delta alone can't tell those two apart.
 
     Args:
-        order_ids: T212 order ID strings returned by _execute_sell_or_trim().
-        timeout:   Maximum seconds to wait. Default 120s covers market-hours
-                   fills with room to spare while keeping poll count low.
+        sell_orders:    list of (order_id, rec, t212_ticker, qty_sold).
+        pre_positions:  {t212_ticker: pos} snapshot taken BEFORE the sells.
+        cur_positions:  {t212_ticker: pos} fetched now.
+        order_statuses: {order_id: STATUS} from _fetch_order_statuses().
 
     Returns:
-        tuple: (all_terminal, statuses) where all_terminal is True if every
-               order was positively confirmed terminal before the timeout, and
-               statuses maps order_id -> last observed terminal status string.
+        dict: {order_id: "SETTLED" | "REJECTED" | "CANCELLED" | "PENDING"}.
+    """
+    result = {}
+    for order_id, _rec, t212_ticker, qty_sold in sell_orders:
+        status = (order_statuses.get(order_id) or "").upper()
+        if status in ("REJECTED", "CANCELLED"):
+            result[order_id] = status
+            continue
+        pre_qty = float((pre_positions.get(t212_ticker) or {}).get("quantity", 0) or 0)
+        cur_qty = float((cur_positions.get(t212_ticker) or {}).get("quantity", 0) or 0)
+        dropped = pre_qty - cur_qty
+        gone = (t212_ticker not in cur_positions) and pre_qty > 0
+        if gone or dropped + 1e-3 >= qty_sold:
+            result[order_id] = "SETTLED"
+        else:
+            result[order_id] = "PENDING"
+    return result
+
+
+def _wait_for_sells_settled(sell_orders: list, pre_positions: dict,
+                            timeout: int = 120) -> tuple[bool, dict]:
+    """
+    Poll T212 until every placed sell/trim resolves (SETTLED or REJECTED/
+    CANCELLED) or the timeout expires. Settlement is confirmed by the position
+    dropping, not by an order status — see _classify_sell_settlement for why.
+
+    Polls every 15s up to `timeout` (default 120s). A positions-fetch error
+    skips that round rather than risking a false "settled".
+
+    Args:
+        sell_orders:   list of (order_id, rec, t212_ticker, qty_sold).
+        pre_positions: {t212_ticker: pos} snapshot taken BEFORE the sells.
+        timeout:       max seconds to wait.
+
+    Returns:
+        tuple: (all_resolved, statuses). all_resolved is True when nothing is
+               left PENDING — i.e. the cash balance can be trusted (no unsettled
+               proceeds inflating it). statuses maps order_id -> final state.
     """
     statuses: dict = {}
-    if not order_ids:
+    if not sell_orders:
         return True, statuses
 
-    terminal = {"FILLED", "CANCELLED", "CANCELLING", "REJECTED", "REPLACED"}
-    pending = {str(oid) for oid in order_ids}
+    pending = {oid for oid, _r, _t, _q in sell_orders}
     deadline = time.time() + timeout
+    logger.info("Waiting for %d sell order(s) to settle (up to %ds)...", len(pending), timeout)
 
-    logger.info("Waiting for %d sell order(s) to fill (up to %ds)...", len(pending), timeout)
     while pending and time.time() < deadline:
         time.sleep(15)
-        try:
-            r = requests.get(
-                f"{T212_BASE_URL}/equity/orders",
-                headers=_headers(), timeout=20,
-            )
-            r.raise_for_status()
-            orders = r.json()
-        except Exception as e:
-            logger.warning("Order status poll failed: %s", e)
-            continue
-
-        if not isinstance(orders, list):
-            continue
-
-        for order in orders:
-            if not isinstance(order, dict):
-                continue
-            oid = str(order.get("id", ""))
-            status = (order.get("status") or "").upper()
-            if oid in pending and status in terminal:
-                logger.info("Order %s: %s", oid, status)
-                statuses[oid] = status
+        cur_positions = _safe_positions_map()
+        if cur_positions is None:
+            continue  # couldn't fetch positions — don't risk a false settle
+        order_statuses = _fetch_order_statuses()
+        classified = _classify_sell_settlement(
+            sell_orders, pre_positions, cur_positions, order_statuses
+        )
+        for oid, state in classified.items():
+            if oid in pending and state != "PENDING":
+                logger.info("Sell order %s: %s", oid, state)
+                statuses[oid] = state
                 pending.discard(oid)
+        if not pending:
+            break
 
+    for oid in pending:
+        statuses[oid] = "PENDING"
     if pending:
         logger.warning(
-            "Sell orders still pending after %ds: %s",
+            "Sell orders not settled after %ds (queued for market open?): %s",
             timeout, pending,
         )
-        return False, statuses
-    return True, statuses
+    return (not pending), statuses
 
 
 # =============================================================================
@@ -878,16 +935,24 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
 
     Safety guard: refuses to execute if T212_ENV=live and T212_DEMO_EXECUTE=true.
 
-    Execution order — two passes with a fill-wait in between:
+    Execution order — two passes with a settlement-wait in between:
       Pass 1: all SELL/TRIM orders are placed.
-      Wait:   polls T212 until every sell order reaches a terminal status (up to 120s).
-              Sells that terminate REJECTED/CANCELLED are removed from
-              confirmed_recs — they never executed, so shadow must not apply them.
-      Re-fetch: reads the actual T212 cash balance after sells have settled.
-      Pass 2: all BUY orders are placed against the real post-sell cash balance.
+      Wait:   polls until each sell SETTLES (confirmed by the position quantity
+              dropping, not an order status) or is REJECTED/CANCELLED, up to 120s.
+              Rejected sells are removed from confirmed_recs — they never
+              executed, so shadow must not apply them.
+      Re-fetch: if everything resolved (nothing left queued), reads the real
+              post-sell cash; otherwise caps the buy budget at pre-sell cash.
+      Pass 2: all BUY orders are placed against that cash figure.
 
-      This enables same-run sell-and-reinvest when running during market hours.
-      The 120-second wait is generous — market-hours fills are typically near-instant.
+    Same-run sell-and-reinvest therefore works whenever the sells actually
+    execute within the run — i.e. during market hours (live or demo), and
+    always on the demo (which fills instantly regardless of clock). Out-of-hours
+    in LIVE the sells queue for the open and do not settle in time, so their
+    proceeds can't fund buys this run — those buys defer to the next run. This
+    is a T212 constraint (buying power is validated against settled cash at
+    order-placement time), not a limitation we can code around: a buy that
+    depends on un-settled sell proceeds is rejected for insufficient funds.
 
     Args:
         recs: List of recommendation dicts from extract_recommendations().
@@ -919,10 +984,14 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
     # "insufficient funds" because the proceeds haven't actually settled.
     pre_sell_cash = _get_available_cash() if sell_recs else None
 
+    # Snapshot of positions BEFORE any sells — settlement is detected by these
+    # quantities dropping (see _classify_sell_settlement).
+    pre_positions = dict(positions_map)
+
     # --- Pass 1: execute all sells ---
-    # Track order_id -> rec so sells that terminate REJECTED/CANCELLED can be
-    # un-confirmed before shadow mirrors them.
-    sell_orders: list[tuple[str, dict, str]] = []  # (order_id, rec, t212_ticker)
+    # Track (order_id, rec, t212_ticker, qty_sold) so settlement can be
+    # confirmed by the position dropping, and rejected sells un-mirrored.
+    sell_orders: list[tuple] = []
     for rec in sell_recs:
         action    = rec.get("action", "").upper().strip()
         yf_ticker = (rec.get("yfinance_ticker") or rec.get("ticker") or "").strip()
@@ -936,10 +1005,11 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
             events.append(f"SKIP {action} {yf_ticker}: no T212 ticker found")
             continue
         try:
-            order_id = _execute_sell_or_trim(rec, yf_ticker, t212_ticker, action,
-                                             positions_map, events, confirmed_recs)
-            if order_id:
-                sell_orders.append((order_id, rec, t212_ticker))
+            res = _execute_sell_or_trim(rec, yf_ticker, t212_ticker, action,
+                                        positions_map, events, confirmed_recs)
+            if res:
+                order_id, qty_sold = res
+                sell_orders.append((order_id, rec, t212_ticker, qty_sold))
         except requests.HTTPError as e:
             events.append(
                 f"T212 ORDER FAILED {action} {t212_ticker}: "
@@ -948,17 +1018,17 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
         except Exception as e:
             events.append(f"T212 ORDER ERROR {action} {t212_ticker}: {e}")
 
-    # Wait for sell orders to fill, then read the real post-sell cash balance.
-    all_fills_confirmed = True
+    # Wait for the sells to settle (confirmed by positions dropping), then read
+    # the real post-sell cash balance.
+    all_settled = True
     sell_statuses: dict = {}
     if sell_orders:
-        all_fills_confirmed, sell_statuses = _wait_for_orders_filled(
-            [oid for oid, _, _ in sell_orders]
-        )
+        all_settled, sell_statuses = _wait_for_sells_settled(sell_orders, pre_positions)
 
-    # Un-confirm sells that terminated without filling — T212 accepted the
-    # order but it never executed, so mirroring it to shadow would cause drift.
-    for order_id, rec, t212_ticker in sell_orders:
+    # Un-confirm sells that were REJECTED/CANCELLED — T212 accepted the request
+    # but it never executed, so mirroring it to shadow would cause drift. A
+    # merely-PENDING (queued) sell stays mirrored: it settles at market open.
+    for order_id, rec, t212_ticker, _qty in sell_orders:
         if sell_statuses.get(order_id) in ("REJECTED", "CANCELLED"):
             if rec in confirmed_recs:
                 confirmed_recs.remove(rec)
@@ -967,13 +1037,17 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
                 f"order {order_id} ended {sell_statuses[order_id]} — not mirrored to shadow"
             )
 
-    if all_fills_confirmed:
+    if all_settled:
+        # Nothing left PENDING — every sell either settled (proceeds real) or was
+        # rejected (no proceeds). The cash balance is now trustworthy, so buys
+        # can use the real (post-sell) figure — this is what enables same-run
+        # sell-and-reinvest when the market is open.
         expected_cash = _get_available_cash()
     else:
-        # Sells are queued for market open and haven't settled yet. T212 may
-        # credit pending sell proceeds to "free" cash, inflating the apparent
-        # balance. Cap the buy budget at the pre-sell cash to avoid placing
-        # buys that T212 will reject with "insufficient funds".
+        # At least one sell is still queued (out-of-hours live). T212 may credit
+        # pending sell proceeds to "free", inflating it — cap the buy budget at
+        # pre-sell cash so we don't place buys T212 will reject for insufficient
+        # funds. Those buys are deferred to next run, when the proceeds settle.
         expected_cash = pre_sell_cash
         if sell_recs and pre_sell_cash is not None:
             events.append(

@@ -53,13 +53,19 @@ investor who runs an experimental portfolio on Trading 212.
   is only a small excess above 15% it may be just one. Do not drip-feed one small buy
   when significant cash is available, but also don't split into more buys than conviction
   supports.
-- Same-run sell-and-reinvest: sell orders are always placed before buy orders.
-  HOWEVER, the agent typically runs at 10:00 UK on Mondays — before US markets open
-  (14:30 UK). Out-of-hours sell orders for US stocks queue for market open and their
-  proceeds are NOT settled in time for same-run buys. Size your BUYs against current
-  available cash only. If a TRIM frees up cash you want to redeploy, plan the BUY for
-  next week's run — the system will have the settled proceeds by then. Do NOT assume
-  TRIM proceeds are available in the same run.
+- Same-run sell-and-reinvest: sell orders are always executed first, and the
+  execution system waits for them to settle before placing buys. You do NOT need
+  to predict settlement timing — propose the full plan you believe is right
+  (the sells AND the buys you would fund from their proceeds), sizing those buys
+  against current cash plus the proceeds you expect your own sells to free. The
+  system then funds whatever has actually settled this run and AUTOMATICALLY
+  DEFERS any buy it cannot yet fund to a future run — it never places a buy
+  against unsettled cash. Practical consequence: when the run happens while the
+  US market is open, sell proceeds settle within the run and your reinvest buys
+  execute the same run; when the run happens before the US open (e.g. 10:00 UK
+  Monday), US sells queue for the open, so those reinvest buys are deferred and
+  will be re-proposed next run once the cash has settled. Either way, propose the
+  economically correct plan and let the system handle the timing.
 - If you cannot find enough conviction buys to deploy the cash, say so
   explicitly in section 5 — but this should be rare. There are always
   fundamentally sound stocks available somewhere.

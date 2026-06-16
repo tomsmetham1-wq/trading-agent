@@ -312,6 +312,62 @@ class TestRealizedPnl:
 
 
 # =============================================================================
+# Sell settlement detection (position-delta based)
+# =============================================================================
+
+class TestSellSettlement:
+    def _orders(self):
+        # (order_id, rec, t212_ticker, qty_sold)
+        return [
+            ("o1", {"action": "SELL"}, "AVGO_US_EQ", 3.0),
+            ("o2", {"action": "TRIM"}, "GOOGL_US_EQ", 1.5),
+        ]
+
+    def test_full_sell_settles_when_position_gone(self):
+        pre = {"AVGO_US_EQ": {"quantity": 3.0}, "GOOGL_US_EQ": {"quantity": 3.6}}
+        cur = {"GOOGL_US_EQ": {"quantity": 3.6}}   # AVGO gone
+        out = t212ex._classify_sell_settlement(
+            [self._orders()[0]], pre, cur, {})
+        assert out["o1"] == "SETTLED"
+
+    def test_trim_settles_when_quantity_drops(self):
+        pre = {"GOOGL_US_EQ": {"quantity": 3.6}}
+        cur = {"GOOGL_US_EQ": {"quantity": 2.1}}   # dropped 1.5
+        out = t212ex._classify_sell_settlement(
+            [self._orders()[1]], pre, cur, {})
+        assert out["o2"] == "SETTLED"
+
+    def test_pending_when_position_unchanged(self):
+        pre = {"AVGO_US_EQ": {"quantity": 3.0}}
+        cur = {"AVGO_US_EQ": {"quantity": 3.0}}     # queued, not executed
+        out = t212ex._classify_sell_settlement(
+            [self._orders()[0]], pre, cur, {})
+        assert out["o1"] == "PENDING"
+
+    def test_partial_drop_less_than_sold_is_pending(self):
+        pre = {"GOOGL_US_EQ": {"quantity": 3.6}}
+        cur = {"GOOGL_US_EQ": {"quantity": 3.0}}    # dropped 0.6 < 1.5
+        out = t212ex._classify_sell_settlement(
+            [self._orders()[1]], pre, cur, {})
+        assert out["o2"] == "PENDING"
+
+    def test_rejected_status_overrides_position(self):
+        pre = {"AVGO_US_EQ": {"quantity": 3.0}}
+        cur = {"AVGO_US_EQ": {"quantity": 3.0}}
+        out = t212ex._classify_sell_settlement(
+            [self._orders()[0]], pre, cur, {"o1": "REJECTED"})
+        assert out["o1"] == "REJECTED"
+
+    def test_mixed_batch(self):
+        pre = {"AVGO_US_EQ": {"quantity": 3.0}, "GOOGL_US_EQ": {"quantity": 3.6}}
+        cur = {"GOOGL_US_EQ": {"quantity": 3.6}}    # AVGO sold, GOOGL trim not yet
+        out = t212ex._classify_sell_settlement(
+            self._orders(), pre, cur, {})
+        assert out["o1"] == "SETTLED"
+        assert out["o2"] == "PENDING"
+
+
+# =============================================================================
 # Bidirectional sync
 # =============================================================================
 
