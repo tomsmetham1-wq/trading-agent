@@ -35,6 +35,20 @@ from dotenv import load_dotenv
 # Load .env BEFORE importing local modules so they can read env vars at import time
 load_dotenv()
 
+# Use the OS (Windows) certificate store for TLS verification, not just the
+# bundled certifi store. Required when the network has a TLS-intercepting proxy
+# or antivirus HTTPS scanning: it presents a certificate signed by a private
+# root CA that Windows trusts but certifi doesn't, which otherwise fails every
+# Anthropic SDK call with "CERTIFICATE_VERIFY_FAILED: unable to get local issuer
+# certificate". This does NOT disable verification — it widens the trust store
+# to match what the OS already trusts. No-op (and harmless) on networks with no
+# interceptor. Guarded so a missing truststore package degrades to certifi.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except Exception:
+    pass
+
 import shadow_portfolio as sp
 import t212_executor as t212ex
 from prompts import build_prompt, build_deep_review_prompt
@@ -247,18 +261,28 @@ def sync_shadow_with_t212(ledger: dict,
 
 def _create_with_retry(client: Anthropic, **kwargs):
     """
-    Call messages.create with retries on rate-limit (429), overload (529), and
-    server errors (5xx), using exponential backoff: 60s → 120s → 240s.
+    Run a streamed messages request and return the final assembled Message,
+    with retries on rate-limit (429), overload (529), server errors (5xx), and
+    transient connection drops, using exponential backoff: 30s → 60s → 120s.
     Client errors (4xx other than 429) are raised immediately — retrying them
     would just repeat the same failure.
+
+    Streaming (not messages.create) is REQUIRED here: the weekly call runs a
+    long server-side web-search + adaptive-thinking loop that can take several
+    minutes. A non-streaming request holds one HTTP connection idle for that
+    whole time and the connection gets dropped (APIConnectionError ~3 min in);
+    streaming keeps data flowing so read timeouts never fire. get_final_message
+    assembles the complete Message (text + stop_reason) just like create would.
     """
     max_retries = 4
-    wait = 60
+    wait = 30
     last_exc = None
     for attempt in range(max_retries):
         try:
-            return client.messages.create(**kwargs)
-        except (anthropic.RateLimitError, anthropic.APIConnectionError) as e:
+            with client.messages.stream(**kwargs) as stream:
+                return stream.get_final_message()
+        except (anthropic.RateLimitError, anthropic.APIConnectionError,
+                anthropic.APITimeoutError) as e:
             last_exc = e
         except anthropic.APIStatusError as e:
             if e.status_code < 500:
@@ -308,7 +332,10 @@ def call_claude(user_prompt: str, model: str = CLAUDE_MODEL_WEEKLY,
     for continuation in range(max_continuations + 1):
         kwargs = dict(
             model=model,
-            max_tokens=16000,
+            # Streaming (in _create_with_retry) means a high ceiling is safe and
+            # gives adaptive thinking + web-search summaries + prose + the JSON
+            # block room to complete without a max_tokens truncation.
+            max_tokens=32000,
             thinking={"type": "adaptive"},
             messages=messages,
         )
@@ -318,8 +345,13 @@ def call_claude(user_prompt: str, model: str = CLAUDE_MODEL_WEEKLY,
             kwargs["tools"] = tools
 
         response = _create_with_retry(client, **kwargs)
+        block_types = [getattr(b, "type", "?") for b in response.content]
         text_parts.extend(
             b.text for b in response.content if getattr(b, "type", "") == "text"
+        )
+        logger.info(
+            "Claude iter=%d stop_reason=%s blocks=%s",
+            continuation, response.stop_reason, block_types,
         )
 
         if response.stop_reason == "pause_turn" and continuation < max_continuations:

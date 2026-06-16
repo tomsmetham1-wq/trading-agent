@@ -2,4 +2,5 @@ anthropic>=0.40.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 yfinance>=0.2.40
+truststore>=0.9.0      # use the OS cert store for TLS (handles intercepting proxies/AV)
 pytest>=9.0.0          # dev only — run: python -m pytest test_trading_agent.py
