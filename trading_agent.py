@@ -316,7 +316,7 @@ def call_claude(user_prompt: str, model: str = CLAUDE_MODEL_WEEKLY,
     """
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
     tools = (
-        [{"type": "web_search_20260209", "name": "web_search", "max_uses": 8}]
+        [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}]
         if use_web_search else []
     )
 
