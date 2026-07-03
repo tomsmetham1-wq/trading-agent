@@ -5,4 +5,5 @@ venv
 .sync_backups
 __pycache__
 t212_instruments.json
+os_ca_bundle.pem
 *.__pyc

@@ -15,6 +15,14 @@ from typing import Optional
 
 import logging
 
+# Point curl_cffi (yfinance's HTTPS client) at the OS trust store BEFORE
+# yfinance is imported, so it trusts any local TLS-interceptor root (e.g. Avast
+# HTTPS scanning) that Windows already trusts. Without this, every yfinance
+# price/FX call fails with "unable to get local issuer certificate" behind such
+# an interceptor. No-op on non-Windows / non-intercepted networks.
+from os_ca_bundle import ensure_os_ca_bundle
+ensure_os_ca_bundle()
+
 import yfinance as yf
 
 logger = logging.getLogger(__name__)

@@ -844,14 +844,26 @@ def build_deep_review_email_subject(started: datetime, val: dict) -> str:
 # =============================================================================
 
 def send_email(subject: str, body: str) -> None:
-    """Send a plain-text email via Gmail SMTP SSL (port 465)."""
+    """
+    Send a plain-text email via Gmail SMTP using STARTTLS on port 587.
+
+    Port 587 + STARTTLS is used rather than implicit SSL on 465 because Avast
+    Mail Shield (and similar AV mail scanners) intercept implicit-SSL 465 with
+    a cert whose root isn't in the Windows trust store — the handshake then
+    fails "root certificate not trusted by the trust provider". On 587 the AV
+    passes Gmail's real certificate through, so truststore verification (Windows
+    store) succeeds. No verification is disabled.
+    """
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = EMAIL_SENDER
     msg["To"] = EMAIL_RECIPIENT
     msg.set_content(body)
     ctx = ssl.create_default_context()
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as s:
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
+        s.ehlo()
+        s.starttls(context=ctx)
+        s.ehlo()
         s.login(EMAIL_SENDER, EMAIL_APP_PASSWORD)
         s.send_message(msg)
 
