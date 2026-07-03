@@ -208,10 +208,11 @@ def extract_t212_totals(t212_cash: dict) -> tuple[float, float]:
             or t212_cash.get("totalValue")
             or t212_cash.get("free", 0)
         )
+        # (x or {}) guards against the API returning "cash": null
         t212_cash_available = float(
             t212_cash.get("free", 0)
-            or t212_cash.get("cash", {}).get("free", 0)
-            or t212_cash.get("cash", {}).get("availableToTrade", 0)
+            or (t212_cash.get("cash") or {}).get("free", 0)
+            or (t212_cash.get("cash") or {}).get("availableToTrade", 0)
         )
         return t212_total, t212_cash_available
     except Exception:
@@ -370,19 +371,26 @@ def call_claude(user_prompt: str, model: str = CLAUDE_MODEL_WEEKLY,
 
 
 def extract_recommendations(text: str) -> list:
-    """Extract the structured JSON recommendations block from Claude's prose response."""
-    match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if not match:
-        match = re.search(r"```\s*(\{[^`]*?\"recommendations\".*?\})\s*```",
-                          text, re.DOTALL)
-    if not match:
-        logger.warning("No JSON block found in Claude response")
-        return []
-    try:
-        return json.loads(match.group(1)).get("recommendations", [])
-    except json.JSONDecodeError as e:
-        logger.warning("JSON parse error: %s", e)
-        return []
+    """
+    Extract the structured JSON recommendations block from Claude's prose response.
+
+    Scans ALL fenced JSON blocks and uses the LAST one that carries a
+    "recommendations" key. The model is instructed to END with the block, so
+    the last one is authoritative — taking the first would execute an echoed
+    example block (e.g. if the model restates the schema in its prose).
+    """
+    blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    for block in reversed(blocks):
+        try:
+            data = json.loads(block)
+        except json.JSONDecodeError as e:
+            logger.warning("JSON parse error in candidate block: %s", e)
+            continue
+        if isinstance(data, dict) and "recommendations" in data:
+            recs = data["recommendations"]
+            return recs if isinstance(recs, list) else []
+    logger.warning("No JSON recommendations block found in Claude response")
+    return []
 
 
 def strip_json_block(text: str) -> str:
@@ -408,6 +416,85 @@ def get_claude_recommendations(pre_val: dict, ledger: dict,
 
 FLIP_FLOP_CALENDAR_DAYS = 7   # ≈ 5 trading days
 POSITION_HARD_CAP = 0.20      # max 20% of total portfolio value per position
+THEME_HARD_CAP = 0.60         # max 60% of total portfolio value per macro theme
+MIN_ORDER_GBP = 25.0          # a cap-reduced buy below this is blocked, not placed
+CASH_FLOOR_ALERT = 0.04       # warn when planned buys leave cash below ~5% reserve
+
+# Matches "+40%" style triggers inside pre-committed trim text,
+# e.g. "Trim 1/3 at +40%, trim another 1/3 at +80%."
+_TRIM_TRIGGER_RE = re.compile(r"\+\s*(\d+(?:\.\d+)?)\s*%")
+
+
+def _rec_ticker(rec: dict) -> str:
+    return (rec.get("yfinance_ticker") or rec.get("ticker") or "").strip()
+
+
+def _recent_full_exit_date(ledger: dict, ticker: str, today) -> str | None:
+    """
+    Return the date string of the most recent full exit (SELL, or TRIM that
+    closed the position) of ticker if it falls within the flip-flop window,
+    else None.
+    """
+    for t in reversed(ledger.get("trades", [])):
+        if t.get("ticker") != ticker:
+            continue
+        is_full_exit = (
+            t.get("action") == "SELL"
+            or (t.get("action") == "TRIM" and t.get("closed_position"))
+        )
+        if not is_full_exit:
+            continue
+        try:
+            sell_date = datetime.strptime(t.get("date", ""), "%Y-%m-%d").date()
+        except ValueError:
+            return None
+        if (today - sell_date).days < FLIP_FLOP_CALENDAR_DAYS:
+            return t["date"]
+        return None
+    return None
+
+
+def _pre_commit_trim_alerts(recs: list, ledger: dict, pre_val: dict) -> list[str]:
+    """
+    Advisory alerts (never blocking) for pre-committed trim levels that have
+    been hit but not acted on this run.
+
+    Trim levels are stored as free text at BUY time ("Trim 1/3 at +40%, trim
+    another 1/3 at +80%."). The prompt calls them binding, but nothing checked
+    compliance in code — this parses the "+N%" triggers, compares against the
+    position's current P&L, and flags any level the model ignored. Levels
+    already honoured are skipped by counting TRIM trades since the position
+    was opened.
+    """
+    alerts: list[str] = []
+    acted = {
+        _rec_ticker(r) for r in recs
+        if (r.get("action") or "").upper().strip() in ("SELL", "TRIM")
+    }
+    positions_val = pre_val.get("positions", {})
+
+    for ticker, pos in ledger.get("positions", {}).items():
+        trims_text = (pos.get("pre_commit_trims") or "").strip()
+        if not trims_text or ticker in acted:
+            continue
+        pnl_pct = (positions_val.get(ticker, {}) or {}).get("pnl_pct")
+        if pnl_pct is None:
+            continue
+        triggers = sorted(float(m) for m in _TRIM_TRIGGER_RE.findall(trims_text))
+        hit = [lvl for lvl in triggers if pnl_pct >= lvl]
+        if not hit:
+            continue
+        trims_done = sum(
+            1 for t in ledger.get("trades", [])
+            if t.get("action") == "TRIM" and t.get("ticker") == ticker
+            and t.get("date", "") >= pos.get("first_bought", "")
+        )
+        if len(hit) > trims_done:
+            alerts.append(
+                f"ALERT {ticker}: pre-committed trim level +{hit[trims_done]:.0f}% "
+                f"hit (P&L {pnl_pct:+.1f}%) but no TRIM recommended this run"
+            )
+    return alerts
 
 
 def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[list, list]:
@@ -415,14 +502,26 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[li
     Filter Claude's recommendations against the hard strategy rules in code.
 
     The rules already exist in the prompt, but prompt-only rules get violated
-    occasionally (e.g. the NVDA buy-rebuy in May 2026). This enforces them
-    mechanically before any order reaches T212:
+    occasionally (e.g. the NVDA buy-rebuy in May 2026, the 81% AI-theme
+    concentration in June 2026). Enforced mechanically before any order
+    reaches T212:
 
       1. Flip-flop rule: a BUY is BLOCKED if the same ticker was fully SOLD
-         within the last ~5 trading days (7 calendar days).
+         within the last ~5 trading days (7 calendar days) — including a full
+         exit recommended IN THIS SAME RUN, which the trade-history check
+         can't see because the sell hasn't hit the ledger yet.
       2. Position cap: a BUY that would push a position above 20% of total
          portfolio value is REDUCED to land exactly at the cap (or blocked if
-         the position is already at/over it).
+         the position is already over it, or the reduced order would be dust).
+         Multiple BUYs of the same ticker in one run are counted cumulatively.
+      3. Theme cap: a BUY whose theme label would push that macro theme above
+         60% of total portfolio value is REDUCED or BLOCKED. Exposure freed by
+         SELL/TRIM recs of the same theme in this run is credited first, so a
+         legitimate rebalance-within-theme isn't wrongly blocked.
+
+    Advisory alerts (returned in guard_events but never blocking):
+      - a pre-committed trim level was hit but no TRIM was recommended;
+      - the planned buys would leave cash below the 5% reserve floor.
 
     Returns:
         tuple: (filtered_recs, guard_events) — guard_events are human-readable
@@ -432,46 +531,76 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[li
     allowed: list[dict] = []
     total = pre_val.get("total_value_gbp") or 0
     positions_val = pre_val.get("positions", {})
+    ledger_positions = ledger.get("positions", {})
     today = datetime.now().date()
+
+    def _pos_value(ticker: str) -> float:
+        return (positions_val.get(ticker, {}) or {}).get("current_value_gbp") or 0.0
+
+    # Tickers fully exited in THIS run's rec list — a BUY of the same ticker in
+    # the same run is a flip-flop the ledger history can't catch.
+    same_run_exits: set[str] = set()
+    for rec in recs:
+        action = (rec.get("action") or "").upper().strip()
+        ticker = _rec_ticker(rec)
+        if not ticker:
+            continue
+        if action == "SELL" or (
+            action == "TRIM" and float(rec.get("trim_pct") or 50) >= 99.9
+        ):
+            same_run_exits.add(ticker)
+
+    # Theme exposure from ledger labels, credited with what this run's sells
+    # free up (a SELL releases the full position value, a TRIM its trim_pct).
+    theme_exposure: dict[str, float] = {}
+    for ticker, pos in ledger_positions.items():
+        theme = (pos.get("theme") or "").strip().lower()
+        if theme:
+            theme_exposure[theme] = theme_exposure.get(theme, 0.0) + _pos_value(ticker)
+    for rec in recs:
+        action = (rec.get("action") or "").upper().strip()
+        if action not in ("SELL", "TRIM"):
+            continue
+        ticker = _rec_ticker(rec)
+        theme = ((ledger_positions.get(ticker) or {}).get("theme") or "").strip().lower()
+        if not theme:
+            continue
+        freed = _pos_value(ticker)
+        if action == "TRIM":
+            freed *= min(float(rec.get("trim_pct") or 50), 100) / 100
+        theme_exposure[theme] = theme_exposure.get(theme, 0.0) - freed
+
+    bought_so_far: dict[str, float] = {}  # per-ticker GBP committed this run
 
     for rec in recs:
         action = (rec.get("action") or "").upper().strip()
-        ticker = (rec.get("yfinance_ticker") or rec.get("ticker") or "").strip()
+        ticker = _rec_ticker(rec)
 
         if action == "BUY" and ticker:
-            # Rule 1: flip-flop — look for the most recent full exit of this
-            # ticker (a SELL, or a TRIM that closed the position)
-            blocked = False
-            for t in reversed(ledger.get("trades", [])):
-                if t.get("ticker") != ticker:
-                    continue
-                is_full_exit = (
-                    t.get("action") == "SELL"
-                    or (t.get("action") == "TRIM" and t.get("closed_position"))
+            # Rule 1: flip-flop — against trade history, then this run's sells.
+            # ASCII only — these strings hit the cp1252 Windows console.
+            exit_date = _recent_full_exit_date(ledger, ticker, today)
+            if exit_date:
+                guard_events.append(
+                    f"BLOCKED BUY {ticker}: flip-flop rule - "
+                    f"sold on {exit_date}, within 5 trading days"
                 )
-                if not is_full_exit:
-                    continue
-                try:
-                    sell_date = datetime.strptime(t.get("date", ""), "%Y-%m-%d").date()
-                except ValueError:
-                    break
-                if (today - sell_date).days < FLIP_FLOP_CALENDAR_DAYS:
-                    # ASCII only — these strings hit the cp1252 Windows console
-                    guard_events.append(
-                        f"BLOCKED BUY {ticker}: flip-flop rule - "
-                        f"sold on {t['date']}, within 5 trading days"
-                    )
-                    blocked = True
-                break
-            if blocked:
+                continue
+            if ticker in same_run_exits:
+                guard_events.append(
+                    f"BLOCKED BUY {ticker}: flip-flop rule - "
+                    f"this same run also fully exits {ticker}"
+                )
                 continue
 
-            # Rule 2: position cap — reduce or block buys that breach 20%
+            amount = float(rec.get("amount_gbp") or 0)
+
+            # Rule 2: position cap — reduce or block buys that breach 20%,
+            # counting earlier buys of the same ticker in this run.
             if total > 0:
-                amount = float(rec.get("amount_gbp") or 0)
-                current = (positions_val.get(ticker, {}) or {}).get("current_value_gbp") or 0
+                current = _pos_value(ticker) + bought_so_far.get(ticker, 0.0)
                 max_amount = POSITION_HARD_CAP * total - current
-                if max_amount <= 0:
+                if max_amount < MIN_ORDER_GBP:
                     guard_events.append(
                         f"BLOCKED BUY {ticker}: position already at/above the "
                         f"20% cap ({current / total * 100:.1f}% of portfolio)"
@@ -483,8 +612,54 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[li
                         f"REDUCED BUY {ticker}: £{amount:.2f} -> £{max_amount:.2f} "
                         f"to stay within the 20% position cap"
                     )
+                    amount = round(max_amount, 2)
+
+            # Rule 3: theme cap — reduce or block buys that breach 60% per theme
+            theme_label = (rec.get("theme") or "").strip()
+            theme = theme_label.lower()
+            if total > 0 and theme and amount > 0:
+                headroom = THEME_HARD_CAP * total - theme_exposure.get(theme, 0.0)
+                if headroom < MIN_ORDER_GBP:
+                    guard_events.append(
+                        f"BLOCKED BUY {ticker}: '{theme_label}' theme already "
+                        f"at/above the 60% cap"
+                    )
+                    continue
+                if amount > headroom + 0.01:
+                    rec = {**rec, "amount_gbp": round(headroom, 2)}
+                    guard_events.append(
+                        f"REDUCED BUY {ticker}: £{amount:.2f} -> £{headroom:.2f} "
+                        f"to stay within the 60% '{theme_label}' theme cap"
+                    )
+                    amount = round(headroom, 2)
+            if theme:
+                theme_exposure[theme] = theme_exposure.get(theme, 0.0) + amount
+            bought_so_far[ticker] = bought_so_far.get(ticker, 0.0) + amount
 
         allowed.append(rec)
+
+    # Advisory alerts — surfaced in the email, never blocking
+    guard_events.extend(_pre_commit_trim_alerts(recs, ledger, pre_val))
+
+    cash = pre_val.get("cash_gbp")
+    if cash is not None and total > 0:
+        planned_buys = sum(
+            float(r.get("amount_gbp") or 0) for r in allowed
+            if (r.get("action") or "").upper().strip() == "BUY"
+        )
+        est_proceeds = 0.0
+        for r in allowed:
+            a = (r.get("action") or "").upper().strip()
+            if a not in ("SELL", "TRIM"):
+                continue
+            v = _pos_value(_rec_ticker(r))
+            est_proceeds += v if a == "SELL" else v * min(float(r.get("trim_pct") or 50), 100) / 100
+        cash_after = cash + est_proceeds - planned_buys
+        if cash_after < CASH_FLOOR_ALERT * total:
+            guard_events.append(
+                f"ALERT: planned buys would leave estimated cash at £{cash_after:.2f} "
+                f"({cash_after / total * 100:.1f}% of portfolio) - below the 5% reserve floor"
+            )
 
     return allowed, guard_events
 
@@ -572,6 +747,19 @@ def build_weekly_email_body(started: datetime, post_val: dict,
             f"\n\nWeek-on-week:     £{wow_gbp:+.2f} ({wow_pct:+.2f}%)"
             f" since {prev_snapshot['date']}"
         )
+        if prev_snapshot.get("pricing_incomplete") or post_val.get("pricing_incomplete"):
+            perf_section += (
+                "\n  (a position had no price in this comparison - "
+                "treat week-on-week as indicative only)"
+            )
+        elif wow_pct <= -15:
+            # Kill criterion: single-week drawdown >15% needs a thesis-level
+            # explanation — flag it the week it happens, not at month end.
+            perf_section += (
+                "\n*** KILL-CRITERION WARNING: single-week drawdown over 15%. "
+                "Check Claude's analysis for a thesis-level explanation - "
+                "if there isn't one, this is a risk-management failure. ***"
+            )
 
     attribution = sp.format_attribution_for_email(post_val)
     if attribution:

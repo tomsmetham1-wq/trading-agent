@@ -179,11 +179,12 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
     missing_in_shadow = t212_tickers - shadow_tickers   # T212 holds it, shadow doesn't
     extra_in_shadow   = shadow_tickers - t212_tickers   # Shadow holds it, T212 doesn't
 
-    # T212 account summary returns flat {"free": ..., "total": ...}
+    # T212 account summary returns flat {"free": ..., "total": ...}.
+    # (x or {}) guards against the API returning "cash": null.
     t212_available = float(
         t212_cash.get("free", 0)
-        or t212_cash.get("cash", {}).get("free", 0)
-        or t212_cash.get("cash", {}).get("availableToTrade", 0)
+        or (t212_cash.get("cash") or {}).get("free", 0)
+        or (t212_cash.get("cash") or {}).get("availableToTrade", 0)
     )
     cash_changed = bidirectional and abs(t212_available - ledger["cash_gbp"]) > 1.0
 
@@ -197,6 +198,8 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
 
     today = datetime.now().strftime("%Y-%m-%d")
     changed = False
+    added: list[str] = []    # what actually got added/removed — the candidate
+    removed: list[str] = []  # sets can shrink (skips, queued orders, wipe guard)
 
     # Step 1: Add positions T212 holds that shadow is missing
     if missing_in_shadow:
@@ -228,6 +231,7 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
                 "first_bought": today,
                 "thesis":       "(synced from T212)",
             }
+            added.append(yf_ticker)
             changed = True
 
     # Step 2: Remove positions shadow holds that T212 doesn't — bidirectional only.
@@ -255,6 +259,7 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
             logger.info("Sync: removing from shadow (not in T212): %s", sorted(to_remove))
             for yf_ticker in to_remove:
                 del ledger["positions"][yf_ticker]
+            removed = sorted(to_remove)
             changed = True
 
     # Step 3: Sync cash to T212's actual balance — bidirectional only
@@ -268,8 +273,8 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
             "action": "SYNC_FROM_T212",
             "ticker": "-",
             "note": (
-                f"Bidirectional sync: added {sorted(missing_in_shadow)}, "
-                f"removed {sorted(extra_in_shadow)}, "
+                f"Bidirectional sync: added {sorted(added)}, "
+                f"removed {removed}, "
                 f"cash set to £{t212_available:.2f}"
             ),
         })

@@ -41,7 +41,14 @@ investor who runs an experimental portfolio on Trading 212.
   the same bad scenario?" If yes, they are one theme. You MUST hold at least one position
   outside the dominant theme.
 - Flip-flop rule: do NOT recommend a BUY for any ticker within 5 trading days of
-  having SOLD or TRIMMED that ticker to zero. Check the trade history.
+  having SOLD or TRIMMED that ticker to zero. Check the trade history. This
+  includes the same run: never SELL a ticker and BUY it back in the same set of
+  recommendations.
+- An imminent earnings date is NOT a fundamental thesis. Do not initiate or add
+  to a position primarily to capture an earnings reaction ("buy ahead of
+  earnings") — that is event-driven momentum trading. Buy only what you would
+  still buy if the next earnings report were three months away. Mentioning an
+  upcoming catalyst as context is fine; it must not be the reason.
 
 === Deployment rules — MANDATORY ===
 - Available cash is shown in the portfolio state below.
@@ -157,9 +164,11 @@ Rules:
     position would fall in the same bad scenario — the theme cap is computed
     from these labels, so do not invent fine-grained sub-themes to dodge it.
 
-Note: the flip-flop rule and the 20% position cap are also enforced
-mechanically in code — a BUY violating them will be blocked or reduced, so
-don't propose one expecting it to slip through.
+Note: the flip-flop rule, the 20% position cap, and the 60% theme cap are also
+enforced mechanically in code — a BUY violating them will be blocked or
+reduced, so don't propose one expecting it to slip through. Pre-committed trim
+levels are checked in code too: if a level is hit and you don't act, the
+omission is flagged in the report.
 
 IMPORTANT: You MUST end your response with the JSON block, even if you need to
 shorten the prose sections. The JSON block is required for trade execution.
@@ -353,10 +362,11 @@ def build_prompt(shadow_val: dict, shadow_ledger: dict,
         cap_alert += "\n" + "\n".join(theme_lines)
 
     # Compact T212 summary — only send what Claude needs, not the full raw response
+    # (x or {}) guards against the API returning "cash": null
     t212_available = float(
         t212_cash.get("free", 0)
-        or t212_cash.get("cash", {}).get("free", 0)
-        or t212_cash.get("cash", {}).get("availableToTrade", 0)
+        or (t212_cash.get("cash") or {}).get("free", 0)
+        or (t212_cash.get("cash") or {}).get("availableToTrade", 0)
     )
     t212_total_val = float(
         t212_cash.get("total", 0)

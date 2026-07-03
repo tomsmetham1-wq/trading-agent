@@ -90,6 +90,11 @@ class TestTranslation:
     def test_reverse_uses_short_name_for_renamed(self):
         assert t212ex.t212_to_yf_ticker("FB_US_EQ", INSTRUMENTS) == "META"
 
+    def test_reverse_us_dot_class_uses_dash(self):
+        # yfinance prices US share classes with a dash (BRK-B), not the dot
+        # T212's shortName uses — the dot form is unpriceable on yfinance
+        assert t212ex.t212_to_yf_ticker("BRK_B_US_EQ", INSTRUMENTS) == "BRK-B"
+
     def test_reverse_lse_gets_l_suffix(self):
         assert t212ex.t212_to_yf_ticker("SHELl_EQ", INSTRUMENTS) == "SHEL.L"
 
@@ -201,6 +206,164 @@ class TestStrategyGuards:
             recs, {"trades": [], "positions": {}}, self._pre_val())
         assert out == recs
         assert events == []
+
+    def test_same_run_sell_then_rebuy_blocked(self):
+        recs = [
+            {"action": "SELL", "yfinance_ticker": "DELL"},
+            {"action": "BUY", "yfinance_ticker": "DELL", "amount_gbp": 300},
+        ]
+        out, events = ta.enforce_strategy_guards(
+            recs, {"trades": [], "positions": {}}, self._pre_val())
+        assert [r["action"] for r in out] == ["SELL"]
+        assert any("flip-flop" in e and "same run" in e for e in events)
+
+    def test_same_run_partial_trim_allows_buy(self):
+        recs = [
+            {"action": "TRIM", "yfinance_ticker": "DELL", "trim_pct": 30},
+            {"action": "BUY", "yfinance_ticker": "DELL", "amount_gbp": 50},
+        ]
+        out, _ = ta.enforce_strategy_guards(
+            recs, {"trades": [], "positions": {}}, self._pre_val())
+        assert [r["action"] for r in out] == ["TRIM", "BUY"]
+
+    def test_multiple_buys_same_ticker_capped_cumulatively(self):
+        # DELL at £1,100 of £6,000 → £100 headroom under the 20% cap.
+        # First £80 buy fits; second £80 buy must be blocked (only £20 left,
+        # below the £25 minimum order).
+        recs = [
+            {"action": "BUY", "yfinance_ticker": "DELL", "amount_gbp": 80},
+            {"action": "BUY", "yfinance_ticker": "DELL", "amount_gbp": 80},
+        ]
+        out, events = ta.enforce_strategy_guards(
+            recs, {"trades": [], "positions": {}}, self._pre_val())
+        assert len(out) == 1
+        assert any("BLOCKED" in e for e in events)
+
+
+class TestThemeCapGuard:
+    def _ledger(self):
+        return {"trades": [], "positions": {
+            "AVGO": {"theme": "AI infrastructure"},
+            "NVDA": {"theme": "AI infrastructure"},
+            "ABBV": {"theme": "pharma"},
+        }}
+
+    def _pre_val(self, avgo=350.0, nvda=300.0):
+        return {
+            "total_value_gbp": 1000.0,
+            "cash_gbp": 400.0,
+            "positions": {
+                "AVGO": {"current_value_gbp": avgo},
+                "NVDA": {"current_value_gbp": nvda},
+                "ABBV": {"current_value_gbp": 100.0},
+            },
+        }
+
+    def test_buy_blocked_when_theme_at_cap(self):
+        # AI theme at 65% — any further AI buy is blocked
+        out, events = ta.enforce_strategy_guards(
+            [{"action": "BUY", "yfinance_ticker": "AMD", "amount_gbp": 100,
+              "theme": "AI infrastructure"}],
+            self._ledger(), self._pre_val())
+        assert out == []
+        assert any("theme" in e and "BLOCKED" in e for e in events)
+
+    def test_buy_reduced_to_theme_headroom(self):
+        # AI theme at 50% (500/1000) — £100 headroom under the 60% cap
+        out, events = ta.enforce_strategy_guards(
+            [{"action": "BUY", "yfinance_ticker": "AMD", "amount_gbp": 200,
+              "theme": "AI infrastructure"}],
+            self._ledger(), self._pre_val(avgo=250.0, nvda=250.0))
+        assert out[0]["amount_gbp"] == pytest.approx(100.0)
+        assert any("theme cap" in e for e in events)
+
+    def test_same_run_sell_frees_theme_headroom(self):
+        # AI theme at 65%, but this run sells AVGO (350) → 30% after — a
+        # rebalance-within-theme buy must not be wrongly blocked
+        out, events = ta.enforce_strategy_guards(
+            [{"action": "SELL", "yfinance_ticker": "AVGO"},
+             {"action": "BUY", "yfinance_ticker": "AMD", "amount_gbp": 200,
+              "theme": "AI infrastructure"}],
+            self._ledger(), self._pre_val())
+        buys = [r for r in out if r["action"] == "BUY"]
+        assert len(buys) == 1
+        assert buys[0]["amount_gbp"] == 200
+
+    def test_other_theme_unaffected(self):
+        out, events = ta.enforce_strategy_guards(
+            [{"action": "BUY", "yfinance_ticker": "XOM", "amount_gbp": 150,
+              "theme": "energy"}],
+            self._ledger(), self._pre_val())
+        assert out[0]["amount_gbp"] == 150
+
+
+class TestPreCommitTrimAlerts:
+    def _ledger(self, trades=None):
+        return {
+            "trades": trades or [],
+            "positions": {
+                "XOM": {
+                    "theme": "energy", "first_bought": "2026-06-22",
+                    "pre_commit_trims": "Trim 1/3 at +25%, trim another 1/3 at +50%.",
+                },
+            },
+        }
+
+    def _pre_val(self, pnl_pct):
+        return {
+            "total_value_gbp": 6000.0, "cash_gbp": 500.0,
+            "positions": {"XOM": {"current_value_gbp": 900.0, "pnl_pct": pnl_pct}},
+        }
+
+    def test_alert_when_level_hit_and_ignored(self):
+        _, events = ta.enforce_strategy_guards([], self._ledger(), self._pre_val(30.0))
+        assert any("pre-committed trim" in e and "+25%" in e for e in events)
+
+    def test_no_alert_below_level(self):
+        _, events = ta.enforce_strategy_guards([], self._ledger(), self._pre_val(10.0))
+        assert not any("pre-committed" in e for e in events)
+
+    def test_no_alert_when_trim_recommended(self):
+        recs = [{"action": "TRIM", "yfinance_ticker": "XOM", "trim_pct": 33}]
+        _, events = ta.enforce_strategy_guards(recs, self._ledger(), self._pre_val(30.0))
+        assert not any("pre-committed" in e for e in events)
+
+    def test_no_alert_when_level_already_honoured(self):
+        trades = [{"action": "TRIM", "ticker": "XOM", "date": "2026-06-29"}]
+        _, events = ta.enforce_strategy_guards([], self._ledger(trades), self._pre_val(30.0))
+        assert not any("pre-committed" in e for e in events)
+
+    def test_second_level_alerts_after_first_honoured(self):
+        trades = [{"action": "TRIM", "ticker": "XOM", "date": "2026-06-29"}]
+        _, events = ta.enforce_strategy_guards([], self._ledger(trades), self._pre_val(55.0))
+        assert any("pre-committed trim" in e and "+50%" in e for e in events)
+
+
+class TestCashFloorAlert:
+    def test_alert_when_buys_drain_cash(self):
+        pre_val = {"total_value_gbp": 6000.0, "cash_gbp": 500.0, "positions": {}}
+        _, events = ta.enforce_strategy_guards(
+            [{"action": "BUY", "yfinance_ticker": "NEW", "amount_gbp": 480}],
+            {"trades": [], "positions": {}}, pre_val)
+        assert any("5% reserve floor" in e for e in events)
+
+    def test_no_alert_when_sells_fund_buys(self):
+        pre_val = {
+            "total_value_gbp": 6000.0, "cash_gbp": 500.0,
+            "positions": {"OLD": {"current_value_gbp": 700.0}},
+        }
+        _, events = ta.enforce_strategy_guards(
+            [{"action": "SELL", "yfinance_ticker": "OLD"},
+             {"action": "BUY", "yfinance_ticker": "NEW", "amount_gbp": 700}],
+            {"trades": [], "positions": {"OLD": {}}}, pre_val)
+        assert not any("reserve floor" in e for e in events)
+
+    def test_no_alert_when_cash_unknown(self):
+        pre_val = {"total_value_gbp": 6000.0, "positions": {}}
+        _, events = ta.enforce_strategy_guards(
+            [{"action": "BUY", "yfinance_ticker": "NEW", "amount_gbp": 480}],
+            {"trades": [], "positions": {}}, pre_val)
+        assert not any("reserve floor" in e for e in events)
 
 
 # =============================================================================
@@ -479,6 +642,26 @@ class TestExtractRecommendations:
     def test_strip_json_block(self):
         text = 'before\n```json\n{"recommendations": []}\n```\nafter'
         assert ta.strip_json_block(text) == "before\n\nafter"
+
+    def test_picks_last_recommendations_block(self):
+        # If the model echoes an example block in its prose, the FINAL block
+        # is the actionable one
+        text = (
+            '```json\n{"recommendations": [{"action": "BUY", "ticker": "ECHO"}]}\n```\n'
+            'more prose\n'
+            '```json\n{"recommendations": [{"action": "BUY", "ticker": "REAL"}]}\n```'
+        )
+        recs = ta.extract_recommendations(text)
+        assert len(recs) == 1
+        assert recs[0]["ticker"] == "REAL"
+
+    def test_skips_non_recommendation_json(self):
+        text = (
+            '```json\n{"recommendations": [{"action": "SELL", "ticker": "X"}]}\n```\n'
+            '```json\n{"some_other_data": 1}\n```'
+        )
+        recs = ta.extract_recommendations(text)
+        assert recs[0]["ticker"] == "X"
 
 
 # =============================================================================

@@ -163,10 +163,28 @@ before execution — prompt rules that were being violated are now mechanical:
 
 - **Flip-flop rule**: BUY blocked if the same ticker was fully exited within
   7 calendar days (~5 trading days). Counts both SELLs and TRIMs that closed
-  the position (trades carry a `closed_position: true` flag).
+  the position (trades carry a `closed_position: true` flag). Also blocks a
+  BUY when the SAME run's rec list fully exits that ticker (the history check
+  can't see sells that haven't hit the ledger yet).
 - **20% position cap**: BUY amounts are reduced to land at the cap, or blocked
-  if the position is already over it.
+  if the position is already over it (or the reduced order would be under
+  £25). Multiple BUYs of one ticker in a run count cumulatively.
+- **60% theme cap** (added July 2026 after AI exposure hit 81% in June): BUYs
+  whose `theme` label would push that theme above 60% are reduced or blocked.
+  Exposure freed by same-run SELL/TRIM recs of the same theme is credited
+  first, so rebalancing within a theme isn't wrongly blocked.
+- **Advisory alerts** (in guard_events, never blocking): pre-committed trim
+  level hit but no TRIM recommended (parses "+N%" triggers from the stored
+  `pre_commit_trims` text, skipping levels already honoured by counting TRIM
+  trades since first_bought); planned buys would leave cash below the 5%
+  reserve floor.
 - Guard actions appear in the weekly email under "Strategy guard actions".
+- The weekly email also flags a >15% week-on-week drawdown (kill criterion)
+  the week it happens, and marks the week-on-week figure as indicative when
+  either snapshot had missing prices.
+- `extract_recommendations()` uses the LAST ```json block containing a
+  "recommendations" key, not the first — an echoed example block in the prose
+  must never be executed.
 
 Crash-recovery journal: `run_journal.json` (gitignored) is written just before
 T212 execution and deleted after the ledger saves. If a run crashes in between,
@@ -177,7 +195,7 @@ Realised P&L: `sp.compute_realized_pnl()` replays the trade log and feeds
 computed realised-vs-unrealised figures into the deep review prompt (tickers
 whose cost basis came from T212 sync are flagged as incomplete).
 
-Test suite: `test_trading_agent.py` (56 tests, no network). Run it after any
+Test suite: `test_trading_agent.py` (80 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the

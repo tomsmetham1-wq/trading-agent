@@ -431,6 +431,11 @@ def t212_to_yf_ticker(t212_ticker: str, instruments: list[dict]) -> Optional[str
             currency   = _instrument_currency(inst)
             for suffix, currencies in YF_SUFFIX_TO_CURRENCIES.items():
                 if currency in currencies:
+                    if not suffix and "." in root:
+                        # US share classes: T212 shortName is "BRK.B" but
+                        # yfinance uses "BRK-B" — a dot here would make the
+                        # synced position unpriceable via yfinance.
+                        root = root.replace(".", "-")
                     return f"{root}.{suffix}" if suffix else root
             return root  # Unknown currency — return symbol without suffix
     return None
@@ -630,8 +635,8 @@ def _get_available_cash() -> Optional[float]:
         data = r.json()
         return float(
             data.get("free", 0)
-            or data.get("cash", {}).get("free", 0)
-            or data.get("cash", {}).get("availableToTrade", 0)
+            or (data.get("cash") or {}).get("free", 0)
+            or (data.get("cash") or {}).get("availableToTrade", 0)
         )
     except Exception as e:
         logger.warning("Couldn't fetch available cash for budget tracking: %s", e)
@@ -890,8 +895,12 @@ def _wait_for_sells_settled(sell_orders: list, pre_positions: dict,
     deadline = time.time() + timeout
     logger.info("Waiting for %d sell order(s) to settle (up to %ds)...", len(pending), timeout)
 
+    # First poll after 3s (the demo fills instantly — no point waiting 15s),
+    # then every 15s.
+    poll_wait = 3
     while pending and time.time() < deadline:
-        time.sleep(15)
+        time.sleep(poll_wait)
+        poll_wait = 15
         cur_positions = _safe_positions_map()
         if cur_positions is None:
             continue  # couldn't fetch positions — don't risk a false settle
