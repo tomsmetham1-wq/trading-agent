@@ -172,12 +172,19 @@ before execution — prompt rules that were being violated are now mechanical:
 - **60% theme cap** (added July 2026 after AI exposure hit 81% in June): BUYs
   whose `theme` label would push that theme above 60% are reduced or blocked.
   Exposure freed by same-run SELL/TRIM recs of the same theme is credited
-  first, so rebalancing within a theme isn't wrongly blocked.
+  first, so rebalancing within a theme isn't wrongly blocked. This only stops
+  a theme getting WORSE — it has nothing to act on when a theme is already
+  overweight and no new buy is proposed in it (see the alert below for that
+  case).
 - **Advisory alerts** (in guard_events, never blocking): pre-committed trim
   level hit but no TRIM recommended (parses "+N%" triggers from the stored
   `pre_commit_trims` text, skipping levels already honoured by counting TRIM
   trades since first_bought); planned buys would leave cash below the 5%
-  reserve floor.
+  reserve floor; a theme is STILL over the 60% cap after this run's recs are
+  applied (added after the July 2026 Opus deep review flagged that AI infra
+  was still ~58-63% weeks after the BUY-side cap existed, because nothing
+  forces a correction when Claude doesn't propose a new buy in that theme —
+  fires every run until the overweight is actually addressed).
 - Guard actions appear in the weekly email under "Strategy guard actions".
 - The weekly email also flags a >15% week-on-week drawdown (kill criterion)
   the week it happens, and marks the week-on-week figure as indicative when
@@ -195,7 +202,7 @@ Realised P&L: `sp.compute_realized_pnl()` replays the trade log and feeds
 computed realised-vs-unrealised figures into the deep review prompt (tickers
 whose cost basis came from T212 sync are flagged as incomplete).
 
-Test suite: `test_trading_agent.py` (80 tests, no network). Run it after any
+Test suite: `test_trading_agent.py` (85 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the

@@ -366,6 +366,58 @@ class TestCashFloorAlert:
         assert not any("reserve floor" in e for e in events)
 
 
+class TestExistingThemeOverCapAlert:
+    def _ledger(self):
+        return {"trades": [], "positions": {
+            "AVGO": {"theme": "AI infrastructure"},
+            "NVDA": {"theme": "AI infrastructure"},
+            "ABBV": {"theme": "pharma"},
+        }}
+
+    def _pre_val(self, avgo=400.0, nvda=350.0, abbv=250.0):
+        return {
+            "total_value_gbp": 1000.0, "cash_gbp": 0.0,
+            "positions": {
+                "AVGO": {"current_value_gbp": avgo},
+                "NVDA": {"current_value_gbp": nvda},
+                "ABBV": {"current_value_gbp": abbv},
+            },
+        }
+
+    def test_alert_fires_with_no_recs_at_all(self):
+        # AI infra at 75% of 1000 total — nothing recommended this run
+        _, events = ta.enforce_strategy_guards([], self._ledger(), self._pre_val())
+        assert any(
+            "AI infrastructure" in e and "no rebalancing recommended" in e
+            for e in events
+        )
+
+    def test_no_alert_when_theme_under_cap(self):
+        # AI infra at 40% — well under the 60% cap
+        _, events = ta.enforce_strategy_guards(
+            [], self._ledger(), self._pre_val(avgo=250.0, nvda=150.0))
+        assert not any("AI infrastructure" in e for e in events)
+
+    def test_alert_wording_differs_when_partially_rebalanced(self):
+        # A TRIM in the theme happened, but it's still over cap afterwards
+        recs = [{"action": "TRIM", "yfinance_ticker": "AVGO", "trim_pct": 10}]
+        _, events = ta.enforce_strategy_guards(recs, self._ledger(), self._pre_val())
+        assert any(
+            "AI infrastructure" in e and "after this run's rebalancing" in e
+            for e in events
+        )
+
+    def test_no_alert_once_sell_brings_theme_under_cap(self):
+        # Selling AVGO entirely drops AI infra from 75% to 35% — fixed
+        recs = [{"action": "SELL", "yfinance_ticker": "AVGO"}]
+        _, events = ta.enforce_strategy_guards(recs, self._ledger(), self._pre_val())
+        assert not any("AI infrastructure" in e for e in events)
+
+    def test_other_theme_unaffected(self):
+        _, events = ta.enforce_strategy_guards([], self._ledger(), self._pre_val())
+        assert not any("pharma" in e for e in events)
+
+
 # =============================================================================
 # Shadow ledger — buys, sells, trims
 # =============================================================================

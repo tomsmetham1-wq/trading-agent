@@ -497,6 +497,39 @@ def _pre_commit_trim_alerts(recs: list, ledger: dict, pre_val: dict) -> list[str
     return alerts
 
 
+def _theme_cap_alerts(theme_exposure: dict, themes_rebalanced_this_run: set,
+                       theme_label_by_key: dict, total: float) -> list[str]:
+    """
+    Advisory alert (never blocking) for any theme still over the 60% cap after
+    this run's recommendations are applied.
+
+    The BUY-side guard only stops a theme getting WORSE — it has nothing to
+    act on when a theme is already overweight and no new buy is proposed in
+    it. This surfaces that ongoing overweight every run until it's actually
+    addressed, rather than letting it sit silently (as AI infrastructure did
+    at ~81% through most of June 2026).
+    """
+    alerts: list[str] = []
+    if total <= 0:
+        return alerts
+    for theme, value in sorted(theme_exposure.items(), key=lambda x: -x[1]):
+        if value <= THEME_HARD_CAP * total:
+            continue
+        label = theme_label_by_key.get(theme, theme)
+        pct = value / total * 100
+        if theme in themes_rebalanced_this_run:
+            alerts.append(
+                f"ALERT: '{label}' theme still at {pct:.1f}% (over the 60% cap) "
+                f"after this run's rebalancing - may need further trimming"
+            )
+        else:
+            alerts.append(
+                f"ALERT: '{label}' theme at {pct:.1f}% (over the 60% cap) - "
+                f"no rebalancing recommended this run"
+            )
+    return alerts
+
+
 def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[list, list]:
     """
     Filter Claude's recommendations against the hard strategy rules in code.
@@ -521,7 +554,11 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[li
 
     Advisory alerts (returned in guard_events but never blocking):
       - a pre-committed trim level was hit but no TRIM was recommended;
-      - the planned buys would leave cash below the 5% reserve floor.
+      - the planned buys would leave cash below the 5% reserve floor;
+      - a theme is STILL over the 60% cap after this run's recs are applied
+        (the BUY-side theme guard only stops new breaches — it has nothing
+        to act on when a theme is already overweight and no new buy is
+        proposed in it, so this fires every run until it's actually fixed).
 
     Returns:
         tuple: (filtered_recs, guard_events) — guard_events are human-readable
@@ -552,11 +589,17 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[li
 
     # Theme exposure from ledger labels, credited with what this run's sells
     # free up (a SELL releases the full position value, a TRIM its trim_pct).
+    # theme_label_by_key preserves original casing (e.g. "AI infrastructure")
+    # for display — theme_exposure itself is keyed lowercase for matching.
     theme_exposure: dict[str, float] = {}
+    theme_label_by_key: dict[str, str] = {}
     for ticker, pos in ledger_positions.items():
-        theme = (pos.get("theme") or "").strip().lower()
+        theme_label = (pos.get("theme") or "").strip()
+        theme = theme_label.lower()
         if theme:
             theme_exposure[theme] = theme_exposure.get(theme, 0.0) + _pos_value(ticker)
+            theme_label_by_key.setdefault(theme, theme_label)
+    themes_rebalanced_this_run: set[str] = set()
     for rec in recs:
         action = (rec.get("action") or "").upper().strip()
         if action not in ("SELL", "TRIM"):
@@ -565,6 +608,7 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[li
         theme = ((ledger_positions.get(ticker) or {}).get("theme") or "").strip().lower()
         if not theme:
             continue
+        themes_rebalanced_this_run.add(theme)
         freed = _pos_value(ticker)
         if action == "TRIM":
             freed *= min(float(rec.get("trim_pct") or 50), 100) / 100
@@ -617,6 +661,8 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[li
             # Rule 3: theme cap — reduce or block buys that breach 60% per theme
             theme_label = (rec.get("theme") or "").strip()
             theme = theme_label.lower()
+            if theme:
+                theme_label_by_key.setdefault(theme, theme_label)
             if total > 0 and theme and amount > 0:
                 headroom = THEME_HARD_CAP * total - theme_exposure.get(theme, 0.0)
                 if headroom < MIN_ORDER_GBP:
@@ -640,6 +686,9 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[li
 
     # Advisory alerts — surfaced in the email, never blocking
     guard_events.extend(_pre_commit_trim_alerts(recs, ledger, pre_val))
+    guard_events.extend(_theme_cap_alerts(
+        theme_exposure, themes_rebalanced_this_run, theme_label_by_key, total
+    ))
 
     cash = pre_val.get("cash_gbp")
     if cash is not None and total > 0:
