@@ -223,7 +223,11 @@ Robustness fixes from the same review (do not regress):
 - `call_claude` handles `stop_reason="pause_turn"` (server web-search loop can
   pause mid-turn; without resuming, the trailing JSON block is lost), warns on
   `max_tokens` truncation, uses adaptive thinking, and retries with typed
-  exceptions (429/5xx/529 only).
+  exceptions (429/5xx/529) plus raw `httpx.TransportError` — the SDK does NOT
+  wrap a connection dropped mid-stream ("peer closed connection without
+  sending complete message body", e.g. Avast killing a long-lived stream) in
+  `anthropic.APIConnectionError`, and that crashed the 2026-07-13 weekly run
+  before it was caught.
 - Weekly snapshots carry `pricing_incomplete: true` when any position had no
   price — don't read those as real drawdowns.
 

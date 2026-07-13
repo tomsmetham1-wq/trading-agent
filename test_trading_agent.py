@@ -9,6 +9,8 @@ Run with:  venv\\Scripts\\python.exe -m pytest test_trading_agent.py -q
 import json
 from datetime import datetime, timedelta
 
+import anthropic
+import httpx
 import pytest
 
 import shadow_portfolio as sp
@@ -840,3 +842,83 @@ class TestPrompts:
         _, user = prompts.build_deep_review_prompt(ledger, self._fake_val(ledger))
         ledger_section = user.split("=== Weekly snapshots")[0]
         assert "weekly_snapshots" not in ledger_section
+
+
+# =============================================================================
+# Claude API retry behaviour
+# =============================================================================
+
+class _FakeStream:
+    """Mimics the context manager returned by client.messages.stream()."""
+    def __init__(self, outcome):
+        self._outcome = outcome
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def get_final_message(self):
+        if isinstance(self._outcome, Exception):
+            raise self._outcome
+        return self._outcome
+
+
+class _FakeClient:
+    """Yields one scripted outcome (exception or message) per stream() call."""
+    def __init__(self, outcomes):
+        self._outcomes = list(outcomes)
+        self.calls = 0
+        self.messages = self  # so client.messages.stream(...) resolves here
+
+    def stream(self, **kwargs):
+        self.calls += 1
+        return _FakeStream(self._outcomes.pop(0))
+
+
+class TestCreateWithRetry:
+    @pytest.fixture(autouse=True)
+    def no_sleep(self, monkeypatch):
+        monkeypatch.setattr(ta.time, "sleep", lambda s: None)
+
+    def test_mid_stream_disconnect_is_retried(self):
+        # A connection dropped WHILE streaming (e.g. AV HTTPS interception)
+        # raises a raw httpx error, not an anthropic.APIConnectionError —
+        # this crashed the 2026-07-13 weekly run before the fix.
+        exc = httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body")
+        client = _FakeClient([exc, "final-message"])
+        assert ta._create_with_retry(client) == "final-message"
+        assert client.calls == 2
+
+    def test_persistent_disconnect_raises_after_all_retries(self):
+        exc = httpx.RemoteProtocolError("incomplete chunked read")
+        client = _FakeClient([exc] * 4)
+        with pytest.raises(httpx.RemoteProtocolError):
+            ta._create_with_retry(client)
+        assert client.calls == 4
+
+    def test_connection_error_is_retried(self):
+        exc = anthropic.APIConnectionError(
+            request=httpx.Request("POST", "https://api.anthropic.com"))
+        client = _FakeClient([exc, "final-message"])
+        assert ta._create_with_retry(client) == "final-message"
+        assert client.calls == 2
+
+    def test_client_4xx_not_retried(self):
+        resp = httpx.Response(
+            400, request=httpx.Request("POST", "https://api.anthropic.com"))
+        exc = anthropic.APIStatusError("bad request", response=resp, body=None)
+        client = _FakeClient([exc])
+        with pytest.raises(anthropic.APIStatusError):
+            ta._create_with_retry(client)
+        assert client.calls == 1
+
+    def test_server_5xx_retried(self):
+        resp = httpx.Response(
+            500, request=httpx.Request("POST", "https://api.anthropic.com"))
+        exc = anthropic.APIStatusError("server error", response=resp, body=None)
+        client = _FakeClient([exc, "final-message"])
+        assert ta._create_with_retry(client) == "final-message"
+        assert client.calls == 2

@@ -28,6 +28,7 @@ from email.message import EmailMessage
 from pathlib import Path
 
 import requests
+import httpx
 import anthropic
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -284,6 +285,14 @@ def _create_with_retry(client: Anthropic, **kwargs):
                 return stream.get_final_message()
         except (anthropic.RateLimitError, anthropic.APIConnectionError,
                 anthropic.APITimeoutError) as e:
+            last_exc = e
+        except httpx.TransportError as e:
+            # The SDK only wraps errors from the initial request in
+            # APIConnectionError. A connection dropped WHILE the response is
+            # streaming (e.g. Avast's HTTPS interceptor killing a long-lived
+            # stream: "peer closed connection without sending complete message
+            # body") escapes as a raw httpx error — retry from scratch; nothing
+            # has been applied to the ledger at this point.
             last_exc = e
         except anthropic.APIStatusError as e:
             if e.status_code < 500:
