@@ -421,6 +421,83 @@ class TestExistingThemeOverCapAlert:
 
 
 # =============================================================================
+# SET_TRIMS — ledger-only backfill of pre-committed trim levels
+# =============================================================================
+
+class TestSetTrims:
+    def _set_trims_rec(self, ticker="TEST",
+                       trims="Trim 1/3 at +35%, trim another 1/3 at +70%."):
+        return {"action": "SET_TRIMS", "yfinance_ticker": ticker,
+                "pre_commit_trims": trims}
+
+    def test_updates_existing_position_without_price_fetch(self, monkeypatch):
+        monkeypatch.setattr(
+            sp, "fetch_price_gbp",
+            lambda *a, **k: pytest.fail("SET_TRIMS must not fetch a price"))
+        ledger = make_ledger()
+        sp.apply_recommendations(ledger, [gbp_buy_rec("TEST", 200)], "2026-07-20")
+        events = sp.apply_recommendations(ledger, [self._set_trims_rec()], "2026-07-20")
+        assert events == ["SET_TRIMS TEST: Trim 1/3 at +35%, trim another 1/3 at +70%."]
+        pos = ledger["positions"]["TEST"]
+        assert pos["pre_commit_trims"] == "Trim 1/3 at +35%, trim another 1/3 at +70%."
+        assert ledger["trades"][-1]["action"] == "SET_TRIMS"
+        assert ledger["cash_gbp"] == pytest.approx(800.0)   # no money moved
+
+    def test_unknown_ticker_skipped(self):
+        ledger = make_ledger()
+        events = sp.apply_recommendations(
+            ledger, [self._set_trims_rec(ticker="NOPE")], "2026-07-20")
+        assert "SKIP SET_TRIMS NOPE" in events[0]
+        assert not ledger["trades"]
+
+    def test_empty_trims_text_skipped(self):
+        ledger = make_ledger()
+        sp.apply_recommendations(ledger, [gbp_buy_rec("TEST", 200)], "2026-07-20")
+        events = sp.apply_recommendations(
+            ledger, [self._set_trims_rec(trims="  ")], "2026-07-20")
+        assert "SKIP SET_TRIMS TEST" in events[0]
+        assert "pre_commit_trims" not in ledger["positions"]["TEST"]
+
+    def test_passes_strategy_guards_untouched(self):
+        rec = self._set_trims_rec()
+        pre_val = {"total_value_gbp": 1000.0, "cash_gbp": 100.0, "positions": {}}
+        allowed, events = ta.enforce_strategy_guards([rec], make_ledger(), pre_val)
+        assert allowed == [rec]
+        assert not any("SET_TRIMS" in e for e in events)
+
+    def test_executor_confirms_without_placing_order(self, monkeypatch):
+        monkeypatch.setattr(t212ex, "T212_DEMO_EXECUTE", True)
+        monkeypatch.setattr(t212ex, "T212_ENV", "demo")
+        monkeypatch.setattr(t212ex, "_load_instruments", lambda: INSTRUMENTS)
+        monkeypatch.setattr(t212ex, "get_t212_positions_map", lambda: {})
+        monkeypatch.setattr(
+            t212ex, "_place_market_order",
+            lambda *a, **k: pytest.fail("SET_TRIMS must not place a T212 order"))
+        rec = self._set_trims_rec()
+        events, confirmed = t212ex.execute_recommendations([rec])
+        assert confirmed == [rec]
+        assert any("SET_TRIMS TEST" in e for e in events)
+
+    def test_realized_pnl_ignores_set_trims_trades(self):
+        ledger = make_ledger()
+        sp.apply_recommendations(ledger, [gbp_buy_rec("TEST", 200)], "2026-07-20")
+        sp.apply_recommendations(ledger, [self._set_trims_rec()], "2026-07-20")
+        pnl = sp.compute_realized_pnl(ledger)
+        assert pnl["total_gbp"] == pytest.approx(0.0)
+
+    def test_thesis_review_flags_missing_trim_levels(self):
+        ledger = make_ledger()
+        sp.apply_recommendations(ledger, [gbp_buy_rec("TEST", 200)], "2026-07-20")
+        val = {"positions": {"TEST": {"pnl_pct": 5.0}}}
+        review = sp.build_thesis_review(ledger, val)
+        assert "NONE SET" in review
+        sp.apply_recommendations(ledger, [self._set_trims_rec()], "2026-07-20")
+        review = sp.build_thesis_review(ledger, val)
+        assert "NONE SET" not in review
+        assert "Trim 1/3 at +35%" in review
+
+
+# =============================================================================
 # Shadow ledger — buys, sells, trims
 # =============================================================================
 

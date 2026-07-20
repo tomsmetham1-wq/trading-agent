@@ -521,6 +521,32 @@ def _apply_sell_or_trim(ledger: dict, rec: dict, ticker: str,
     )
 
 
+def _apply_set_trims(ledger: dict, rec: dict, ticker: str, run_date: str) -> str:
+    """
+    Backfill pre-committed trim levels on an existing position (ledger-only).
+
+    SET_TRIMS recs move no money and place no orders: they exist so positions
+    bought before the pre_commit_trims field was introduced can be brought
+    under the same mechanical trim discipline as newer buys. Logged as a trade
+    so the change is auditable and shows up in the prompt's recent-trade
+    history.
+    """
+    trims = (rec.get("pre_commit_trims") or "").strip()
+    pos = ledger.get("positions", {}).get(ticker)
+    if pos is None:
+        return f"SKIP SET_TRIMS {ticker}: no such position in shadow ledger"
+    if not trims:
+        return f"SKIP SET_TRIMS {ticker}: no pre_commit_trims text provided"
+    pos["pre_commit_trims"] = trims
+    ledger.setdefault("trades", []).append({
+        "date": run_date,
+        "action": "SET_TRIMS",
+        "ticker": ticker,
+        "pre_commit_trims": trims,
+    })
+    return f"SET_TRIMS {ticker}: {trims}"
+
+
 def apply_recommendations(ledger: dict, recs: list, run_date: str) -> list[str]:
     """
     Apply a list of trade recommendations to the shadow portfolio ledger.
@@ -529,7 +555,9 @@ def apply_recommendations(ledger: dict, recs: list, run_date: str) -> list[str]:
     then delegates to _apply_buy() or _apply_sell_or_trim() depending on action type.
     Returns a log of what happened to each recommendation for email reporting.
 
-    Only BUY, SELL, and TRIM actions are processed; HOLD is ignored.
+    Only BUY, SELL, TRIM, and SET_TRIMS actions are processed; HOLD is ignored.
+    SET_TRIMS is ledger-only metadata (backfills pre-committed trim levels on
+    an existing position) — no price fetch, no cash movement.
 
     Args:
         ledger:   Shadow portfolio ledger dict. Mutated in-place.
@@ -544,7 +572,13 @@ def apply_recommendations(ledger: dict, recs: list, run_date: str) -> list[str]:
     for rec in recs:
         action = rec.get("action", "").upper().strip()
         ticker = rec.get("yfinance_ticker") or rec.get("ticker")
-        if not ticker or action not in ("BUY", "SELL", "TRIM"):
+        if not ticker or action not in ("BUY", "SELL", "TRIM", "SET_TRIMS"):
+            continue
+
+        # SET_TRIMS never needs a price — handle it before the price fetch so
+        # a metadata-only rec can't be skipped for a pricing failure.
+        if action == "SET_TRIMS":
+            events.append(_apply_set_trims(ledger, rec, ticker, run_date))
             continue
 
         # For BUY: use T212 actual fill price if available (most accurate cost basis).
@@ -987,6 +1021,11 @@ def build_thesis_review(ledger: dict, current_val: dict) -> str:
                 entry += (
                     f"\n    Pre-committed trim levels (BINDING — check against "
                     f"current P&L): {trims}"
+                )
+            else:
+                entry += (
+                    "\n    Pre-committed trim levels: NONE SET (legacy position)"
+                    " — set binding levels THIS run via a SET_TRIMS action."
                 )
             lines.append(entry)
         lines.append("")

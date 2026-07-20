@@ -139,7 +139,12 @@ All sizing rules are percentage-based so they scale as the portfolio grows.
   When 20% is hit, trim to 15% — not to 19.9%.
 - Cash reserve 5–15% of total portfolio value — uninvested cash is a deliberate choice
 - Deploy trigger: cash > 15% → must buy
-- Each buy: 8–20% of total portfolio value
+- Each buy: 8–20% of total portfolio value. Dead-zone exception (July 2026):
+  cash between the 5% floor and the 8% minimum can't fund a new position and
+  never triggers the >15% deploy rule, so it used to idle forever. The agent
+  may now deploy it as a 3–8% top-up of ONE existing holding (position/theme
+  caps still apply, a live forward driver must be stated, and new positions
+  keep the 8% minimum)
 - Do NOT exit a position solely because it shrank below 8% — only exit if thesis broken
 - Thesis realized ≠ thesis intact (added July 2026): when a position's ORIGINAL
   thesis has substantially played out (mispricing closed, gain captured), HOLD is
@@ -148,10 +153,19 @@ All sizing rules are percentage-based so they scale as the portfolio grows.
   "still growing / business is fine" doesn't qualify (already priced in). Else
   TRIM/exit and recycle into better forward risk/reward. Prompt-only, not a code
   guard — it's a judgement enforced via the thesis-accountability check, so
-  "played out" now forces a decision instead of defaulting to hold.
+  "played out" now forces a decision instead of defaulting to hold. Thesis-
+  realized trims are exempt from the thesis-break checklist's "knowable at
+  entry → override the sell" rule (reaching fair value was the plan, not a
+  panic) — without the exemption the checklist would veto every recycling trim.
 - Theme concentration cap: max 60% in any single macro theme; must hold ≥1 non-dominant-theme position
 - Flip-flop rule: no BUY within 5 trading days of a SELL/TRIM of the same ticker
-- Pre-commit trim levels at BUY entry — mechanical, not reactive
+- Pre-commit trim levels at BUY entry — mechanical, not reactive. Legacy
+  positions bought before this field existed are backfilled via SET_TRIMS
+  (July 2026): a ledger-only rec action — no T212 order, no cash movement —
+  that persists `pre_commit_trims` on an existing position and logs a
+  SET_TRIMS trade. The executor confirms it straight through, guards pass it
+  untouched, and `build_thesis_review()` flags any holding with "NONE SET"
+  until the whole book is covered.
 - Holding period: weeks to months
 - Universe: UK/US listed stocks and ETFs on Trading 212
 - Benchmark: VUSA.L (Vanguard S&P 500 GBP)

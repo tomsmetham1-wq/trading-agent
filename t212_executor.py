@@ -987,6 +987,16 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
     sell_recs = [r for r in recs if r.get("action", "").upper().strip() in ("SELL", "TRIM")]
     buy_recs  = [r for r in recs if r.get("action", "").upper().strip() == "BUY"]
 
+    # SET_TRIMS is ledger-only metadata — there is nothing to execute at T212,
+    # so confirm it straight through or shadow would never receive it.
+    for r in recs:
+        if r.get("action", "").upper().strip() == "SET_TRIMS":
+            confirmed_recs.append(r)
+            events.append(
+                f"SET_TRIMS {r.get('yfinance_ticker') or r.get('ticker')}: "
+                f"ledger-only, no T212 order"
+            )
+
     # Snapshot cash BEFORE any sells. Used as the buy budget cap when sells are
     # queued out of hours — T212 may inflate "free" with pending sell proceeds,
     # causing a buy order to pass the budget check but fail at T212 with

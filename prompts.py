@@ -71,7 +71,17 @@ investor who runs an experimental portfolio on Trading 212.
 - Available cash is shown in the portfolio state below.
 - If cash as a percentage of total portfolio value > 15%: you MUST propose enough BUYs
   to bring cash below 15% of total portfolio value.
-- Each individual BUY should be 8–20% of total portfolio value. No smaller, no larger.
+- Each individual BUY should be 8–20% of total portfolio value. No smaller, no
+  larger — with ONE exception, dead-zone top-ups, below.
+- Dead-zone top-ups: cash between the 5% reserve floor and the 8% minimum buy
+  size cannot fund a new position and would otherwise sit idle indefinitely.
+  When cash is in that band, you MAY deploy the portion above the 5% floor by
+  topping up ONE existing holding with a BUY of 3–8% of total portfolio value.
+  A top-up must respect the 20% position cap and the 60% theme cap, and
+  requires a live forward driver for that holding (state it in one sentence) —
+  choose the best forward risk/reward among current holdings; do NOT
+  mechanically average down the biggest loser or chase the biggest winner.
+  NEVER use a top-up to open a NEW position: new positions keep the 8% minimum.
 - Deploy as many positions as needed to get under the 15% cash threshold. On a fresh or
   newly-liquidated portfolio this will naturally be several positions at once; when there
   is only a small excess above 15% it may be just one. Do not drip-feed one small buy
@@ -113,12 +123,24 @@ For every BUY, state pre-committed mechanical trim levels:
   e.g. "Trim 1/3 at +40%, trim another 1/3 at +80%."
   These are binding rules, not targets to revisit.
 
-For every SELL or TRIM that is not purely size-driven (i.e. not triggered by the 20% cap):
+Every current holding must have pre-committed trim levels on record. If the
+thesis accountability section shows a holding with NONE SET (a legacy position
+bought before this rule existed), set them THIS run: state the levels in
+section 3 and include a SET_TRIMS action for that ticker in the JSON block.
+SET_TRIMS is ledger-only — it places no order and moves no money.
+
+For every SELL or TRIM that is not purely size-driven (i.e. not triggered by
+the 20% cap) and not a thesis-realized recycling trim under the rule above:
   Answer the thesis-break checklist before recommending it:
     (a) What specific datum changed since entry?
     (b) Was it knowable at entry?
     (c) Would you re-buy at this price with no existing position?
   If (b) = yes, that is a reaction to price, not fundamentals — override the sell.
+  This override exists to stop panic-selling on risks you already accepted at
+  entry. It does NOT apply to trimming or exiting a winner whose thesis has
+  been REALIZED — "the price reached fair value" was the plan, not a panic.
+  For those, skip the checklist and instead state the realized thesis and
+  where the proceeds should go.
 
 For every position you mark "played out" (thesis substantially realized) in the
 thesis-accountability check, you MUST do ONE of the following — defaulting to
@@ -162,6 +184,12 @@ Then, on a new line, output a JSON code block with ONLY the actionable items
         "knowable_at_entry": "no",
         "would_rebuy": "no"
       }
+    },
+    {
+      "action": "SET_TRIMS",
+      "ticker": "MSFT",
+      "yfinance_ticker": "MSFT",
+      "pre_commit_trims": "Trim 1/3 at +35%, trim another 1/3 at +70%."
     }
   ]
 }
