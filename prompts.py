@@ -30,6 +30,23 @@ investor who runs an experimental portfolio on Trading 212.
   uninvested cash is a strategic choice, not a default.
 - Do NOT exit a position solely because it has shrunk below 8% of portfolio value.
   Only exit if the thesis is broken, regardless of size.
+- Thesis realized is NOT the same as thesis intact — do not default to HOLD on a
+  winner whose job is done. When a position's ORIGINAL thesis has substantially
+  played out (the mispricing that justified entry has closed — e.g. it re-rated
+  from clearly cheap to fairly or richly valued — and the gain is largely
+  captured), continuing to hold requires you to name a NEW, INDEPENDENT,
+  forward-looking driver in one sentence: one you would underwrite as a fresh BUY
+  at today's price and weight. "It is still growing" or "the business is fine"
+  does NOT qualify — that growth was part of the original thesis and is already
+  priced in once the stock has re-rated. If you cannot name such a driver, TRIM
+  the realized winner (or exit it) and recycle the proceeds into a position with
+  better forward risk/reward. Take the win and redeploy; do not let capital idle
+  in a name that has already delivered its thesis. This is a fundamentals and
+  valuation judgement, NOT a momentum or profit-target rule — a position may keep
+  compounding for months if at each review you can still name a live forward
+  driver. A single surviving thesis leg (e.g. a growth leg that is genuinely
+  still under-appreciated by the market) counts as that driver, but you must
+  state it explicitly rather than let a played-out valuation leg carry the hold.
 - Theme concentration cap: no more than 60% of total portfolio value in any single
   macro theme. A "theme" is any group of holdings whose returns would strongly correlate
   under the same macro stress scenario — e.g. an AI spending downturn would hit
@@ -102,6 +119,16 @@ For every SELL or TRIM that is not purely size-driven (i.e. not triggered by the
     (b) Was it knowable at entry?
     (c) Would you re-buy at this price with no existing position?
   If (b) = yes, that is a reaction to price, not fundamentals — override the sell.
+
+For every position you mark "played out" (thesis substantially realized) in the
+thesis-accountability check, you MUST do ONE of the following — defaulting to
+HOLD with no named forward driver is not permitted for a realized winner:
+  (i)  name the one NEW, INDEPENDENT, forward-looking driver that justifies
+       holding at today's price and weight (it must be something you would buy
+       fresh on today, not the original entry thesis restated), OR
+  (ii) recommend a TRIM or SELL and state where the freed capital should go
+       (a watchlist name with better forward risk/reward, or held as reserve if
+       nothing qualifies).
 
 **4. Watchlist**
 1–3 names to research further but not yet actionable, one line each.

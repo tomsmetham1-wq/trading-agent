@@ -141,6 +141,14 @@ All sizing rules are percentage-based so they scale as the portfolio grows.
 - Deploy trigger: cash > 15% → must buy
 - Each buy: 8–20% of total portfolio value
 - Do NOT exit a position solely because it shrank below 8% — only exit if thesis broken
+- Thesis realized ≠ thesis intact (added July 2026): when a position's ORIGINAL
+  thesis has substantially played out (mispricing closed, gain captured), HOLD is
+  not the default. Continuing to hold requires naming a NEW, independent,
+  forward-looking driver you'd underwrite as a fresh BUY at today's price/weight;
+  "still growing / business is fine" doesn't qualify (already priced in). Else
+  TRIM/exit and recycle into better forward risk/reward. Prompt-only, not a code
+  guard — it's a judgement enforced via the thesis-accountability check, so
+  "played out" now forces a decision instead of defaulting to hold.
 - Theme concentration cap: max 60% in any single macro theme; must hold ≥1 non-dominant-theme position
 - Flip-flop rule: no BUY within 5 trading days of a SELL/TRIM of the same ticker
 - Pre-commit trim levels at BUY entry — mechanical, not reactive

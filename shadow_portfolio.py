@@ -1015,6 +1015,10 @@ def build_thesis_review(ledger: dict, current_val: dict) -> str:
         "IMPORTANT: Before recommending any action, explicitly state whether\n"
         "each current position's original thesis has played out, broken down,\n"
         "or is still pending. This is your primary accountability check.\n"
+        "If a thesis has PLAYED OUT, holding is not automatic: either name one\n"
+        "new, independent, forward-looking driver that would justify buying it\n"
+        "fresh at today's price and weight, or TRIM/exit and recycle the capital\n"
+        "into better forward risk/reward.\n"
     )
 
     return "\n".join(lines)
