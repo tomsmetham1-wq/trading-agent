@@ -59,6 +59,11 @@ INSTRUMENTS_CACHE_PATH = Path(
     os.getenv("T212_INSTRUMENTS_CACHE", "t212_instruments.json")
 )
 
+# Recommendation actions that only write metadata to the shadow ledger. They
+# place no order and move no cash, so execute_recommendations() confirms them
+# straight through rather than sending anything to T212.
+LEDGER_ONLY_ACTIONS = ("SET_TRIMS", "SET_DRIVER")
+
 
 # =============================================================================
 # Exchange reference — the heart of robust ticker translation
@@ -987,13 +992,15 @@ def execute_recommendations(recs: list) -> tuple[list[str], list[dict]]:
     sell_recs = [r for r in recs if r.get("action", "").upper().strip() in ("SELL", "TRIM")]
     buy_recs  = [r for r in recs if r.get("action", "").upper().strip() == "BUY"]
 
-    # SET_TRIMS is ledger-only metadata — there is nothing to execute at T212,
-    # so confirm it straight through or shadow would never receive it.
+    # SET_TRIMS / SET_DRIVER are ledger-only metadata — there is nothing to
+    # execute at T212, so confirm them straight through or shadow would never
+    # receive them.
     for r in recs:
-        if r.get("action", "").upper().strip() == "SET_TRIMS":
+        action = r.get("action", "").upper().strip()
+        if action in LEDGER_ONLY_ACTIONS:
             confirmed_recs.append(r)
             events.append(
-                f"SET_TRIMS {r.get('yfinance_ticker') or r.get('ticker')}: "
+                f"{action} {r.get('yfinance_ticker') or r.get('ticker')}: "
                 f"ledger-only, no T212 order"
             )
 

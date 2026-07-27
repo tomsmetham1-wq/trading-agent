@@ -157,6 +157,9 @@ All sizing rules are percentage-based so they scale as the portfolio grows.
   realized trims are exempt from the thesis-break checklist's "knowable at
   entry → override the sell" rule (reaching fair value was the plan, not a
   panic) — without the exemption the checklist would veto every recycling trim.
+  The named driver is no longer prose-only: it must be recorded with a
+  SET_DRIVER rec (July 2026, see below) so it is replayed and re-tested every
+  following week rather than silently carrying the hold forever.
 - Theme concentration cap: max 60% in any single macro theme; must hold ≥1 non-dominant-theme position
 - Flip-flop rule: no BUY within 5 trading days of a SELL/TRIM of the same ticker
 - Pre-commit trim levels at BUY entry — mechanical, not reactive. Legacy
@@ -201,8 +204,14 @@ before execution — prompt rules that were being violated are now mechanical:
 - **Advisory alerts** (in guard_events, never blocking): pre-committed trim
   level hit but no TRIM recommended (parses "+N%" triggers from the stored
   `pre_commit_trims` text, skipping levels already honoured by counting TRIM
-  trades since first_bought); planned buys would leave cash below the 5%
-  reserve floor; a theme is STILL over the 60% cap after this run's recs are
+  trades since first_bought); a position is held on a recorded forward driver
+  after its thesis played out, with the driver's age (plus a churn flag once 3+
+  different drivers have been named for the same position); a played-out
+  position's next trim level needs more than a 15% rally from TODAY to trigger
+  (`PLAYED_OUT_TRIM_MAX_UPSIDE` — trim levels are entry-relative, so on a big
+  winner they drift out of reach: DELL was played out at +97.6% with its first
+  trim at +130% from entry, ~16% away); planned buys would leave cash below the
+  5% reserve floor; a theme is STILL over the 60% cap after this run's recs are
   applied (added after the July 2026 Opus deep review flagged that AI infra
   was still ~58-63% weeks after the BUY-side cap existed, because nothing
   forces a correction when Claude doesn't propose a new buy in that theme —
@@ -224,7 +233,32 @@ Realised P&L: `sp.compute_realized_pnl()` replays the trade log and feeds
 computed realised-vs-unrealised figures into the deep review prompt (tickers
 whose cost basis came from T212 sync are flagged as incomplete).
 
-Test suite: `test_trading_agent.py` (85 tests, no network). Run it after any
+Forward-driver accountability (SET_DRIVER, July 2026): the second ledger-only
+rec action (alongside SET_TRIMS) — no T212 order, no cash movement, confirmed
+straight through by the executor (`LEDGER_ONLY_ACTIONS` in t212_executor.py)
+and passed untouched by the guards. It persists on the position:
+`thesis_played_out: true`, `forward_driver`, `forward_driver_set` (date), and
+`forward_driver_history` (every driver ever named, current one last).
+
+Why it exists: the thesis-realized rule let Claude keep a played-out winner by
+naming a new forward driver, but that claim lived only in that week's prose.
+Next run saw a plain HOLD, never re-tested it, and the position coasted (DELL,
+declared "definitively played out" at +97.6% on 2026-07-27 and held anyway).
+`build_thesis_review()` now replays the recorded driver, its age in weeks, and
+any drivers it superseded, then demands one of: (a) confirm it still live with
+NEW evidence, (b) SET_DRIVER a replacement, (c) TRIM/SELL. Repeated
+replacements are surfaced as "driver #N" — churning justifications to keep a
+winner is itself a signal. `thesis_played_out` is never cleared (a realized
+thesis doesn't un-realize); selling the position removes it with the position.
+DELL's driver was backfilled from the 2026-07-27 report.
+
+Two advisory guards make the same thing visible outside the prompt (see the
+alerts list above) — without them the whole mechanism lived inside Claude's
+context and never reached the weekly email. The prompt also now requires that a
+played-out position's next trim level be within ~15% of TODAY's price, tightened
+via SET_TRIMS alongside the SET_DRIVER if it isn't.
+
+Test suite: `test_trading_agent.py` (120 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the

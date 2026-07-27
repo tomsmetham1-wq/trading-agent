@@ -47,6 +47,20 @@ investor who runs an experimental portfolio on Trading 212.
   driver. A single surviving thesis leg (e.g. a growth leg that is genuinely
   still under-appreciated by the market) counts as that driver, but you must
   state it explicitly rather than let a played-out valuation leg carry the hold.
+  Any driver you name must be RECORDED with a SET_DRIVER action (ledger-only,
+  no order, no cash) so it is replayed to you every following week and has to
+  be defended with fresh evidence, replaced, or the position trimmed. A driver
+  already on record is shown in the thesis accountability section with its age
+  — treat re-confirming a stale one without new evidence as failing the test.
+- Trim levels on a played-out position must be REACHABLE. Pre-committed trim
+  levels are expressed as gains from ENTRY, so on a large winner they can sit
+  far above today's price and never bite. Whenever you declare a thesis played
+  out, check its levels: the next un-hit level must be within ~15% of TODAY's
+  price. If it is further away, issue a SET_TRIMS alongside the SET_DRIVER to
+  tighten it. A realized winner with no near-term mechanical exit is being held
+  on hope. (Worked example: a position at +97% from entry with its next trim at
+  +130% from entry needs another ~16% rally to trigger — too far. A level near
+  +115% from entry sits ~9% above today's price and would qualify.)
 - Theme concentration cap: no more than 60% of total portfolio value in any single
   macro theme. A "theme" is any group of holdings whose returns would strongly correlate
   under the same macro stress scenario — e.g. an AI spending downturn would hit
@@ -147,10 +161,19 @@ thesis-accountability check, you MUST do ONE of the following — defaulting to
 HOLD with no named forward driver is not permitted for a realized winner:
   (i)  name the one NEW, INDEPENDENT, forward-looking driver that justifies
        holding at today's price and weight (it must be something you would buy
-       fresh on today, not the original entry thesis restated), OR
+       fresh on today, not the original entry thesis restated) AND include a
+       SET_DRIVER action for that ticker in the JSON block so the claim is on
+       record and gets re-tested every week from now on, OR
   (ii) recommend a TRIM or SELL and state where the freed capital should go
        (a watchlist name with better forward risk/reward, or held as reserve if
        nothing qualifies).
+
+A position that ALREADY has a recorded forward driver (shown with its age in
+the thesis accountability section) is being held on that claim alone. Each run
+you must either evidence it as still live from recent news/results, issue a new
+SET_DRIVER replacing it, or TRIM/SELL. Only issue SET_DRIVER when the driver is
+new or changed — re-confirming an unchanged driver needs no action, just the
+evidence in section 3.
 
 **4. Watchlist**
 1–3 names to research further but not yet actionable, one line each.
@@ -159,7 +182,8 @@ HOLD with no named forward driver is not permitted for a realized winner:
 What you don't know. What could invalidate the thesis. Where you're speculating.
 
 Then, on a new line, output a JSON code block with ONLY the actionable items
-(BUY, SELL, TRIM — skip HOLD). Use this exact schema:
+(BUY, SELL, TRIM, plus the ledger-only SET_TRIMS and SET_DRIVER — skip HOLD).
+Use this exact schema:
 
 ```json
 {
@@ -190,10 +214,22 @@ Then, on a new line, output a JSON code block with ONLY the actionable items
       "ticker": "MSFT",
       "yfinance_ticker": "MSFT",
       "pre_commit_trims": "Trim 1/3 at +35%, trim another 1/3 at +70%."
+    },
+    {
+      "action": "SET_DRIVER",
+      "ticker": "CAT",
+      "yfinance_ticker": "CAT",
+      "forward_driver": "Entry thesis (trough multiple) is played out at +90%; hold now rests only on the $40bn dealer backlog underwriting 12-18 months of revenue at expanding margins, which I would buy fresh today."
     }
   ]
 }
 ```
+
+SET_DRIVER records, on the position, the forward driver justifying a hold whose
+ORIGINAL thesis has played out. It places no order and moves no cash. The driver
+text must be self-contained (it is replayed to you in future runs with no other
+context) and must be a driver you would underwrite as a fresh BUY today — not a
+restatement of the entry thesis.
 
 yfinance_ticker rules — use the exact format Yahoo Finance uses:
   US (NYSE/NASDAQ):  bare symbol         e.g. AAPL, MSFT, NVDA

@@ -7,7 +7,7 @@ Run with:  venv\\Scripts\\python.exe -m pytest test_trading_agent.py -q
 """
 
 import json
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import anthropic
 import httpx
@@ -495,6 +495,235 @@ class TestSetTrims:
         review = sp.build_thesis_review(ledger, val)
         assert "NONE SET" not in review
         assert "Trim 1/3 at +35%" in review
+
+
+# =============================================================================
+# SET_DRIVER — the forward driver carrying a played-out position
+# =============================================================================
+
+class TestSetDriver:
+    DRIVER = "Backlog of $51bn underwrites 12-18 months of revenue at rising margins."
+
+    def _set_driver_rec(self, ticker="TEST", driver=DRIVER):
+        return {"action": "SET_DRIVER", "yfinance_ticker": ticker,
+                "forward_driver": driver}
+
+    def _held(self, ledger=None):
+        ledger = ledger or make_ledger()
+        sp.apply_recommendations(ledger, [gbp_buy_rec("TEST", 200)], "2026-07-20")
+        return ledger
+
+    def test_records_driver_without_price_fetch_or_cash_movement(self, monkeypatch):
+        monkeypatch.setattr(
+            sp, "fetch_price_gbp",
+            lambda *a, **k: pytest.fail("SET_DRIVER must not fetch a price"))
+        ledger = self._held()
+        events = sp.apply_recommendations(
+            ledger, [self._set_driver_rec()], "2026-07-27")
+        assert events == [f"SET_DRIVER TEST: {self.DRIVER}"]
+        pos = ledger["positions"]["TEST"]
+        assert pos["thesis_played_out"] is True
+        assert pos["forward_driver"] == self.DRIVER
+        assert pos["forward_driver_set"] == "2026-07-27"
+        assert pos["forward_driver_history"] == [
+            {"date": "2026-07-27", "driver": self.DRIVER}
+        ]
+        assert ledger["trades"][-1]["action"] == "SET_DRIVER"
+        assert ledger["cash_gbp"] == pytest.approx(800.0)
+
+    def test_falls_back_to_thesis_oneline(self):
+        ledger = self._held()
+        sp.apply_recommendations(
+            ledger,
+            [{"action": "SET_DRIVER", "yfinance_ticker": "TEST",
+              "thesis_oneline": "Fallback driver."}],
+            "2026-07-27")
+        assert ledger["positions"]["TEST"]["forward_driver"] == "Fallback driver."
+
+    def test_replacement_is_recorded_in_history_and_trade(self):
+        ledger = self._held()
+        sp.apply_recommendations(ledger, [self._set_driver_rec()], "2026-07-27")
+        events = sp.apply_recommendations(
+            ledger, [self._set_driver_rec(driver="A different driver.")],
+            "2026-08-03")
+        assert "replaces" in events[0]
+        pos = ledger["positions"]["TEST"]
+        assert pos["forward_driver"] == "A different driver."
+        assert pos["forward_driver_set"] == "2026-08-03"
+        assert [h["driver"] for h in pos["forward_driver_history"]] == [
+            self.DRIVER, "A different driver."
+        ]
+        assert ledger["trades"][-1]["replaces_driver"] == self.DRIVER
+
+    def test_unknown_ticker_skipped(self):
+        ledger = make_ledger()
+        events = sp.apply_recommendations(
+            ledger, [self._set_driver_rec(ticker="NOPE")], "2026-07-27")
+        assert "SKIP SET_DRIVER NOPE" in events[0]
+        assert not ledger["trades"]
+
+    def test_empty_driver_text_skipped(self):
+        ledger = self._held()
+        events = sp.apply_recommendations(
+            ledger, [self._set_driver_rec(driver="  ")], "2026-07-27")
+        assert "SKIP SET_DRIVER TEST" in events[0]
+        assert "thesis_played_out" not in ledger["positions"]["TEST"]
+
+    def test_passes_strategy_guards_untouched(self):
+        rec = self._set_driver_rec()
+        pre_val = {"total_value_gbp": 1000.0, "cash_gbp": 100.0, "positions": {}}
+        allowed, events = ta.enforce_strategy_guards([rec], make_ledger(), pre_val)
+        assert allowed == [rec]
+        assert not any("SET_DRIVER" in e for e in events)
+
+    def test_executor_confirms_without_placing_order(self, monkeypatch):
+        monkeypatch.setattr(t212ex, "T212_DEMO_EXECUTE", True)
+        monkeypatch.setattr(t212ex, "T212_ENV", "demo")
+        monkeypatch.setattr(t212ex, "_load_instruments", lambda: INSTRUMENTS)
+        monkeypatch.setattr(t212ex, "get_t212_positions_map", lambda: {})
+        monkeypatch.setattr(
+            t212ex, "_place_market_order",
+            lambda *a, **k: pytest.fail("SET_DRIVER must not place a T212 order"))
+        rec = self._set_driver_rec()
+        events, confirmed = t212ex.execute_recommendations([rec])
+        assert confirmed == [rec]
+        assert any("SET_DRIVER TEST" in e for e in events)
+
+    def test_realized_pnl_ignores_set_driver_trades(self):
+        ledger = self._held()
+        sp.apply_recommendations(ledger, [self._set_driver_rec()], "2026-07-27")
+        assert sp.compute_realized_pnl(ledger)["total_gbp"] == pytest.approx(0.0)
+
+    def test_thesis_review_replays_driver_and_demands_a_decision(self):
+        ledger = self._held()
+        val = {"positions": {"TEST": {"pnl_pct": 95.0}}}
+        assert "ORIGINAL THESIS ALREADY PLAYED OUT" not in sp.build_thesis_review(
+            ledger, val)
+
+        sp.apply_recommendations(ledger, [self._set_driver_rec()], "2026-07-27")
+        review = sp.build_thesis_review(ledger, val)
+        assert "ORIGINAL THESIS ALREADY PLAYED OUT" in review
+        assert self.DRIVER in review
+        assert "REQUIRED THIS RUN" in review
+
+    def test_thesis_review_shows_driver_age(self):
+        ledger = self._held()
+        old = (date.today() - timedelta(weeks=6)).isoformat()
+        sp.apply_recommendations(ledger, [self._set_driver_rec()], old)
+        review = sp.build_thesis_review(ledger, {"positions": {}})
+        assert "named 6 weeks ago" in review
+
+    def test_thesis_review_lists_superseded_drivers(self):
+        ledger = self._held()
+        sp.apply_recommendations(ledger, [self._set_driver_rec()], "2026-07-27")
+        sp.apply_recommendations(
+            ledger, [self._set_driver_rec(driver="Second driver.")], "2026-08-03")
+        review = sp.build_thesis_review(ledger, {"positions": {}})
+        assert "driver #2" in review
+        assert self.DRIVER in review          # the superseded one is still shown
+        assert "Second driver." in review
+
+    def test_selling_the_position_drops_the_played_out_flag(self, monkeypatch):
+        ledger = self._held()
+        sp.apply_recommendations(ledger, [self._set_driver_rec()], "2026-07-27")
+        monkeypatch.setattr(sp, "fetch_price_gbp", lambda t: 12.0)
+        sp.apply_recommendations(
+            ledger, [{"action": "SELL", "yfinance_ticker": "TEST"}], "2026-08-03")
+        assert "TEST" not in ledger["positions"]
+
+    # --- advisory alerts surfaced in the weekly email ---
+
+    def _played_out_ledger(self, trims="Trim 1/3 at +130%, another 1/3 at +175%.",
+                           drivers=1, set_date="2026-07-27"):
+        ledger = make_ledger()
+        ledger["positions"] = {
+            "DELL": {
+                "shares": 3.0, "avg_cost_gbp": 160.0, "first_bought": "2026-04-26",
+                "thesis": "cheap at 17x", "pre_commit_trims": trims,
+                "thesis_played_out": True,
+                "forward_driver": "backlog", "forward_driver_set": set_date,
+                "forward_driver_history": [
+                    {"date": set_date, "driver": f"driver {i}"}
+                    for i in range(drivers)
+                ],
+            }
+        }
+        return ledger
+
+    def _pre_val(self, pnl=97.6):
+        return {"total_value_gbp": 6000.0, "cash_gbp": 400.0,
+                "positions": {"DELL": {"current_value_gbp": 960.0,
+                                       "pnl_pct": pnl}}}
+
+    def test_alerts_that_position_is_held_on_a_driver(self):
+        _, events = ta.enforce_strategy_guards(
+            [], self._played_out_ledger(), self._pre_val())
+        assert any("held on a forward driver" in e for e in events)
+
+    def test_no_driver_alert_when_position_is_being_sold(self):
+        _, events = ta.enforce_strategy_guards(
+            [{"action": "SELL", "yfinance_ticker": "DELL"}],
+            self._played_out_ledger(), self._pre_val())
+        assert not any("held on a forward driver" in e for e in events)
+
+    def test_driver_churn_flagged_from_third_driver(self):
+        _, events = ta.enforce_strategy_guards(
+            [], self._played_out_ledger(drivers=2), self._pre_val())
+        assert not any("different forward drivers" in e for e in events)
+        _, events = ta.enforce_strategy_guards(
+            [], self._played_out_ledger(drivers=3), self._pre_val())
+        assert any("3 different forward drivers" in e for e in events)
+
+    def test_unreachable_trim_level_alerts(self):
+        # +97.6% now, next level +130% from entry = a further 16.4% rally
+        _, events = ta.enforce_strategy_guards(
+            [], self._played_out_ledger(), self._pre_val())
+        assert any("no near-term mechanical exit" in e for e in events)
+
+    def test_reachable_trim_level_does_not_alert(self):
+        # +115% from entry on a +97.6% position is only ~8.8% above today
+        _, events = ta.enforce_strategy_guards(
+            [], self._played_out_ledger(trims="Trim 1/3 at +115%."),
+            self._pre_val())
+        assert not any("no near-term mechanical exit" in e for e in events)
+
+    def test_no_trim_alert_when_set_trims_lands_this_run(self):
+        _, events = ta.enforce_strategy_guards(
+            [{"action": "SET_TRIMS", "yfinance_ticker": "DELL",
+              "pre_commit_trims": "Trim 1/3 at +110%."}],
+            self._played_out_ledger(), self._pre_val())
+        assert not any("no near-term mechanical exit" in e for e in events)
+
+    def test_alerts_when_no_trim_level_remains_above_current_pnl(self):
+        _, events = ta.enforce_strategy_guards(
+            [], self._played_out_ledger(trims="Trim 1/3 at +30%."),
+            self._pre_val())
+        assert any("no trim level remains" in e for e in events)
+
+    def test_healthy_position_raises_no_played_out_alerts(self):
+        ledger = self._played_out_ledger()
+        del ledger["positions"]["DELL"]["thesis_played_out"]
+        _, events = ta.enforce_strategy_guards([], ledger, self._pre_val())
+        assert not any("played out" in e or "forward driver" in e for e in events)
+
+    def test_alerts_are_advisory_never_blocking(self):
+        recs = [gbp_buy_rec("MSFT", 300, theme="software")]
+        allowed, events = ta.enforce_strategy_guards(
+            recs, self._played_out_ledger(), self._pre_val())
+        assert allowed == recs
+        assert any("played out" in e for e in events)
+
+    def test_missing_price_does_not_crash_the_alert(self):
+        pre_val = {"total_value_gbp": 6000.0, "cash_gbp": 400.0,
+                   "positions": {"DELL": {"current_value_gbp": 960.0}}}
+        _, events = ta.enforce_strategy_guards(
+            [], self._played_out_ledger(), pre_val)
+        assert not any("mechanical exit" in e for e in events)
+
+    def test_weeks_since_handles_bad_input(self):
+        assert sp._weeks_since(None) is None
+        assert sp._weeks_since("not-a-date") is None
+        assert sp._weeks_since(date.today().isoformat()) == 0
 
 
 # =============================================================================

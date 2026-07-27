@@ -429,6 +429,11 @@ THEME_HARD_CAP = 0.60         # max 60% of total portfolio value per macro theme
 MIN_ORDER_GBP = 25.0          # a cap-reduced buy below this is blocked, not placed
 CASH_FLOOR_ALERT = 0.04       # warn when planned buys leave cash below ~5% reserve
 
+# A position whose thesis has played out should have a mechanical trim within
+# this % move of TODAY's price. Trim levels are stored as gains from entry, so
+# on a big winner they can sit far above the current price and never bite.
+PLAYED_OUT_TRIM_MAX_UPSIDE = 15.0
+
 # Matches "+40%" style triggers inside pre-committed trim text,
 # e.g. "Trim 1/3 at +40%, trim another 1/3 at +80%."
 _TRIM_TRIGGER_RE = re.compile(r"\+\s*(\d+(?:\.\d+)?)\s*%")
@@ -436,6 +441,29 @@ _TRIM_TRIGGER_RE = re.compile(r"\+\s*(\d+(?:\.\d+)?)\s*%")
 
 def _rec_ticker(rec: dict) -> str:
     return (rec.get("yfinance_ticker") or rec.get("ticker") or "").strip()
+
+
+def _trim_triggers_and_honoured(ledger: dict, ticker: str,
+                                 pos: dict) -> tuple[list[float], int]:
+    """
+    Parse a position's pre-committed trim triggers and count how many have
+    already been acted on.
+
+    Returns (triggers ascending, trims_done). Levels are stored as free text
+    ("Trim 1/3 at +40%, trim another 1/3 at +80%.") and are gains from ENTRY,
+    so they compare directly against a position's pnl_pct. Honoured levels are
+    counted as TRIM trades since the position was opened.
+    """
+    triggers = sorted(
+        float(m) for m in
+        _TRIM_TRIGGER_RE.findall(pos.get("pre_commit_trims") or "")
+    )
+    trims_done = sum(
+        1 for t in ledger.get("trades", [])
+        if t.get("action") == "TRIM" and t.get("ticker") == ticker
+        and t.get("date", "") >= pos.get("first_bought", "")
+    )
+    return triggers, trims_done
 
 
 def _recent_full_exit_date(ledger: dict, ticker: str, today) -> str | None:
@@ -489,19 +517,116 @@ def _pre_commit_trim_alerts(recs: list, ledger: dict, pre_val: dict) -> list[str
         pnl_pct = (positions_val.get(ticker, {}) or {}).get("pnl_pct")
         if pnl_pct is None:
             continue
-        triggers = sorted(float(m) for m in _TRIM_TRIGGER_RE.findall(trims_text))
+        triggers, trims_done = _trim_triggers_and_honoured(ledger, ticker, pos)
         hit = [lvl for lvl in triggers if pnl_pct >= lvl]
         if not hit:
             continue
-        trims_done = sum(
-            1 for t in ledger.get("trades", [])
-            if t.get("action") == "TRIM" and t.get("ticker") == ticker
-            and t.get("date", "") >= pos.get("first_bought", "")
-        )
         if len(hit) > trims_done:
             alerts.append(
                 f"ALERT {ticker}: pre-committed trim level +{hit[trims_done]:.0f}% "
                 f"hit (P&L {pnl_pct:+.1f}%) but no TRIM recommended this run"
+            )
+    return alerts
+
+
+def _forward_driver_alerts(recs: list, ledger: dict) -> list[str]:
+    """
+    Advisory alerts (never blocking) for positions being carried by a recorded
+    forward driver after their original thesis played out.
+
+    These holds rest on a claim, not on the entry thesis (see SET_DRIVER in
+    shadow_portfolio.py). The prompt makes Claude re-argue that claim every
+    week, but nothing surfaced it OUTSIDE the prompt — so a realized winner
+    could be held for months on a driver named once and never questioned, with
+    no visibility in the weekly email. This puts the claim and its age in front
+    of a human every run until the position is trimmed or sold.
+
+    Driver churn is flagged separately: repeatedly swapping in a fresh
+    justification to keep the same winner is a distinct failure mode from
+    holding one driver too long.
+    """
+    alerts: list[str] = []
+    acted = {
+        _rec_ticker(r) for r in recs
+        if (r.get("action") or "").upper().strip() in ("SELL", "TRIM")
+    }
+
+    for ticker, pos in ledger.get("positions", {}).items():
+        if not pos.get("thesis_played_out") or ticker in acted:
+            continue
+        set_date = pos.get("forward_driver_set") or "?"
+        weeks = sp._weeks_since(pos.get("forward_driver_set"))
+        age = f", {weeks}w ago" if weeks else ""
+        alerts.append(
+            f"NOTE {ticker}: thesis played out - held on a forward driver "
+            f"named {set_date}{age}, not the entry thesis"
+        )
+        drivers = len(pos.get("forward_driver_history") or [])
+        if drivers >= 3:
+            alerts.append(
+                f"ALERT {ticker}: {drivers} different forward drivers named to "
+                f"justify holding this position - review whether it still earns "
+                f"its place"
+            )
+    return alerts
+
+
+def _played_out_trim_alerts(recs: list, ledger: dict, pre_val: dict) -> list[str]:
+    """
+    Advisory alerts (never blocking) for a played-out position with no
+    mechanical trim level reachable from today's price.
+
+    Trim levels are gains from ENTRY, so on a large winner they can sit far
+    above the current price. DELL was declared played out at +97.6% with its
+    first trim at +130% from entry — another 16% rally away — so nothing
+    mechanical would have banked the realized gain for months. A position whose
+    thesis is already realized should have a trim within
+    PLAYED_OUT_TRIM_MAX_UPSIDE of where the price actually is, not where it
+    started.
+
+    Skipped when the run already acts on the position (SELL/TRIM) or resets its
+    levels (SET_TRIMS) — the fix is landing this run.
+    """
+    alerts: list[str] = []
+    addressed = {
+        _rec_ticker(r) for r in recs
+        if (r.get("action") or "").upper().strip()
+        in ("SELL", "TRIM", "SET_TRIMS")
+    }
+    positions_val = pre_val.get("positions", {})
+
+    for ticker, pos in ledger.get("positions", {}).items():
+        if not pos.get("thesis_played_out") or ticker in addressed:
+            continue
+        pnl_pct = (positions_val.get(ticker, {}) or {}).get("pnl_pct")
+        if pnl_pct is None:
+            continue
+
+        # Levels at or below current P&L are already due — that is the
+        # _pre_commit_trim_alerts case, not this one. Only what's still ahead
+        # tells us whether a future trim can actually bite.
+        triggers, _ = _trim_triggers_and_honoured(ledger, ticker, pos)
+        pending = [lvl for lvl in triggers if lvl > pnl_pct]
+        if not pending:
+            alerts.append(
+                f"ALERT {ticker}: thesis played out and no trim level remains "
+                f"above current P&L ({pnl_pct:+.1f}%) - set reachable levels "
+                f"via SET_TRIMS or recycle the position"
+            )
+            continue
+
+        # Convert an entry-relative trigger into the move still needed from
+        # today's price: a +130% trigger on a +97.6% position is only ~16% away.
+        basis = 100.0 + pnl_pct
+        if basis <= 0:
+            continue
+        upside = (pending[0] - pnl_pct) / basis * 100.0
+        if upside > PLAYED_OUT_TRIM_MAX_UPSIDE:
+            alerts.append(
+                f"ALERT {ticker}: thesis played out but next trim level "
+                f"(+{pending[0]:.0f}% from entry) needs a further {upside:.0f}% "
+                f"rally from today - no near-term mechanical exit on a realized "
+                f"winner; tighten via SET_TRIMS"
             )
     return alerts
 
@@ -563,6 +688,11 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[li
 
     Advisory alerts (returned in guard_events but never blocking):
       - a pre-committed trim level was hit but no TRIM was recommended;
+      - a position is being held on a recorded forward driver after its
+        original thesis played out (with the driver's age, and a separate
+        flag when several different drivers have been named for it);
+      - a played-out position's next trim level is more than 15% above
+        today's price, so nothing mechanical will bank the realized gain;
       - the planned buys would leave cash below the 5% reserve floor;
       - a theme is STILL over the 60% cap after this run's recs are applied
         (the BUY-side theme guard only stops new breaches — it has nothing
@@ -695,6 +825,8 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[li
 
     # Advisory alerts — surfaced in the email, never blocking
     guard_events.extend(_pre_commit_trim_alerts(recs, ledger, pre_val))
+    guard_events.extend(_forward_driver_alerts(recs, ledger))
+    guard_events.extend(_played_out_trim_alerts(recs, ledger, pre_val))
     guard_events.extend(_theme_cap_alerts(
         theme_exposure, themes_rebalanced_this_run, theme_label_by_key, total
     ))

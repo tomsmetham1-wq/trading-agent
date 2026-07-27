@@ -547,6 +547,56 @@ def _apply_set_trims(ledger: dict, rec: dict, ticker: str, run_date: str) -> str
     return f"SET_TRIMS {ticker}: {trims}"
 
 
+def _apply_set_driver(ledger: dict, rec: dict, ticker: str, run_date: str) -> str:
+    """
+    Record the forward driver that is carrying a played-out position (ledger-only).
+
+    When a position's ORIGINAL thesis has substantially played out, the strategy
+    allows continuing to hold only if a NEW, independent, forward-looking driver
+    is named — one that would be underwritten as a fresh BUY at today's price.
+    Before this action existed that claim was made in prose and then forgotten:
+    the next run saw a plain HOLD, the driver was never re-tested, and a
+    realized winner could coast indefinitely on an assertion made weeks earlier
+    (DELL, July 2026). Persisting it flips the default — build_thesis_review()
+    replays the driver and its age into every subsequent prompt, so it must be
+    defended with fresh evidence, replaced, or the position trimmed.
+
+    Once set, thesis_played_out is never cleared: a thesis that has been
+    realized does not become un-realized. Selling the position removes it.
+    Moves no money and places no order.
+    """
+    driver = (rec.get("forward_driver") or rec.get("thesis_oneline") or "").strip()
+    pos = ledger.get("positions", {}).get(ticker)
+    if pos is None:
+        return f"SKIP SET_DRIVER {ticker}: no such position in shadow ledger"
+    if not driver:
+        return f"SKIP SET_DRIVER {ticker}: no forward_driver text provided"
+
+    previous = (pos.get("forward_driver") or "").strip()
+    pos["thesis_played_out"]  = True
+    pos["forward_driver"]     = driver
+    pos["forward_driver_set"] = run_date
+    # History includes the current driver as its last element, so repeatedly
+    # swapping in a fresh justification each week is itself visible.
+    pos.setdefault("forward_driver_history", []).append(
+        {"date": run_date, "driver": driver}
+    )
+
+    trade = {
+        "date":           run_date,
+        "action":         "SET_DRIVER",
+        "ticker":         ticker,
+        "forward_driver": driver,
+    }
+    if previous and previous != driver:
+        trade["replaces_driver"] = previous
+    ledger.setdefault("trades", []).append(trade)
+
+    if previous and previous != driver:
+        return f"SET_DRIVER {ticker}: {driver} (replaces: {previous})"
+    return f"SET_DRIVER {ticker}: {driver}"
+
+
 def apply_recommendations(ledger: dict, recs: list, run_date: str) -> list[str]:
     """
     Apply a list of trade recommendations to the shadow portfolio ledger.
@@ -555,9 +605,10 @@ def apply_recommendations(ledger: dict, recs: list, run_date: str) -> list[str]:
     then delegates to _apply_buy() or _apply_sell_or_trim() depending on action type.
     Returns a log of what happened to each recommendation for email reporting.
 
-    Only BUY, SELL, TRIM, and SET_TRIMS actions are processed; HOLD is ignored.
-    SET_TRIMS is ledger-only metadata (backfills pre-committed trim levels on
-    an existing position) — no price fetch, no cash movement.
+    Only BUY, SELL, TRIM, SET_TRIMS and SET_DRIVER actions are processed; HOLD
+    is ignored. SET_TRIMS (pre-committed trim levels) and SET_DRIVER (the
+    forward driver carrying a played-out position) are ledger-only metadata —
+    no price fetch, no cash movement.
 
     Args:
         ledger:   Shadow portfolio ledger dict. Mutated in-place.
@@ -572,13 +623,17 @@ def apply_recommendations(ledger: dict, recs: list, run_date: str) -> list[str]:
     for rec in recs:
         action = rec.get("action", "").upper().strip()
         ticker = rec.get("yfinance_ticker") or rec.get("ticker")
-        if not ticker or action not in ("BUY", "SELL", "TRIM", "SET_TRIMS"):
+        if not ticker or action not in ("BUY", "SELL", "TRIM", "SET_TRIMS",
+                                        "SET_DRIVER"):
             continue
 
-        # SET_TRIMS never needs a price — handle it before the price fetch so
-        # a metadata-only rec can't be skipped for a pricing failure.
+        # Metadata-only actions never need a price — handle them before the
+        # price fetch so they can't be skipped for a pricing failure.
         if action == "SET_TRIMS":
             events.append(_apply_set_trims(ledger, rec, ticker, run_date))
+            continue
+        if action == "SET_DRIVER":
+            events.append(_apply_set_driver(ledger, rec, ticker, run_date))
             continue
 
         # For BUY: use T212 actual fill price if available (most accurate cost basis).
@@ -979,6 +1034,73 @@ def snapshot(ledger: dict, val: dict, run_date: str,
     ledger["weekly_snapshots"].append(entry)
 
 
+def _weeks_since(iso_date: str | None) -> Optional[int]:
+    """Whole weeks between an ISO date string and today, or None if unparseable."""
+    if not iso_date:
+        return None
+    try:
+        then = datetime.strptime(iso_date, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+    return max((date.today() - then).days, 0) // 7
+
+
+def _format_forward_driver(pos: dict) -> str:
+    """
+    Render the played-out / forward-driver block for one position in the thesis
+    accountability section.
+
+    A position marked thesis_played_out is being held on a claim, not on its
+    entry thesis. Replaying that claim verbatim — with its age, and any earlier
+    drivers it replaced — forces it to be re-argued against this week's facts
+    instead of silently carrying the hold forever.
+    """
+    if not pos.get("thesis_played_out"):
+        return ""
+
+    driver   = pos.get("forward_driver") or "(none recorded)"
+    set_date = pos.get("forward_driver_set") or "?"
+    weeks    = _weeks_since(pos.get("forward_driver_set"))
+    if weeks is None:
+        age = ""
+    elif weeks == 0:
+        age = " (named this week)"
+    else:
+        age = f" (named {weeks} week{'s' if weeks != 1 else ''} ago)"
+
+    block = (
+        f"\n    ** ORIGINAL THESIS ALREADY PLAYED OUT — declared {set_date} **"
+        f"\n    This hold rests solely on the forward driver below{age}, NOT on the"
+        f"\n    entry thesis above:"
+        f"\n      \"{driver}\""
+    )
+
+    history = pos.get("forward_driver_history") or []
+    if len(history) > 1:
+        block += (
+            f"\n    This is driver #{len(history)} for this position. Previously named:"
+        )
+        for h in history[:-1]:
+            block += f"\n      [{h.get('date', '?')}] {h.get('driver', '')}"
+        block += (
+            "\n      (Repeatedly swapping in a fresh justification to keep a"
+            "\n       realized winner is itself evidence the hold is not earning"
+            "\n       its place — weigh that.)"
+        )
+
+    block += (
+        "\n    REQUIRED THIS RUN — pick one, do not default to HOLD:"
+        "\n      (a) Confirm the driver is STILL live, citing evidence from the past"
+        "\n          week or the most recent results. Restating it in different words"
+        "\n          with no new evidence is NOT a defence."
+        "\n      (b) Replace it with a different forward driver you would underwrite"
+        "\n          as a fresh BUY at today's price and weight — issue a new"
+        "\n          SET_DRIVER action so the replacement is on record."
+        "\n      (c) TRIM or SELL and state where the freed capital goes."
+    )
+    return block
+
+
 def build_thesis_review(ledger: dict, current_val: dict) -> str:
     """
     Build the thesis accountability section for the Claude weekly prompt.
@@ -1016,6 +1138,7 @@ def build_thesis_review(ledger: dict, current_val: dict) -> str:
                 + (f", theme: {theme}" if theme else "")
                 + f")\n    Entry thesis: {thesis}"
             )
+            entry += _format_forward_driver(pos)
             trims = pos.get("pre_commit_trims")
             if trims:
                 entry += (
@@ -1056,8 +1179,10 @@ def build_thesis_review(ledger: dict, current_val: dict) -> str:
         "or is still pending. This is your primary accountability check.\n"
         "If a thesis has PLAYED OUT, holding is not automatic: either name one\n"
         "new, independent, forward-looking driver that would justify buying it\n"
-        "fresh at today's price and weight, or TRIM/exit and recycle the capital\n"
-        "into better forward risk/reward.\n"
+        "fresh at today's price and weight — and record it with a SET_DRIVER\n"
+        "action so it can be re-tested next week — or TRIM/exit and recycle the\n"
+        "capital into better forward risk/reward. Any position already carrying\n"
+        "a recorded forward driver is marked below and MUST be re-argued.\n"
     )
 
     return "\n".join(lines)
