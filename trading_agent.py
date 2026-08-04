@@ -434,6 +434,11 @@ CASH_FLOOR_ALERT = 0.04       # warn when planned buys leave cash below ~5% rese
 # on a big winner they can sit far above the current price and never bite.
 PLAYED_OUT_TRIM_MAX_UPSIDE = 15.0
 
+# Declaring a thesis played out costs a third of the position: the forward
+# driver may carry the remainder, never the whole win. If Claude doesn't
+# include the trim itself, this is the one injected mechanically.
+PLAYED_OUT_BANK_TRIM_PCT = 33.0
+
 # Matches "+40%" style triggers inside pre-committed trim text,
 # e.g. "Trim 1/3 at +40%, trim another 1/3 at +80%."
 _TRIM_TRIGGER_RE = re.compile(r"\+\s*(\d+(?:\.\d+)?)\s*%")
@@ -631,6 +636,96 @@ def _played_out_trim_alerts(recs: list, ledger: dict, pre_val: dict) -> list[str
     return alerts
 
 
+def _inject_played_out_banks(recs: list, ledger: dict,
+                             pre_val: dict) -> tuple[list, list[str]]:
+    """
+    Force a mechanical bank on played-out positions Claude keeps holding.
+
+    The forward-driver accountability loop demands words, not money: a hold on
+    a realized winner can be re-justified every week with "fresh evidence"
+    (for a secular theme there always is some), so nothing ever converts the
+    paper gain into realised gain unless the price rallies to a trim level.
+    DELL was declared played out at +97.6% on 2026-07-27 and simply carried
+    on — exactly the stagnation the July 2026 deep review flagged ("bank a
+    third of DELL now").
+
+    Rule, enforced here in code: a played-out declaration costs 1/3 of the
+    position. If no TRIM/SELL has been recorded since the declaration — or
+    the latest one is PLAYED_OUT_REBANK_WEEKS or more old — and this run's
+    recs don't act on the ticker, a PLAYED_OUT_BANK_TRIM_PCT TRIM is
+    prepended to the rec list. It executes exactly like a Claude TRIM
+    (T212-first, shadow mirrors on confirmation). The prompt tells Claude
+    the bank is coming, so a deliberate recycling trim can pre-empt it.
+
+    Returns (recs including any injected trims, guard_events).
+    """
+    events: list[str] = []
+    injected: list[dict] = []
+    acted = {
+        _rec_ticker(r) for r in recs
+        if (r.get("action") or "").upper().strip() in ("SELL", "TRIM")
+    }
+    declared_this_run = {
+        _rec_ticker(r) for r in recs
+        if (r.get("action") or "").upper().strip() == "SET_DRIVER"
+    }
+    positions_val = pre_val.get("positions", {})
+
+    for ticker, pos in ledger.get("positions", {}).items():
+        if ticker in acted:
+            continue
+        if pos.get("thesis_played_out"):
+            due = sp.played_out_bank_due(ledger, ticker, pos)
+            declared = sp.played_out_declared_date(pos) or "?"
+        elif ticker in declared_this_run:
+            due = True          # declared this very run, with no trim alongside
+            declared = "this run"
+        else:
+            continue
+        if not due:
+            continue
+
+        value = (positions_val.get(ticker, {}) or {}).get("current_value_gbp")
+        if value is None:
+            events.append(
+                f"ALERT {ticker}: mechanical bank due (thesis played out, "
+                f"declared {declared}) but no live price this run - trim NOT "
+                f"forced, will retry next run"
+            )
+            continue
+        trim_value = value * PLAYED_OUT_BANK_TRIM_PCT / 100
+        if trim_value < MIN_ORDER_GBP:
+            events.append(
+                f"ALERT {ticker}: mechanical bank due but a "
+                f"{PLAYED_OUT_BANK_TRIM_PCT:.0f}% trim is only "
+                f"£{trim_value:.2f} - too small to force, review manually"
+            )
+            continue
+
+        injected.append({
+            "action": "TRIM",
+            "ticker": ticker,
+            "yfinance_ticker": ticker,
+            "trim_pct": PLAYED_OUT_BANK_TRIM_PCT,
+            "thesis_oneline": (
+                f"Mechanical bank: thesis played out (declared {declared}) "
+                f"with no gain banked since - strategy rule, not a thesis "
+                f"change. Forward driver carries the remaining position."
+            ),
+            "guard_generated": True,
+        })
+        events.append(
+            f"FORCED TRIM {ticker}: thesis played out (declared {declared}) "
+            f"with no gain banked since - mechanically trimming "
+            f"{PLAYED_OUT_BANK_TRIM_PCT:.0f}% (~£{trim_value:.2f}) to convert "
+            f"paper alpha into realised alpha"
+        )
+
+    # Injected trims go FIRST so the theme/cash guards credit their proceeds
+    # and the executor's sells-before-buys pass picks them up naturally.
+    return injected + recs, events
+
+
 def _theme_cap_alerts(theme_exposure: dict, themes_rebalanced_this_run: set,
                        theme_label_by_key: dict, total: float) -> list[str]:
     """
@@ -685,6 +780,16 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[li
          60% of total portfolio value is REDUCED or BLOCKED. Exposure freed by
          SELL/TRIM recs of the same theme in this run is credited first, so a
          legitimate rebalance-within-theme isn't wrongly blocked.
+      4. Trim levels only tighten: a SET_TRIMS that raises (or removes) the
+         next un-hit trigger is BLOCKED and the existing levels kept — the
+         July 2026 deep review called repeated trim-level resets on a winner
+         "moving the goalposts".
+      0. Played-out positions must bank: if a position's thesis is played out
+         and no TRIM/SELL has landed since the declaration (or in the last
+         PLAYED_OUT_REBANK_WEEKS), a PLAYED_OUT_BANK_TRIM_PCT TRIM is
+         INJECTED into the rec list and executes like any other trade — the
+         forward driver may carry the remainder of a realized winner, never
+         the whole position (see _inject_played_out_banks).
 
     Advisory alerts (returned in guard_events but never blocking):
       - a pre-committed trim level was hit but no TRIM was recommended;
@@ -709,6 +814,12 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[li
     positions_val = pre_val.get("positions", {})
     ledger_positions = ledger.get("positions", {})
     today = datetime.now().date()
+
+    # Rule 0: played-out positions must bank — inject the mechanical trim
+    # BEFORE anything else so the theme/cash checks credit its proceeds and
+    # the advisory alerts treat the position as acted on this run.
+    recs, bank_events = _inject_played_out_banks(recs, ledger, pre_val)
+    guard_events.extend(bank_events)
 
     def _pos_value(ticker: str) -> float:
         return (positions_val.get(ticker, {}) or {}).get("current_value_gbp") or 0.0
@@ -820,6 +931,43 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[li
             if theme:
                 theme_exposure[theme] = theme_exposure.get(theme, 0.0) + amount
             bought_so_far[ticker] = bought_so_far.get(ticker, 0.0) + amount
+
+        elif action == "SET_TRIMS" and ticker:
+            # Rule 4: trim levels may only be TIGHTENED, never raised.
+            # An unreachable level is information (the position is extended)
+            # — moving the goalpost up removes the only mechanical exit.
+            # Compared on the next un-hit trigger, the one that actually bites.
+            pos = ledger_positions.get(ticker) or {}
+            old_triggers = sorted(
+                float(m) for m in
+                _TRIM_TRIGGER_RE.findall(pos.get("pre_commit_trims") or "")
+            )
+            new_triggers = sorted(
+                float(m) for m in
+                _TRIM_TRIGGER_RE.findall(rec.get("pre_commit_trims") or "")
+            )
+            if old_triggers and new_triggers:
+                pnl_pct = (positions_val.get(ticker, {}) or {}).get("pnl_pct")
+                if pnl_pct is not None:
+                    old_pending = [t for t in old_triggers if t > pnl_pct]
+                    new_pending = [t for t in new_triggers if t > pnl_pct]
+                else:
+                    old_pending, new_pending = old_triggers, new_triggers
+                if old_pending and (
+                    not new_pending
+                    or new_pending[0] > old_pending[0] + 0.01
+                ):
+                    detail = (
+                        "removes every un-hit level" if not new_pending
+                        else f"raises the next un-hit level from "
+                             f"+{old_pending[0]:.0f}% to +{new_pending[0]:.0f}%"
+                    )
+                    guard_events.append(
+                        f"BLOCKED SET_TRIMS {ticker}: {detail} - trim levels "
+                        f"may only be tightened, never loosened; existing "
+                        f"levels kept"
+                    )
+                    continue
 
         allowed.append(rec)
 

@@ -160,6 +160,25 @@ All sizing rules are percentage-based so they scale as the portfolio grows.
   The named driver is no longer prose-only: it must be recorded with a
   SET_DRIVER rec (July 2026, see below) so it is replayed and re-tested every
   following week rather than silently carrying the hold forever.
+- Played-out positions must BANK, not just argue (added Aug 2026): declaring a
+  thesis played out costs 1/3 of the position — a forward driver carries the
+  remainder, never the whole win. Code-enforced in
+  `_inject_played_out_banks()`: if a played-out position has had no TRIM/SELL
+  since its declaration, or none in the last 12 weeks
+  (`sp.PLAYED_OUT_REBANK_WEEKS`), a 33% TRIM (`PLAYED_OUT_BANK_TRIM_PCT`) is
+  INJECTED into the rec list and executes like any Claude trade. Claude is
+  told in the prompt and thesis review ("MECHANICAL BANK DUE") so it can
+  pre-empt with its own better-sized trim. Rationale: the accountability loop
+  demanded words, not money — DELL was declared played out 2026-07-27 at
+  +97.6% and was then held for weeks on a driver "confirmed with fresh
+  evidence" every run (for a secular theme there always is some), while the
+  Aug 2026 Opus deep review said "bank a third of DELL now".
+- Trim levels only tighten (added Aug 2026, Opus deep review): a SET_TRIMS
+  that raises or removes the next un-hit trigger is BLOCKED in code and the
+  existing levels kept — an unreachable level means the position is extended,
+  which argues for trimming, not for moving the line. Compared on the first
+  trigger above current P&L (falls back to raw first triggers when the price
+  is unknown), so re-tightening after a level has been hit still works.
 - Theme concentration cap: max 60% in any single macro theme; must hold ≥1 non-dominant-theme position
 - Flip-flop rule: no BUY within 5 trading days of a SELL/TRIM of the same ticker
 - Pre-commit trim levels at BUY entry — mechanical, not reactive. Legacy
@@ -194,6 +213,14 @@ before execution — prompt rules that were being violated are now mechanical:
 - **20% position cap**: BUY amounts are reduced to land at the cap, or blocked
   if the position is already over it (or the reduced order would be under
   £25). Multiple BUYs of one ticker in a run count cumulatively.
+- **Played-out bank injection** (added Aug 2026): a played-out position owing
+  a bank (no trim since declaration or in 12 weeks) gets a 33% TRIM inserted
+  at the FRONT of the rec list — the only guard that creates a trade rather
+  than blocking one. Skipped when Claude's own recs already SELL/TRIM the
+  ticker; falls back to an advisory alert when the position has no live price
+  or the trim would be under £25.
+- **SET_TRIMS tighten-only** (added Aug 2026): blocks any SET_TRIMS that
+  raises or removes the next un-hit trim trigger.
 - **60% theme cap** (added July 2026 after AI exposure hit 81% in June): BUYs
   whose `theme` label would push that theme above 60% are reduced or blocked.
   Exposure freed by same-run SELL/TRIM recs of the same theme is credited
@@ -258,7 +285,7 @@ context and never reached the weekly email. The prompt also now requires that a
 played-out position's next trim level be within ~15% of TODAY's price, tightened
 via SET_TRIMS alongside the SET_DRIVER if it isn't.
 
-Test suite: `test_trading_agent.py` (120 tests, no network). Run it after any
+Test suite: `test_trading_agent.py` (141 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the

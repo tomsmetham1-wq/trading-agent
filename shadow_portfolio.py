@@ -1045,7 +1045,60 @@ def _weeks_since(iso_date: str | None) -> Optional[int]:
     return max((date.today() - then).days, 0) // 7
 
 
-def _format_forward_driver(pos: dict) -> str:
+# A played-out position must bank a trim at declaration and then at least
+# once every this-many weeks — a forward driver carries the un-banked
+# remainder of a realized winner, never the whole position indefinitely.
+PLAYED_OUT_REBANK_WEEKS = 12
+
+
+def played_out_declared_date(pos: dict) -> Optional[str]:
+    """
+    ISO date a position's thesis was declared played out, or None.
+
+    The declaration is the FIRST forward-driver entry — forward_driver_set
+    moves every time the driver is replaced, so it can't anchor "since
+    declaration" checks.
+    """
+    if not pos.get("thesis_played_out"):
+        return None
+    history = pos.get("forward_driver_history") or []
+    if history and history[0].get("date"):
+        return history[0]["date"]
+    return pos.get("forward_driver_set")
+
+
+def last_bank_since(ledger: dict, ticker: str, since: str) -> Optional[str]:
+    """
+    ISO date of the most recent TRIM or SELL of ticker on/after `since`,
+    or None if no gain has been banked in that window.
+    """
+    latest = None
+    for t in ledger.get("trades", []):
+        if (t.get("ticker") == ticker
+                and t.get("action") in ("SELL", "TRIM")
+                and (t.get("date") or "") >= since):
+            if latest is None or t["date"] > latest:
+                latest = t["date"]
+    return latest
+
+
+def played_out_bank_due(ledger: dict, ticker: str, pos: dict) -> bool:
+    """
+    True when a played-out position owes a mechanical bank: no TRIM/SELL since
+    the played-out declaration, or the most recent one is at least
+    PLAYED_OUT_REBANK_WEEKS old.
+    """
+    declared = played_out_declared_date(pos)
+    if not declared:
+        return False
+    last_bank = last_bank_since(ledger, ticker, declared)
+    if last_bank is None:
+        return True
+    weeks = _weeks_since(last_bank)
+    return weeks is not None and weeks >= PLAYED_OUT_REBANK_WEEKS
+
+
+def _format_forward_driver(pos: dict, bank_due: bool = False) -> str:
     """
     Render the played-out / forward-driver block for one position in the thesis
     accountability section.
@@ -1098,6 +1151,16 @@ def _format_forward_driver(pos: dict) -> str:
         "\n          SET_DRIVER action so the replacement is on record."
         "\n      (c) TRIM or SELL and state where the freed capital goes."
     )
+    if bank_due:
+        block += (
+            "\n    MECHANICAL BANK DUE: no gain has been banked on this position"
+            "\n    since declaration (or in the last 12 weeks). Options (a) and (b)"
+            "\n    keep the hold but do NOT waive the bank — unless your"
+            "\n    recommendations include a TRIM or SELL for this ticker, the"
+            "\n    system will automatically add a 33% TRIM this run. Recommend"
+            "\n    your own trim (with sizing and destination for the proceeds)"
+            "\n    rather than letting the mechanical default decide."
+        )
     return block
 
 
@@ -1138,7 +1201,8 @@ def build_thesis_review(ledger: dict, current_val: dict) -> str:
                 + (f", theme: {theme}" if theme else "")
                 + f")\n    Entry thesis: {thesis}"
             )
-            entry += _format_forward_driver(pos)
+            entry += _format_forward_driver(
+                pos, bank_due=played_out_bank_due(ledger, ticker, pos))
             trims = pos.get("pre_commit_trims")
             if trims:
                 entry += (

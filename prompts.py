@@ -52,6 +52,16 @@ investor who runs an experimental portfolio on Trading 212.
   be defended with fresh evidence, replaced, or the position trimmed. A driver
   already on record is shown in the thesis accountability section with its age
   — treat re-confirming a stale one without new evidence as failing the test.
+- Declaring a thesis played out BANKS PART OF THE WIN — this is mechanical and
+  not optional. A forward driver carries at most the remainder of a realized
+  winner, never the whole position: when you mark a position played out, include
+  a TRIM of at least 1/3 in the same run, and while it stays played out a trim
+  must land at least once every 12 weeks (hitting a pre-committed level counts).
+  If your recommendations don't include one when it's due, the system
+  automatically adds a 33% TRIM — so recommend your own trim with proper sizing
+  and a destination for the proceeds rather than letting the default decide.
+  Words alone ("the driver is still live, evidenced by...") never satisfy this
+  rule; only a trim does.
 - Trim levels on a played-out position must be REACHABLE. Pre-committed trim
   levels are expressed as gains from ENTRY, so on a large winner they can sit
   far above today's price and never bite. Whenever you declare a thesis played
@@ -61,6 +71,10 @@ investor who runs an experimental portfolio on Trading 212.
   on hope. (Worked example: a position at +97% from entry with its next trim at
   +130% from entry needs another ~16% rally to trigger — too far. A level near
   +115% from entry sits ~9% above today's price and would qualify.)
+  Trim levels may only be TIGHTENED (lowered), never raised: a SET_TRIMS that
+  raises or removes the next un-hit level is blocked in code. An unreachable
+  level is information — it means the position is extended, which is an
+  argument FOR trimming, not for moving the line.
 - Theme concentration cap: no more than 60% of total portfolio value in any single
   macro theme. A "theme" is any group of holdings whose returns would strongly correlate
   under the same macro stress scenario — e.g. an AI spending downturn would hit
@@ -259,7 +273,10 @@ Note: the flip-flop rule, the 20% position cap, and the 60% theme cap are also
 enforced mechanically in code — a BUY violating them will be blocked or
 reduced, so don't propose one expecting it to slip through. Pre-committed trim
 levels are checked in code too: if a level is hit and you don't act, the
-omission is flagged in the report.
+omission is flagged in the report. The played-out bank rule is enforced in
+code as well: a played-out position with no trim banked since declaration (or
+in the last 12 weeks) gets an automatic 33% TRIM added to your
+recommendations, and a SET_TRIMS that loosens existing levels is blocked.
 
 IMPORTANT: You MUST end your response with the JSON block, even if you need to
 shorten the prose sections. The JSON block is required for trade execution.

@@ -648,6 +648,13 @@ class TestSetDriver:
                 ],
             }
         }
+        # A recent bank keeps the mandatory played-out bank satisfied, so these
+        # tests exercise the advisory alerts, not the forced-trim injection
+        # (which has its own test class).
+        ledger["trades"].append({
+            "date": date.today().isoformat(), "action": "TRIM",
+            "ticker": "DELL", "shares": 1.0, "amount_gbp": 300.0,
+        })
         return ledger
 
     def _pre_val(self, pnl=97.6):
@@ -724,6 +731,235 @@ class TestSetDriver:
         assert sp._weeks_since(None) is None
         assert sp._weeks_since("not-a-date") is None
         assert sp._weeks_since(date.today().isoformat()) == 0
+
+
+class TestPlayedOutBankGuard:
+    """
+    A played-out declaration costs 1/3 of the position, enforced in code: if
+    no trim has banked gains since the declaration (or in the last 12 weeks),
+    a 33% TRIM is injected into the rec list. Added Aug 2026 after DELL was
+    declared played out at +97.6% and then simply held week after week on a
+    re-confirmed forward driver — words satisfied the accountability loop,
+    money never moved.
+    """
+
+    def _ledger(self, declared=None, banked=None):
+        declared = declared or (date.today() - timedelta(weeks=1)).isoformat()
+        ledger = make_ledger()
+        ledger["positions"] = {
+            "DELL": {
+                "shares": 3.0, "avg_cost_gbp": 160.0, "first_bought": "2026-04-26",
+                "thesis": "cheap at 17x",
+                "pre_commit_trims": "Trim 1/3 at +110%, another 1/3 at +150%.",
+                "thesis_played_out": True,
+                "forward_driver": "backlog", "forward_driver_set": declared,
+                "forward_driver_history": [{"date": declared, "driver": "backlog"}],
+            }
+        }
+        if banked:
+            ledger["trades"].append({
+                "date": banked, "action": "TRIM",
+                "ticker": "DELL", "shares": 1.0, "amount_gbp": 300.0,
+            })
+        return ledger
+
+    def _pre_val(self, value=960.0):
+        return {"total_value_gbp": 6000.0, "cash_gbp": 400.0,
+                "positions": {"DELL": {"current_value_gbp": value,
+                                       "pnl_pct": 97.6}}}
+
+    def _forced(self, allowed):
+        return [r for r in allowed if r.get("guard_generated")]
+
+    def test_injects_forced_trim_when_no_bank_since_declaration(self):
+        allowed, events = ta.enforce_strategy_guards(
+            [], self._ledger(), self._pre_val())
+        forced = self._forced(allowed)
+        assert len(forced) == 1
+        assert forced[0]["action"] == "TRIM"
+        assert forced[0]["yfinance_ticker"] == "DELL"
+        assert forced[0]["trim_pct"] == ta.PLAYED_OUT_BANK_TRIM_PCT
+        assert any(e.startswith("FORCED TRIM DELL") for e in events)
+
+    def test_injected_trim_comes_before_other_recs(self):
+        buy = gbp_buy_rec("MSFT", 300, theme="software")
+        allowed, _ = ta.enforce_strategy_guards(
+            [buy], self._ledger(), self._pre_val())
+        assert allowed[0].get("guard_generated")
+        assert allowed[-1] == buy
+
+    def test_no_injection_when_claude_trims_itself(self):
+        recs = [{"action": "TRIM", "yfinance_ticker": "DELL", "trim_pct": 25}]
+        allowed, events = ta.enforce_strategy_guards(
+            recs, self._ledger(), self._pre_val())
+        assert not self._forced(allowed)
+        assert not any("FORCED TRIM" in e for e in events)
+
+    def test_no_injection_when_claude_sells(self):
+        recs = [{"action": "SELL", "yfinance_ticker": "DELL"}]
+        allowed, _ = ta.enforce_strategy_guards(
+            recs, self._ledger(), self._pre_val())
+        assert not self._forced(allowed)
+
+    def test_no_injection_when_recently_banked(self):
+        ledger = self._ledger(banked=date.today().isoformat())
+        allowed, events = ta.enforce_strategy_guards([], ledger, self._pre_val())
+        assert not self._forced(allowed)
+        # the advisory note that the hold rests on a driver still fires
+        assert any("held on a forward driver" in e for e in events)
+
+    def test_reinjects_when_last_bank_is_stale(self):
+        declared = (date.today() - timedelta(weeks=20)).isoformat()
+        banked = (date.today() - timedelta(weeks=13)).isoformat()
+        ledger = self._ledger(declared=declared, banked=banked)
+        allowed, _ = ta.enforce_strategy_guards([], ledger, self._pre_val())
+        assert len(self._forced(allowed)) == 1
+
+    def test_no_reinjection_inside_rebank_window(self):
+        declared = (date.today() - timedelta(weeks=20)).isoformat()
+        banked = (date.today() - timedelta(weeks=5)).isoformat()
+        ledger = self._ledger(declared=declared, banked=banked)
+        allowed, _ = ta.enforce_strategy_guards([], ledger, self._pre_val())
+        assert not self._forced(allowed)
+
+    def test_same_run_set_driver_without_trim_triggers_bank(self):
+        ledger = self._ledger()
+        del ledger["positions"]["DELL"]["thesis_played_out"]
+        recs = [{"action": "SET_DRIVER", "yfinance_ticker": "DELL",
+                 "forward_driver": "new driver"}]
+        allowed, events = ta.enforce_strategy_guards(recs, ledger, self._pre_val())
+        forced = self._forced(allowed)
+        assert len(forced) == 1
+        assert any("declared this run" in e for e in events)
+        # the SET_DRIVER itself still goes through
+        assert any(r.get("action") == "SET_DRIVER" for r in allowed)
+
+    def test_same_run_set_driver_with_own_trim_no_injection(self):
+        ledger = self._ledger()
+        del ledger["positions"]["DELL"]["thesis_played_out"]
+        recs = [
+            {"action": "SET_DRIVER", "yfinance_ticker": "DELL",
+             "forward_driver": "new driver"},
+            {"action": "TRIM", "yfinance_ticker": "DELL", "trim_pct": 33},
+        ]
+        allowed, _ = ta.enforce_strategy_guards(recs, ledger, self._pre_val())
+        assert not self._forced(allowed)
+
+    def test_dust_position_alerts_instead_of_trimming(self):
+        allowed, events = ta.enforce_strategy_guards(
+            [], self._ledger(), self._pre_val(value=60.0))
+        assert not self._forced(allowed)
+        assert any("too small to force" in e for e in events)
+
+    def test_missing_price_alerts_instead_of_trimming(self):
+        pre_val = {"total_value_gbp": 6000.0, "cash_gbp": 400.0,
+                   "positions": {"DELL": {}}}
+        allowed, events = ta.enforce_strategy_guards([], self._ledger(), pre_val)
+        assert not self._forced(allowed)
+        assert any("no live price" in e for e in events)
+
+    def test_non_played_out_position_untouched(self):
+        ledger = self._ledger()
+        del ledger["positions"]["DELL"]["thesis_played_out"]
+        allowed, events = ta.enforce_strategy_guards([], ledger, self._pre_val())
+        assert allowed == []
+        assert not any("FORCED TRIM" in e for e in events)
+
+    def test_thesis_review_warns_when_bank_due(self):
+        review = sp.build_thesis_review(
+            self._ledger(), {"positions": {"DELL": {"pnl_pct": 97.6}}})
+        assert "MECHANICAL BANK DUE" in review
+
+    def test_thesis_review_silent_when_recently_banked(self):
+        review = sp.build_thesis_review(
+            self._ledger(banked=date.today().isoformat()),
+            {"positions": {"DELL": {"pnl_pct": 97.6}}})
+        assert "MECHANICAL BANK DUE" not in review
+
+
+class TestSetTrimsTightenGuard:
+    """
+    Trim levels may only be tightened, never loosened — the July 2026 deep
+    review flagged DELL's levels being reset twice in eight days as moving
+    the goalposts. A SET_TRIMS that raises (or removes) the next un-hit
+    trigger is blocked and the existing levels kept.
+    """
+
+    def _ledger(self, trims="Trim 1/3 at +130%, another 1/3 at +175%."):
+        ledger = make_ledger()
+        ledger["positions"] = {
+            "DELL": {
+                "shares": 3.0, "avg_cost_gbp": 160.0, "first_bought": "2026-04-26",
+                "thesis": "cheap at 17x", "pre_commit_trims": trims,
+            }
+        }
+        return ledger
+
+    def _pre_val(self, pnl=97.6):
+        positions = {"DELL": {"current_value_gbp": 960.0}}
+        if pnl is not None:
+            positions["DELL"]["pnl_pct"] = pnl
+        return {"total_value_gbp": 6000.0, "cash_gbp": 400.0,
+                "positions": positions}
+
+    def _set_trims(self, text):
+        return {"action": "SET_TRIMS", "yfinance_ticker": "DELL",
+                "pre_commit_trims": text}
+
+    def test_blocks_raising_next_unhit_level(self):
+        rec = self._set_trims("Trim 1/3 at +150%, another 1/3 at +200%.")
+        allowed, events = ta.enforce_strategy_guards(
+            [rec], self._ledger(), self._pre_val())
+        assert rec not in allowed
+        assert any("BLOCKED SET_TRIMS DELL" in e for e in events)
+
+    def test_allows_tightening(self):
+        rec = self._set_trims("Trim 1/3 at +110%, another 1/3 at +150%.")
+        allowed, events = ta.enforce_strategy_guards(
+            [rec], self._ledger(), self._pre_val())
+        assert rec in allowed
+        assert not any("BLOCKED SET_TRIMS" in e for e in events)
+
+    def test_blocks_removing_every_unhit_level(self):
+        # all proposed levels sit below current P&L — nothing left to bite
+        rec = self._set_trims("Trim 1/3 at +30%.")
+        allowed, events = ta.enforce_strategy_guards(
+            [rec], self._ledger(), self._pre_val())
+        assert rec not in allowed
+        assert any("removes every un-hit level" in e for e in events)
+
+    def test_allows_backfill_when_no_existing_levels(self):
+        rec = self._set_trims("Trim 1/3 at +150%.")
+        allowed, _ = ta.enforce_strategy_guards(
+            [rec], self._ledger(trims=""), self._pre_val())
+        assert rec in allowed
+
+    def test_equal_level_allowed(self):
+        rec = self._set_trims("Trim 1/3 at +130%, another 1/3 at +175%.")
+        allowed, _ = ta.enforce_strategy_guards(
+            [rec], self._ledger(), self._pre_val())
+        assert rec in allowed
+
+    def test_unknown_pnl_compares_raw_first_triggers(self):
+        raise_rec = self._set_trims("Trim 1/3 at +140%.")
+        allowed, events = ta.enforce_strategy_guards(
+            [raise_rec], self._ledger(), self._pre_val(pnl=None))
+        assert raise_rec not in allowed
+        assert any("BLOCKED SET_TRIMS" in e for e in events)
+
+        lower_rec = self._set_trims("Trim 1/3 at +120%.")
+        allowed, _ = ta.enforce_strategy_guards(
+            [lower_rec], self._ledger(), self._pre_val(pnl=None))
+        assert lower_rec in allowed
+
+    def test_hit_levels_are_ignored_in_comparison(self):
+        # +130% already hit at +140% P&L: only +175% is pending, so a new set
+        # with first pending level +160% is a tightening even though its raw
+        # first trigger (+160%) is above the old raw first (+130%).
+        rec = self._set_trims("Trim 1/3 at +160%.")
+        allowed, _ = ta.enforce_strategy_guards(
+            [rec], self._ledger(), self._pre_val(pnl=140.0))
+        assert rec in allowed
 
 
 # =============================================================================
