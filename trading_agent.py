@@ -462,6 +462,13 @@ THEME_HARD_CAP = 0.60         # max 60% of total portfolio value per macro theme
 MIN_ORDER_GBP = 25.0          # a cap-reduced buy below this is blocked, not placed
 CASH_FLOOR_ALERT = 0.04       # warn when planned buys leave cash below ~5% reserve
 
+# Cash deployment bands, as fractions of total portfolio value. The deployable
+# slice is cash minus the reserve floor; when that slice can't fund a new
+# position at the minimum, only a dead-zone top-up can put it to work.
+CASH_RESERVE_FLOOR   = 0.05
+MIN_NEW_POSITION_PCT = 0.08
+MIN_TOPUP_PCT        = 0.03
+
 # A position whose thesis has played out should have a mechanical trim within
 # this % move of TODAY's price. Trim levels are stored as gains from entry, so
 # on a big winner they can sit far above the current price and never bite.
@@ -832,6 +839,10 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[li
       - a played-out position's next trim level is more than 15% above
         today's price, so nothing mechanical will bank the realized gain;
       - the planned buys would leave cash below the 5% reserve floor;
+      - the deployable slice (cash above the 5% floor) is too small to open a
+        position at the 8% minimum but large enough for a dead-zone top-up,
+        and no BUY was proposed — the trap that idled cash for eight weeks
+        from June 2026;
       - a theme is STILL over the 60% cap after this run's recs are applied
         (the BUY-side theme guard only stops new breaches — it has nothing
         to act on when a theme is already overweight and no new buy is
@@ -1031,6 +1042,23 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[li
                 f"ALERT: planned buys would leave estimated cash at £{cash_after:.2f} "
                 f"({cash_after / total * 100:.1f}% of portfolio) - below the 5% reserve floor"
             )
+
+        # Idle-cash trap: the deployable slice is too small to open a position
+        # at the 8% minimum but big enough for a dead-zone top-up. Nothing in
+        # the rules used to fire here (cash above the old 5-8% dead-zone band,
+        # below what a new position needs) and the agent deployed nothing for
+        # eight weeks - 17 Aug 2026 was cash 12.7%, slice £491 vs a £507
+        # minimum. The prompt rule now covers it, so this alert means a
+        # fundable top-up was available and wasn't taken.
+        if planned_buys == 0:
+            deployable = cash_after - CASH_RESERVE_FLOOR * total
+            if MIN_TOPUP_PCT * total <= deployable < MIN_NEW_POSITION_PCT * total:
+                guard_events.append(
+                    f"ALERT: £{deployable:.2f} deployable above the 5% reserve "
+                    f"({deployable / total * 100:.1f}% of portfolio) - too little "
+                    f"for a new position at the 8% minimum but enough for a "
+                    f"dead-zone top-up, and no BUY was proposed"
+                )
 
     return allowed, guard_events
 

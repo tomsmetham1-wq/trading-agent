@@ -139,12 +139,18 @@ All sizing rules are percentage-based so they scale as the portfolio grows.
   When 20% is hit, trim to 15% — not to 19.9%.
 - Cash reserve 5–15% of total portfolio value — uninvested cash is a deliberate choice
 - Deploy trigger: cash > 15% → must buy
-- Each buy: 8–20% of total portfolio value. Dead-zone exception (July 2026):
-  cash between the 5% floor and the 8% minimum can't fund a new position and
-  never triggers the >15% deploy rule, so it used to idle forever. The agent
-  may now deploy it as a 3–8% top-up of ONE existing holding (position/theme
-  caps still apply, a live forward driver must be stated, and new positions
-  keep the 8% minimum)
+- Each buy: 8–20% of total portfolio value. Dead-zone exception (July 2026,
+  widened Aug 2026): the trigger is the DEPLOYABLE SLICE (cash minus the 5%
+  floor), not headline cash %. Whenever that slice is too small to fund a new
+  position at the 8% minimum, the agent may deploy it as a 3–8% top-up of ONE
+  existing holding (position/theme caps still apply, a live forward driver
+  must be stated, and new positions keep the 8% minimum).
+  Why it was widened: the original "cash between 5% and 8%" wording left a
+  trap. On 17 Aug 2026 cash was 12.7% (£808) — above the dead-zone band so no
+  top-up was permitted, below 15% so no forced deploy, and the slice (£491)
+  couldn't fund the £507 minimum new position. Nothing fired; the agent
+  deployed nothing for eight weeks (last new position 22 June). Keying off the
+  slice strictly generalises the old rule and closes the gap.
 - Do NOT exit a position solely because it shrank below 8% — only exit if thesis broken
 - Thesis realized ≠ thesis intact (added July 2026): when a position's ORIGINAL
   thesis has substantially played out (mispricing closed, gain captured), HOLD is
@@ -238,7 +244,10 @@ before execution — prompt rules that were being violated are now mechanical:
   (`PLAYED_OUT_TRIM_MAX_UPSIDE` — trim levels are entry-relative, so on a big
   winner they drift out of reach: DELL was played out at +97.6% with its first
   trim at +130% from entry, ~16% away); planned buys would leave cash below the
-  5% reserve floor; a theme is STILL over the 60% cap after this run's recs are
+  5% reserve floor; the deployable slice can't fund a new position at the 8%
+  minimum but is big enough for a dead-zone top-up and no BUY was proposed
+  (`CASH_RESERVE_FLOOR` / `MIN_NEW_POSITION_PCT` / `MIN_TOPUP_PCT` — the
+  idle-cash trap, see the dead-zone rule above); a theme is STILL over the 60% cap after this run's recs are
   applied (added after the July 2026 Opus deep review flagged that AI infra
   was still ~58-63% weeks after the BUY-side cap existed, because nothing
   forces a correction when Claude doesn't propose a new buy in that theme —
@@ -348,6 +357,17 @@ Robustness fixes from the same review (do not regress):
 - **Monthly (Opus)**: strategic critique of the agent itself — not picking new
   trades, but reviewing whether the strategy/reasoning is sound. Runs on first
   Monday of each month, or with `--deep-review` flag.
+
+Deep review section 7 (added Aug 2026): sections 5 (recommendations) and 6
+(kill criteria) were independent, and 5 comes first — so the Aug 2026 review
+produced seven improvements and then a "shut it down" verdict with nothing
+reconciling them. Section 7 now fires only when a criterion has triggered and
+forces the review to say which recommendations would actually address the
+finding (or admit none would), what must be true by a named date for
+continuing to have been right, and — critically — whether the failure is one
+of IDEA GENERATION or of DEPLOYMENT/CONSTRAINTS. The watchlist scores are
+passed into the deep review as the evidence for that last call; the raw
+observation series is stripped from the ledger copy to save tokens.
 
 ## Current portfolio state (as of 2026-06-01)
 

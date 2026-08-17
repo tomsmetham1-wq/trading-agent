@@ -101,10 +101,19 @@ investor who runs an experimental portfolio on Trading 212.
   to bring cash below 15% of total portfolio value.
 - Each individual BUY should be 8–20% of total portfolio value. No smaller, no
   larger — with ONE exception, dead-zone top-ups, below.
-- Dead-zone top-ups: cash between the 5% reserve floor and the 8% minimum buy
-  size cannot fund a new position and would otherwise sit idle indefinitely.
-  When cash is in that band, you MAY deploy the portion above the 5% floor by
-  topping up ONE existing holding with a BUY of 3–8% of total portfolio value.
+- Dead-zone top-ups: what matters is the DEPLOYABLE SLICE — cash minus the 5%
+  reserve floor — not the headline cash percentage. Whenever that slice is too
+  small to fund a new position at the 8% minimum, the cash cannot be deployed
+  any other way and would otherwise sit idle indefinitely. In that situation
+  you MAY deploy the slice by topping up ONE existing holding with a BUY of
+  3–8% of total portfolio value.
+  Worked example (17 Aug 2026, the case this rule was widened to cover): cash
+  £808 on a £6,344 portfolio is 12.7% — comfortably above the 5–15% band's
+  floor, so no forced deployment — but the deployable slice is only £491 (7.7%)
+  against a £507 minimum new position. A new position is unfundable without
+  breaching the floor, so a top-up is the ONLY way to deploy, and the run
+  before this rule was widened deployed nothing at all. If the slice is under
+  the 3% top-up minimum it is genuinely too small to use — hold it and say so.
   A top-up must respect the 20% position cap and the 60% theme cap, and
   requires a live forward driver for that holding (state it in one sentence) —
   choose the best forward risk/reward among current holdings; do NOT
@@ -391,6 +400,32 @@ State whether each criterion below has been triggered, is at risk, or is clear:
   portfolio underperforming VUSA.** If that happens, the agent is a lottery-ticket
   buyer, not a stock-picker. Shut it down.
 
+**7. If any criterion has triggered — the override case**
+Sections 5 and 6 must not contradict each other. If you have concluded that a
+kill criterion has triggered, do NOT stop at "shut it down" and leave a list of
+improvements hanging above it with no relationship to that verdict. The operator
+may reasonably choose to continue; your job is to make that an informed choice
+rather than a hopeful one. State explicitly:
+
+  (a) Which of your section 5 recommendations, if any, would actually address
+      the finding that triggered the criterion — and which are unrelated
+      housekeeping that would not change the outcome. Be honest when the answer
+      is "none of them" — a structural problem the strategy can't fix is the
+      most important thing you can report.
+  (b) What specifically would have to be TRUE by a stated future date for
+      continuing to have been the right call. Name the metric, the threshold
+      and the date, so the next review can check it rather than re-litigate.
+  (c) Whether the evidence supports the failure being one of IDEA GENERATION
+      (the picks themselves are not good) or of DEPLOYMENT/CONSTRAINTS (the
+      picks may be fine but capital never reached them, e.g. cash trapped by
+      sizing rules, caps forcing sales, ideas flagged but never bought). These
+      demand opposite responses, so do not leave it ambiguous. The watchlist
+      tracking section records names that were flagged but not bought, with
+      their performance since — use it as evidence where it exists, and say so
+      plainly when there is not yet enough history to tell.
+
+If no criterion has triggered, state that in one line and skip this section.
+
 Be blunt. The user is paying for this review specifically because they need
 an outside perspective harder than the weekly voice. Don't hedge.
 """
@@ -409,6 +444,13 @@ figures for section 1 rather than re-deriving them) ===
 {realized_pnl}
 
 Top contributor by unrealised P&L: {top_contributor}
+
+=== Watchlist tracking — ideas flagged but NOT bought ===
+Scored against the benchmark over each name's own window. This is the
+counterfactual for section 7(c): if these names have broadly beaten the held
+book, the constraint is deployment, not idea generation. Treat fewer than ~4
+weeks of history per name as too little to conclude anything.
+{watchlist_review}
 
 Today: {today}
 """
@@ -559,8 +601,12 @@ def build_deep_review_prompt(ledger: dict, valuation: dict) -> tuple[str, str]:
     # Strip sync noise from trades and drop weekly_snapshots from the ledger
     # copy — snapshots are passed separately below, so including them here
     # would just duplicate tokens.
+    # Watchlist observations are a long price series per name — the scored
+    # summary below carries the signal, so drop the raw dict from the ledger
+    # copy rather than spending tokens on every weekly price point.
     filtered_ledger = {
-        k: v for k, v in ledger.items() if k != "weekly_snapshots"
+        k: v for k, v in ledger.items()
+        if k not in ("weekly_snapshots", "watchlist")
     }
     filtered_ledger["trades"] = [
         t for t in ledger.get("trades", [])
@@ -592,6 +638,8 @@ def build_deep_review_prompt(ledger: dict, valuation: dict) -> tuple[str, str]:
         valuation_json=json.dumps(valuation, indent=2, default=str),
         realized_pnl=json.dumps(realized_summary, indent=2, default=str),
         top_contributor=top_contributor,
+        watchlist_review=(sp.build_watchlist_review(ledger)
+                          or "(no watchlist names tracked yet)"),
         today=datetime.now().strftime("%A, %d %B %Y"),
     )
     return DEEP_REVIEW_SYSTEM, user_prompt

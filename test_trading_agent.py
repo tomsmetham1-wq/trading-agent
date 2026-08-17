@@ -368,6 +368,66 @@ class TestCashFloorAlert:
         assert not any("reserve floor" in e for e in events)
 
 
+class TestIdleCashTrapAlert:
+    """
+    The gap that idled cash from late June to late Aug 2026: cash above the
+    old 5-8% dead-zone band but with a deployable slice too small to fund a
+    new position at the 8% minimum. No rule fired, so nothing was deployed
+    for eight weeks. Reproduces the real 17 Aug numbers.
+    """
+    LEDGER = {"trades": [], "positions": {}}
+
+    def _pre_val(self, cash, total=6344.43, positions=None):
+        return {"total_value_gbp": total, "cash_gbp": cash,
+                "positions": positions or {}}
+
+    def test_alerts_on_the_17_aug_trap(self):
+        # cash 12.7%; slice = 808.35 - 317.22 = 491.13 vs a 507.55 minimum
+        _, events = ta.enforce_strategy_guards([], self.LEDGER,
+                                                self._pre_val(808.35))
+        assert any("dead-zone top-up" in e for e in events)
+
+    def test_no_alert_when_a_buy_is_proposed(self):
+        _, events = ta.enforce_strategy_guards(
+            [{"action": "BUY", "yfinance_ticker": "NEW", "amount_gbp": 400}],
+            self.LEDGER, self._pre_val(808.35))
+        assert not any("dead-zone top-up" in e for e in events)
+
+    def test_no_alert_when_slice_funds_a_new_position(self):
+        # cash 14% -> slice 9% > the 8% minimum, so a new position is fundable
+        _, events = ta.enforce_strategy_guards([], self.LEDGER,
+                                                self._pre_val(888.0))
+        assert not any("dead-zone top-up" in e for e in events)
+
+    def test_no_alert_when_slice_is_below_the_topup_minimum(self):
+        # 3 Aug 2026: slice was 2.6%, genuinely too small to use
+        _, events = ta.enforce_strategy_guards([], self.LEDGER,
+                                                self._pre_val(466.14, total=6094.47))
+        assert not any("dead-zone top-up" in e for e in events)
+
+    def test_sale_proceeds_count_toward_the_slice(self):
+        # a SELL this run lifts cash out of the trap and into fundable range
+        pre_val = self._pre_val(
+            300.0, positions={"OLD": {"current_value_gbp": 600.0}})
+        _, events = ta.enforce_strategy_guards(
+            [{"action": "SELL", "yfinance_ticker": "OLD"}],
+            {"trades": [], "positions": {"OLD": {}}}, pre_val)
+        assert not any("dead-zone top-up" in e for e in events)
+
+    def test_no_alert_when_cash_unknown(self):
+        _, events = ta.enforce_strategy_guards(
+            [], self.LEDGER, {"total_value_gbp": 6344.43, "positions": {}})
+        assert not any("dead-zone top-up" in e for e in events)
+
+    def test_alert_is_advisory_never_blocking(self):
+        recs = [{"action": "SET_TRIMS", "yfinance_ticker": "X",
+                 "pre_commit_trims": "Trim 1/3 at +40%."}]
+        allowed, events = ta.enforce_strategy_guards(
+            recs, self.LEDGER, self._pre_val(808.35))
+        assert allowed == recs
+        assert any("dead-zone top-up" in e for e in events)
+
+
 class TestExistingThemeOverCapAlert:
     def _ledger(self):
         return {"trades": [], "positions": {
@@ -1613,6 +1673,59 @@ class TestPrompts:
         _, user = prompts.build_deep_review_prompt(ledger, self._fake_val(ledger))
         ledger_section = user.split("=== Weekly snapshots")[0]
         assert "weekly_snapshots" not in ledger_section
+
+    def test_weekly_prompt_includes_watchlist_review(self):
+        ledger = self._themed_ledger()
+        sp.record_watchlist(ledger, [{"ticker": "ZTS", "yfinance_ticker": "ZTS",
+                                      "thesis_oneline": "Cheap animal health."}],
+                            "2026-08-17", price_fn=lambda t: 100.0,
+                            benchmark_return_pct=6.0)
+        _, user = prompts.build_prompt(
+            self._fake_val(ledger), ledger, {"free": 550.0, "total": 6000.0}, [])
+        assert "Watchlist accountability" in user
+        assert "ZTS" in user
+
+    def test_weekly_prompt_omits_watchlist_when_empty(self):
+        ledger = self._themed_ledger()
+        _, user = prompts.build_prompt(
+            self._fake_val(ledger), ledger, {"free": 550.0, "total": 6000.0}, [])
+        assert "Watchlist accountability" not in user
+
+    def test_deep_review_demands_kill_verdict_reconciliation(self):
+        system, _ = prompts.build_deep_review_prompt(
+            self._themed_ledger(), self._fake_val(self._themed_ledger()))
+        assert "must not contradict" in system
+        assert "IDEA GENERATION" in system
+        assert "DEPLOYMENT/CONSTRAINTS" in system
+
+    def test_deep_review_carries_watchlist_evidence(self):
+        ledger = self._themed_ledger()
+        sp.record_watchlist(ledger, [{"ticker": "ZTS", "yfinance_ticker": "ZTS",
+                                      "thesis_oneline": "Cheap animal health."}],
+                            "2026-08-17", price_fn=lambda t: 100.0,
+                            benchmark_return_pct=6.0)
+        _, user = prompts.build_deep_review_prompt(ledger, self._fake_val(ledger))
+        assert "ideas flagged but NOT bought" in user
+        assert "ZTS" in user
+
+    def test_deep_review_handles_empty_watchlist(self):
+        ledger = self._themed_ledger()
+        _, user = prompts.build_deep_review_prompt(ledger, self._fake_val(ledger))
+        assert "no watchlist names tracked yet" in user
+
+    def test_deep_review_strips_raw_watchlist_observations(self):
+        ledger = self._themed_ledger()
+        sp.record_watchlist(ledger, [{"ticker": "ZTS", "yfinance_ticker": "ZTS"}],
+                            "2026-08-17", price_fn=lambda t: 100.0)
+        _, user = prompts.build_deep_review_prompt(ledger, self._fake_val(ledger))
+        ledger_section = user.split("=== Weekly snapshots")[0]
+        assert "observations" not in ledger_section
+
+    def test_dead_zone_rule_keys_off_the_deployable_slice(self):
+        system, _ = prompts.build_prompt(
+            self._fake_val(self._themed_ledger()), self._themed_ledger(),
+            {"free": 550.0}, [])
+        assert "DEPLOYABLE SLICE" in system
 
 
 # =============================================================================
