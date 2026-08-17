@@ -53,6 +53,7 @@ def _default_ledger() -> dict:
         "positions": {},       # {ticker: {shares, avg_cost_gbp, first_bought, thesis}}
         "trades": [],          # append-only trade log
         "weekly_snapshots": [], # weekly valuation snapshots for performance tracking
+        "watchlist": {},       # {ticker: {first_seen, thesis, observations}} — recorded, never gated
     }
 
 
@@ -1162,6 +1163,263 @@ def _format_forward_driver(pos: dict, bank_due: bool = False) -> str:
             "\n    rather than letting the mechanical default decide."
         )
     return block
+
+
+# =============================================================================
+# Watchlist recording — observational only, never gates a trade
+# =============================================================================
+
+# How long a name dropped from the active watchlist keeps being priced. Long
+# enough to score an idea over the strategy's weeks-to-months horizon, short
+# enough that the weekly price fetch doesn't grow without bound.
+WATCHLIST_TRACK_WEEKS = 26
+
+
+def _watchlist_bought_date(ledger: dict, ticker: str, since: str) -> Optional[str]:
+    """ISO date of the first BUY of ticker on/after `since`, or None."""
+    for t in ledger.get("trades", []):
+        if (t.get("ticker") == ticker and t.get("action") == "BUY"
+                and (t.get("date") or "") >= (since or "")):
+            return t["date"]
+    return None
+
+
+def record_watchlist(ledger: dict, entries: list, run_date: str,
+                     price_fn=None,
+                     benchmark_return_pct: Optional[float] = None) -> list[str]:
+    """
+    Record this run's watchlist names and re-price every name already tracked.
+
+    Purely observational — nothing here blocks, gates or creates a trade. It
+    exists to answer a question the agent has no evidence for: are its
+    non-held ideas any good? Watchlist names used to live only in the prose
+    report and evaporate the next run (ZTS/STZ/ACN one week, NFLX/AZN.L/WMT
+    the next), so there was never a record to score them against.
+
+    Names dropped from the active list keep being priced for
+    WATCHLIST_TRACK_WEEKS — an idea that was abandoned and then ran is
+    precisely the data this is here to capture.
+
+    benchmark_return_pct is the portfolio-inception-relative benchmark return
+    at this run, stored per observation so a name's performance can later be
+    measured over its OWN window rather than since inception.
+
+    Returns human-readable event strings for the run log.
+    """
+    price_fn = price_fn or fetch_price_gbp
+    watchlist = ledger.setdefault("watchlist", {})
+    events: list[str] = []
+
+    seen_now: set[str] = set()
+    for entry in (entries or []):
+        if not isinstance(entry, dict):
+            continue
+        ticker = (entry.get("yfinance_ticker") or entry.get("ticker") or "").strip()
+        if not ticker:
+            continue
+        seen_now.add(ticker)
+        rec = watchlist.get(ticker)
+        if rec is None:
+            rec = watchlist[ticker] = {
+                "first_seen":      run_date,
+                "yfinance_ticker": ticker,
+                "observations":    [],
+            }
+            events.append(f"WATCHLIST +{ticker}: now tracked")
+        rec["last_seen"] = run_date
+        rec["active"] = True
+        rec.pop("tracking_ended", None)
+        thesis = (entry.get("thesis_oneline") or entry.get("thesis") or "").strip()
+        if thesis:
+            rec["thesis"] = thesis
+        theme = (entry.get("theme") or "").strip()
+        if theme:
+            rec["theme"] = theme
+
+    for ticker, rec in watchlist.items():
+        if ticker not in seen_now and rec.get("active"):
+            rec["active"] = False
+            events.append(
+                f"WATCHLIST -{ticker}: dropped from the active list, "
+                f"still priced for {WATCHLIST_TRACK_WEEKS}w"
+            )
+        if rec.get("tracking_ended"):
+            continue
+        if not rec.get("active"):
+            weeks_cold = _weeks_since(rec.get("last_seen"))
+            if weeks_cold is not None and weeks_cold >= WATCHLIST_TRACK_WEEKS:
+                rec["tracking_ended"] = run_date
+                events.append(f"WATCHLIST {ticker}: tracking window closed")
+                continue
+
+        price = price_fn(rec.get("yfinance_ticker") or ticker)
+        if price is None:
+            continue
+        observation = {
+            "date":      run_date,
+            "price_gbp": round(price, 4),
+        }
+        if benchmark_return_pct is not None:
+            observation["benchmark_return_pct"] = round(benchmark_return_pct, 4)
+        observations = rec.setdefault("observations", [])
+        # A re-run on the same date updates in place rather than double-counting.
+        if observations and observations[-1].get("date") == run_date:
+            observations[-1] = observation
+        else:
+            observations.append(observation)
+
+    return events
+
+
+def watchlist_performance(ledger: dict) -> list[dict]:
+    """
+    Score every tracked watchlist name over its own observation window.
+
+    Each name is measured from its first priced observation to its latest, and
+    against the benchmark over that SAME window (not since portfolio
+    inception), so a name first seen last week isn't compared against six
+    months of benchmark return.
+
+    Returns a list of dicts sorted by vs-benchmark, best first. Names with
+    fewer than two priced observations are included with None returns — they
+    are being tracked but can't be scored yet.
+    """
+    scored: list[dict] = []
+    for ticker, rec in (ledger.get("watchlist") or {}).items():
+        priced = [
+            o for o in (rec.get("observations") or [])
+            if o.get("price_gbp")
+        ]
+        row = {
+            "ticker":          ticker,
+            "thesis":          rec.get("thesis", ""),
+            "theme":           rec.get("theme"),
+            "first_seen":      rec.get("first_seen"),
+            "active":          bool(rec.get("active")),
+            "tracking_ended":  rec.get("tracking_ended"),
+            "weeks_tracked":   _weeks_since(rec.get("first_seen")),
+            "bought_date":     _watchlist_bought_date(
+                ledger, ticker, rec.get("first_seen")),
+            "return_pct":       None,
+            "benchmark_pct":    None,
+            "vs_benchmark_pts": None,
+        }
+        if len(priced) >= 2:
+            first, last = priced[0], priced[-1]
+            row["return_pct"] = round(
+                (last["price_gbp"] / first["price_gbp"] - 1) * 100, 2)
+            b0 = first.get("benchmark_return_pct")
+            b1 = last.get("benchmark_return_pct")
+            if b0 is not None and b1 is not None and (100 + b0) != 0:
+                # Both are inception-relative, so the benchmark's return over
+                # THIS name's window is the ratio of the two, not their
+                # difference.
+                bench = ((100 + b1) / (100 + b0) - 1) * 100
+                row["benchmark_pct"] = round(bench, 2)
+                row["vs_benchmark_pts"] = round(row["return_pct"] - bench, 2)
+        scored.append(row)
+
+    return sorted(
+        scored,
+        key=lambda r: (r["vs_benchmark_pts"] is None, -(r["vs_benchmark_pts"] or 0)),
+    )
+
+
+def build_watchlist_review(ledger: dict) -> str:
+    """
+    Build the watchlist section for the Claude weekly prompt.
+
+    Replays every tracked name with its age, its recorded thesis and how it has
+    actually performed since first mention. This is recording only: there is no
+    obligation to buy a watchlist name, no gate on buying one that isn't
+    listed, and dropping a name costs nothing but a stated reason.
+    """
+    rows = watchlist_performance(ledger)
+    if not rows:
+        return ""
+
+    lines = [
+        "=== Watchlist accountability (RECORDING ONLY — no gate on any trade) ===",
+        "Names you have flagged previously, with what they have actually done",
+        "since. Carry forward the ones you still believe in (repeat them in this",
+        "run's watchlist array), and DROP the ones you don't by simply omitting",
+        "them — but say in one line why any name you drop is no longer of",
+        "interest. Dropped names keep being priced, so an idea abandoned just",
+        "before it ran will show up. None of this restricts what you may buy.",
+        "",
+    ]
+    for row in rows:
+        weeks = row["weeks_tracked"]
+        age = f"{weeks}w" if weeks is not None else "?"
+        state = "active" if row["active"] else "dropped"
+        if row["tracking_ended"]:
+            state = "tracking ended"
+        if row["bought_date"]:
+            state += f", BOUGHT {row['bought_date']}"
+        if row["return_pct"] is None:
+            perf = "no scoreable price history yet"
+        else:
+            perf = f"{row['return_pct']:+.1f}% since first seen"
+            if row["vs_benchmark_pts"] is not None:
+                perf += (
+                    f" (benchmark {row['benchmark_pct']:+.1f}% over the same"
+                    f" window, {row['vs_benchmark_pts']:+.1f} pts)"
+                )
+        lines.append(
+            f"  {row['ticker']} (first seen {row['first_seen']}, {age} ago, "
+            f"{state})\n    {perf}"
+        )
+        if row["thesis"]:
+            lines.append(f"    Recorded thesis: {row['thesis']}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def format_watchlist_for_email(ledger: dict) -> str:
+    """
+    Format tracked watchlist names and their performance for the weekly email.
+
+    Purely a scoreboard for ideas the agent flagged but did not buy — the
+    counterfactual that decides whether its idea generation is worth anything.
+    """
+    rows = watchlist_performance(ledger)
+    if not rows:
+        return ""
+
+    lines = ["=== Watchlist tracking (recorded, not acted on) ==="]
+    for row in rows:
+        weeks = row["weeks_tracked"]
+        age = f"{weeks}w" if weeks is not None else "?"
+        flags = [] if row["active"] else ["dropped"]
+        if row["tracking_ended"]:
+            flags = ["tracking ended"]
+        if row["bought_date"]:
+            flags.append(f"bought {row['bought_date']}")
+        suffix = f" [{', '.join(flags)}]" if flags else ""
+        if row["return_pct"] is None:
+            lines.append(f"  {row['ticker']:<8} {age:>4} tracked  (no score yet){suffix}")
+        else:
+            vs = (
+                f"  vs bench: {row['vs_benchmark_pts']:>+6.1f} pts"
+                if row["vs_benchmark_pts"] is not None else ""
+            )
+            lines.append(
+                f"  {row['ticker']:<8} {age:>4} tracked  "
+                f"{row['return_pct']:>+7.2f}%{vs}{suffix}"
+            )
+
+    scoreable = [r for r in rows if r["vs_benchmark_pts"] is not None]
+    if scoreable:
+        avg = sum(r["vs_benchmark_pts"] for r in scoreable) / len(scoreable)
+        lines.append(
+            f"  ---\n  {len(scoreable)} scoreable name(s), average "
+            f"{avg:+.1f} pts vs benchmark over their own windows."
+        )
+        lines.append(
+            "  (Ideas flagged but not bought. If this stays positive while the\n"
+            "   held book lags, the agent's problem is deployment, not picking.)"
+        )
+    return "\n".join(lines)
 
 
 def build_thesis_review(ledger: dict, current_val: dict) -> str:

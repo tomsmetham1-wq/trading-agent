@@ -285,7 +285,34 @@ context and never reached the weekly email. The prompt also now requires that a
 played-out position's next trim level be within ~15% of TODAY's price, tightened
 via SET_TRIMS alongside the SET_DRIVER if it isn't.
 
-Test suite: `test_trading_agent.py` (141 tests, no network). Run it after any
+Watchlist recording (Aug 2026) — RECORDING ONLY, deliberately not a gate:
+`ledger["watchlist"]` tracks every name Claude flags in section 4, with the
+price at first mention and a weekly observation thereafter. Claude emits an
+optional `"watchlist"` array alongside `"recommendations"` in the same JSON
+block; `sp.record_watchlist()` runs AFTER execution (so a name bought this run
+is scoreable as "bought") and is wrapped in try/except so idea-tracking can
+never break a run that already placed orders.
+
+Why it exists: the agent named 3 fresh watchlist ideas every week and never
+revisited them (ZTS/STZ/ACN on 10 Aug, NFLX/AZN.L/WMT on 17 Aug), so there was
+no evidence about whether its non-held ideas were any good — the open question
+after DELL was found to carry the entire book. `watchlist_performance()` scores
+each name from its first priced observation against the benchmark **over that
+name's own window** (observations store the inception-relative benchmark
+return; the window return is the ratio of the two, not their difference — do
+not "simplify" this to a subtraction). Surfaced in the prompt via
+`build_watchlist_review()` and in the weekly email via
+`format_watchlist_for_email()`.
+
+Names dropped from the active list keep being priced for
+`sp.WATCHLIST_TRACK_WEEKS` (26) — an idea abandoned just before it ran is the
+single most important thing this captures, so do not "clean up" dropped names.
+Deliberately absent: any rule that blocks a BUY for not being on the watchlist,
+or requires a name to persist N weeks before it can be bought. Those were
+considered and rejected — they forfeit real upside to buy a filter the data
+doesn't yet justify. Revisit only once there are ~3 months of scores.
+
+Test suite: `test_trading_agent.py` (164 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the

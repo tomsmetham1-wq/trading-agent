@@ -962,6 +962,235 @@ class TestSetTrimsTightenGuard:
         assert rec in allowed
 
 
+class TestWatchlistRecording:
+    """
+    The watchlist is RECORDED and scored, never gated. Added Aug 2026: the
+    agent named 3 fresh watchlist ideas every week and never revisited them
+    (ZTS/STZ/ACN one run, NFLX/AZN.L/WMT the next), so there was no evidence
+    about whether its non-held ideas were any good — the open question after
+    DELL carried the entire book. These tests pin the recording behaviour AND
+    the guarantee that nothing here blocks or creates a trade.
+    """
+
+    def _entry(self, ticker="ZTS", thesis="Cheap animal health.", theme="pharma"):
+        return {"ticker": ticker, "yfinance_ticker": ticker,
+                "thesis_oneline": thesis, "theme": theme}
+
+    def _prices(self, mapping):
+        return lambda t: mapping.get(t)
+
+    def test_records_new_name_with_price_and_thesis(self):
+        ledger = make_ledger()
+        events = sp.record_watchlist(
+            ledger, [self._entry()], "2026-08-17",
+            price_fn=self._prices({"ZTS": 100.0}), benchmark_return_pct=9.0)
+        rec = ledger["watchlist"]["ZTS"]
+        assert rec["first_seen"] == "2026-08-17"
+        assert rec["active"] is True
+        assert rec["thesis"] == "Cheap animal health."
+        assert rec["theme"] == "pharma"
+        assert rec["observations"] == [
+            {"date": "2026-08-17", "price_gbp": 100.0, "benchmark_return_pct": 9.0}
+        ]
+        assert any("WATCHLIST +ZTS" in e for e in events)
+
+    def test_repeat_mention_appends_observation_not_duplicate_entry(self):
+        ledger = make_ledger()
+        sp.record_watchlist(ledger, [self._entry()], "2026-08-17",
+                            price_fn=self._prices({"ZTS": 100.0}))
+        sp.record_watchlist(ledger, [self._entry()], "2026-08-24",
+                            price_fn=self._prices({"ZTS": 110.0}))
+        rec = ledger["watchlist"]["ZTS"]
+        assert rec["first_seen"] == "2026-08-17"
+        assert rec["last_seen"] == "2026-08-24"
+        assert [o["price_gbp"] for o in rec["observations"]] == [100.0, 110.0]
+
+    def test_same_date_rerun_updates_in_place(self):
+        ledger = make_ledger()
+        sp.record_watchlist(ledger, [self._entry()], "2026-08-17",
+                            price_fn=self._prices({"ZTS": 100.0}))
+        sp.record_watchlist(ledger, [self._entry()], "2026-08-17",
+                            price_fn=self._prices({"ZTS": 105.0}))
+        obs = ledger["watchlist"]["ZTS"]["observations"]
+        assert len(obs) == 1
+        assert obs[0]["price_gbp"] == 105.0
+
+    def test_dropped_name_keeps_being_priced(self):
+        ledger = make_ledger()
+        sp.record_watchlist(ledger, [self._entry()], "2026-08-17",
+                            price_fn=self._prices({"ZTS": 100.0}))
+        events = sp.record_watchlist(ledger, [], "2026-08-24",
+                                     price_fn=self._prices({"ZTS": 130.0}))
+        rec = ledger["watchlist"]["ZTS"]
+        assert rec["active"] is False
+        # the whole point: an abandoned idea that then ran is still visible
+        assert [o["price_gbp"] for o in rec["observations"]] == [100.0, 130.0]
+        assert any("dropped from the active list" in e for e in events)
+
+    def test_readded_name_becomes_active_again(self):
+        ledger = make_ledger()
+        sp.record_watchlist(ledger, [self._entry()], "2026-08-17",
+                            price_fn=self._prices({"ZTS": 100.0}))
+        sp.record_watchlist(ledger, [], "2026-08-24",
+                            price_fn=self._prices({"ZTS": 100.0}))
+        sp.record_watchlist(ledger, [self._entry()], "2026-08-31",
+                            price_fn=self._prices({"ZTS": 100.0}))
+        assert ledger["watchlist"]["ZTS"]["active"] is True
+
+    def test_tracking_window_closes_for_long_cold_name(self):
+        ledger = make_ledger()
+        stale = (date.today() - timedelta(weeks=sp.WATCHLIST_TRACK_WEEKS + 1))
+        ledger["watchlist"] = {
+            "OLD": {"first_seen": "2026-01-01", "yfinance_ticker": "OLD",
+                    "last_seen": stale.isoformat(), "active": False,
+                    "observations": [{"date": "2026-01-01", "price_gbp": 10.0}]},
+        }
+        events = sp.record_watchlist(ledger, [], date.today().isoformat(),
+                                     price_fn=self._prices({"OLD": 99.0}))
+        rec = ledger["watchlist"]["OLD"]
+        assert rec.get("tracking_ended")
+        assert len(rec["observations"]) == 1      # no new price fetched
+        assert any("tracking window closed" in e for e in events)
+
+    def test_unpriceable_name_is_tracked_without_observation(self):
+        ledger = make_ledger()
+        sp.record_watchlist(ledger, [self._entry("NOPE")], "2026-08-17",
+                            price_fn=self._prices({}))
+        assert ledger["watchlist"]["NOPE"]["observations"] == []
+
+    def test_malformed_entries_ignored(self):
+        ledger = make_ledger()
+        sp.record_watchlist(
+            ledger, ["not a dict", {}, {"ticker": "  "}, None], "2026-08-17",
+            price_fn=self._prices({}))
+        assert ledger["watchlist"] == {}
+
+    # --- scoring ---
+
+    def _two_obs_ledger(self, p0=100.0, p1=120.0, b0=0.0, b1=10.0):
+        ledger = make_ledger()
+        sp.record_watchlist(ledger, [self._entry()], "2026-08-17",
+                            price_fn=self._prices({"ZTS": p0}),
+                            benchmark_return_pct=b0)
+        sp.record_watchlist(ledger, [self._entry()], "2026-08-24",
+                            price_fn=self._prices({"ZTS": p1}),
+                            benchmark_return_pct=b1)
+        return ledger
+
+    def test_scores_return_against_benchmark_over_its_own_window(self):
+        # +20% for the name; benchmark went 0% -> 10% inception-relative,
+        # which over THIS window is (110/100 - 1) = +10%, so +10 pts.
+        row = sp.watchlist_performance(self._two_obs_ledger())[0]
+        assert row["return_pct"] == pytest.approx(20.0)
+        assert row["benchmark_pct"] == pytest.approx(10.0)
+        assert row["vs_benchmark_pts"] == pytest.approx(10.0)
+
+    def test_benchmark_window_is_not_since_inception(self):
+        # A name first seen when the benchmark was already +50% must not be
+        # charged that 50% — only what happened after it was first seen.
+        row = sp.watchlist_performance(
+            self._two_obs_ledger(b0=50.0, b1=65.0))[0]
+        assert row["benchmark_pct"] == pytest.approx(10.0)
+
+    def test_single_observation_is_tracked_but_unscored(self):
+        ledger = make_ledger()
+        sp.record_watchlist(ledger, [self._entry()], "2026-08-17",
+                            price_fn=self._prices({"ZTS": 100.0}))
+        row = sp.watchlist_performance(ledger)[0]
+        assert row["return_pct"] is None
+        assert row["vs_benchmark_pts"] is None
+
+    def test_bought_name_is_flagged_with_its_buy_date(self, monkeypatch):
+        ledger = self._two_obs_ledger()
+        monkeypatch.setattr(sp, "fetch_price_gbp", lambda t: 10.0)
+        sp.apply_recommendations(ledger, [gbp_buy_rec("ZTS", 200)], "2026-08-24")
+        row = sp.watchlist_performance(ledger)[0]
+        assert row["bought_date"] == "2026-08-24"
+
+    def test_buy_before_first_seen_is_not_counted(self, monkeypatch):
+        ledger = make_ledger()
+        monkeypatch.setattr(sp, "fetch_price_gbp", lambda t: 10.0)
+        sp.apply_recommendations(ledger, [gbp_buy_rec("ZTS", 200)], "2026-07-01")
+        sp.record_watchlist(ledger, [self._entry()], "2026-08-17",
+                            price_fn=self._prices({"ZTS": 100.0}))
+        assert sp.watchlist_performance(ledger)[0]["bought_date"] is None
+
+    def test_ranking_puts_best_vs_benchmark_first(self):
+        ledger = make_ledger()
+        for day, prices in (("2026-08-17", {"AAA": 100.0, "BBB": 100.0}),
+                            ("2026-08-24", {"AAA": 90.0, "BBB": 140.0})):
+            sp.record_watchlist(
+                ledger, [self._entry("AAA"), self._entry("BBB")], day,
+                price_fn=self._prices(prices), benchmark_return_pct=0.0)
+        assert [r["ticker"] for r in sp.watchlist_performance(ledger)] == ["BBB", "AAA"]
+
+    # --- surfaces ---
+
+    def test_prompt_section_replays_names_and_states_it_is_not_a_gate(self):
+        review = sp.build_watchlist_review(self._two_obs_ledger())
+        assert "ZTS" in review
+        assert "+20.0%" in review
+        assert "RECORDING ONLY" in review
+        assert "Cheap animal health." in review
+
+    def test_prompt_section_empty_when_nothing_tracked(self):
+        assert sp.build_watchlist_review(make_ledger()) == ""
+
+    def test_email_section_shows_score_and_average(self):
+        table = sp.format_watchlist_for_email(self._two_obs_ledger())
+        assert "ZTS" in table
+        assert "+20.00%" in table
+        assert "average" in table
+
+    def test_email_section_empty_when_nothing_tracked(self):
+        assert sp.format_watchlist_for_email(make_ledger()) == ""
+
+    # --- the no-gate guarantee ---
+
+    def test_watchlist_never_blocks_or_creates_a_trade(self):
+        ledger = self._two_obs_ledger()
+        pre_val = {"total_value_gbp": 6000.0, "cash_gbp": 1000.0, "positions": {}}
+        # a BUY of a name that was never watched must pass untouched
+        recs = [gbp_buy_rec("NEVERWATCHED", 500, theme="software")]
+        allowed, events = ta.enforce_strategy_guards(recs, ledger, pre_val)
+        assert allowed == recs
+        assert not any("watchlist" in e.lower() for e in events)
+        # and a tracked name generates no recs of its own
+        allowed, events = ta.enforce_strategy_guards([], ledger, pre_val)
+        assert allowed == []
+        assert not any("watchlist" in e.lower() for e in events)
+
+    def test_extract_watchlist_from_recommendations_block(self):
+        text = (
+            'prose\n```json\n'
+            '{"recommendations": [], "watchlist": '
+            '[{"ticker": "ZTS", "yfinance_ticker": "ZTS"}]}\n```'
+        )
+        assert ta.extract_watchlist(text) == [
+            {"ticker": "ZTS", "yfinance_ticker": "ZTS"}]
+
+    def test_extract_watchlist_missing_is_empty_not_an_error(self):
+        assert ta.extract_watchlist('```json\n{"recommendations": []}\n```') == []
+        assert ta.extract_watchlist("no json here") == []
+
+    def test_extract_watchlist_ignores_echoed_example_block(self):
+        text = (
+            '```json\n{"recommendations": [], "watchlist": '
+            '[{"ticker": "EXAMPLE"}]}\n```\n'
+            'real one:\n```json\n{"recommendations": [], "watchlist": '
+            '[{"ticker": "REAL"}]}\n```'
+        )
+        assert ta.extract_watchlist(text) == [{"ticker": "REAL"}]
+
+    def test_recommendations_still_extracted_alongside_watchlist(self):
+        text = (
+            '```json\n{"recommendations": [{"action": "BUY", "ticker": "X"}], '
+            '"watchlist": [{"ticker": "ZTS"}]}\n```'
+        )
+        assert ta.extract_recommendations(text) == [{"action": "BUY", "ticker": "X"}]
+        assert ta.extract_watchlist(text) == [{"ticker": "ZTS"}]
+
+
 # =============================================================================
 # Shadow ledger — buys, sells, trims
 # =============================================================================

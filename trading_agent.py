@@ -379,14 +379,13 @@ def call_claude(user_prompt: str, model: str = CLAUDE_MODEL_WEEKLY,
     return "\n\n".join(text_parts).strip()
 
 
-def extract_recommendations(text: str) -> list:
+def _last_json_block_with(text: str, key: str) -> dict | None:
     """
-    Extract the structured JSON recommendations block from Claude's prose response.
+    Return the LAST fenced JSON block carrying `key`, or None.
 
-    Scans ALL fenced JSON blocks and uses the LAST one that carries a
-    "recommendations" key. The model is instructed to END with the block, so
-    the last one is authoritative — taking the first would execute an echoed
-    example block (e.g. if the model restates the schema in its prose).
+    The model is instructed to END with its block, so the last one is
+    authoritative — taking the first would pick up an echoed example block
+    (e.g. if the model restates the schema in its prose).
     """
     blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     for block in reversed(blocks):
@@ -395,11 +394,39 @@ def extract_recommendations(text: str) -> list:
         except json.JSONDecodeError as e:
             logger.warning("JSON parse error in candidate block: %s", e)
             continue
-        if isinstance(data, dict) and "recommendations" in data:
-            recs = data["recommendations"]
-            return recs if isinstance(recs, list) else []
-    logger.warning("No JSON recommendations block found in Claude response")
-    return []
+        if isinstance(data, dict) and key in data:
+            return data
+    return None
+
+
+def extract_recommendations(text: str) -> list:
+    """
+    Extract the structured JSON recommendations block from Claude's prose response.
+    """
+    data = _last_json_block_with(text, "recommendations")
+    if data is None:
+        logger.warning("No JSON recommendations block found in Claude response")
+        return []
+    recs = data["recommendations"]
+    return recs if isinstance(recs, list) else []
+
+
+def extract_watchlist(text: str) -> list:
+    """
+    Extract the optional watchlist array from Claude's response.
+
+    Read from the authoritative recommendations block when it carries a
+    "watchlist" key, otherwise from the last block that has one. A missing
+    watchlist is normal and never an error — it records nothing new that run
+    and existing tracked names are still re-priced.
+    """
+    data = _last_json_block_with(text, "recommendations")
+    if data is None or "watchlist" not in data:
+        data = _last_json_block_with(text, "watchlist")
+    if data is None:
+        return []
+    entries = data.get("watchlist")
+    return entries if isinstance(entries, list) else []
 
 
 def strip_json_block(text: str) -> str:
@@ -408,15 +435,21 @@ def strip_json_block(text: str) -> str:
 
 
 def get_claude_recommendations(pre_val: dict, ledger: dict,
-                                t212_cash: dict, t212_positions: list) -> tuple[str, list]:
-    """Build the weekly prompt, call Claude (with web search), and extract recommendations."""
+                                t212_cash: dict, t212_positions: list
+                                ) -> tuple[str, list, list]:
+    """
+    Build the weekly prompt, call Claude (with web search), and extract both the
+    actionable recommendations and the (observational) watchlist.
+    """
     logger.info("Calling Claude (%s) with web search...", CLAUDE_MODEL_WEEKLY)
     system_prompt, user_prompt = build_prompt(pre_val, ledger, t212_cash, t212_positions)
     response = call_claude(user_prompt, model=CLAUDE_MODEL_WEEKLY,
                            system_prompt=system_prompt)
     recs = extract_recommendations(response)
-    logger.info("Claude made %d actionable recommendation(s)", len(recs))
-    return response, recs
+    watchlist = extract_watchlist(response)
+    logger.info("Claude made %d actionable recommendation(s), %d watchlist name(s)",
+                len(recs), len(watchlist))
+    return response, recs, watchlist
 
 
 # =============================================================================
@@ -1072,7 +1105,8 @@ def build_weekly_email_body(started: datetime, post_val: dict,
                              t212_cash: dict, t212_positions: list,
                              shadow_events: list, t212_events: list,
                              prose: str, prev_snapshot: dict = None,
-                             guard_events: list = None) -> str:
+                             guard_events: list = None,
+                             ledger: dict = None) -> str:
     """Assemble the full weekly report email body."""
     t212_total, t212_cash_available = extract_t212_totals(t212_cash)
 
@@ -1127,6 +1161,9 @@ def build_weekly_email_body(started: datetime, post_val: dict,
         + "\n"
     ) if guard_events else ""
 
+    watchlist_table = sp.format_watchlist_for_email(ledger) if ledger else ""
+    watchlist_section = f"\n{watchlist_table}\n" if watchlist_table else ""
+
     return (
         f"Weekly Portfolio Review\n"
         f"Environment: {T212_ENV.upper()}\n"
@@ -1138,6 +1175,7 @@ def build_weekly_email_body(started: datetime, post_val: dict,
         + ("\n".join(f"  {e}" for e in shadow_events) if shadow_events else "  (none)")
         + guard_section
         + demo_section
+        + watchlist_section
         + "\n\n"
         f"=== Claude's full analysis ===\n\n{prose}\n\n"
         f"---\n"
@@ -1268,7 +1306,8 @@ def run_weekly(started: datetime) -> None:
     )
 
     # Step 5: Claude analysis
-    response, recs = get_claude_recommendations(pre_val, ledger, t212_cash, t212_positions)
+    response, recs, watchlist = get_claude_recommendations(
+        pre_val, ledger, t212_cash, t212_positions)
 
     # Step 5b: mechanical strategy guards (flip-flop rule, 20% position cap)
     recs, guard_events = enforce_strategy_guards(recs, ledger, pre_val)
@@ -1287,6 +1326,19 @@ def run_weekly(started: datetime) -> None:
     prev_snapshot = (ledger.get("weekly_snapshots") or [None])[-1]
     t212_total, _ = extract_t212_totals(t212_cash)
     post_val = sp.valuation(ledger, t212_price_map=t212_price_map)
+
+    # Step 7b: record the watchlist. Observational only — it runs AFTER
+    # execution so a name bought this run is already scoreable as "bought",
+    # and it can never affect what was traded.
+    try:
+        for e in sp.record_watchlist(
+            ledger, watchlist, run_date,
+            benchmark_return_pct=post_val.get("benchmark_return_pct"),
+        ):
+            logger.info("[WATCHLIST] %s", e)
+    except Exception as e:
+        # Never let idea-tracking break a run that has already placed orders.
+        logger.error("Watchlist recording failed (trades unaffected): %s", e)
     sp.snapshot(ledger, post_val, run_date, t212_total_gbp=t212_total)
     ledger["last_run_date"] = run_date
     sp.save_ledger(ledger)
@@ -1296,7 +1348,7 @@ def run_weekly(started: datetime) -> None:
     prose = strip_json_block(response)
     body = build_weekly_email_body(
         started, post_val, t212_cash, t212_positions, shadow_events, t212_events, prose,
-        prev_snapshot=prev_snapshot, guard_events=guard_events,
+        prev_snapshot=prev_snapshot, guard_events=guard_events, ledger=ledger,
     )
     subject = build_weekly_email_subject(started, t212_total, post_val)
     try:

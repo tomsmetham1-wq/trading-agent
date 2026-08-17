@@ -192,6 +192,15 @@ evidence in section 3.
 **4. Watchlist**
 1–3 names to research further but not yet actionable, one line each.
 
+Watchlist names are now RECORDED and priced every week so their performance
+can be compared against what the portfolio actually held. This is measurement
+only — it places no obligation to ever buy a watchlist name, and no
+restriction on buying a name that was never on the list. Carry forward names
+you still believe in by repeating them each run; drop one by simply omitting
+it, stating in one line why it is no longer of interest. Do not pad the list
+to look decisive, and do not reset it to three fresh names every week out of
+habit: a name you still rate should reappear.
+
 **5. Confidence & caveats**
 What you don't know. What could invalidate the thesis. Where you're speculating.
 
@@ -235,9 +244,22 @@ Use this exact schema:
       "yfinance_ticker": "CAT",
       "forward_driver": "Entry thesis (trough multiple) is played out at +90%; hold now rests only on the $40bn dealer backlog underwriting 12-18 months of revenue at expanding margins, which I would buy fresh today."
     }
+  ],
+  "watchlist": [
+    {
+      "ticker": "ZTS",
+      "yfinance_ticker": "ZTS",
+      "thesis_oneline": "Animal health leader at 10.5x forward P/E vs 19x 10-year average; entry blocked on cash, not conviction.",
+      "theme": "pharma"
+    }
   ]
 }
 ```
+
+The "watchlist" array mirrors section 4 and is optional — omit it or send an
+empty list if you are tracking nothing. It is RECORDED ONLY: no watchlist
+entry ever places an order, and buying a name requires a BUY in
+"recommendations" exactly as before, whether or not it was ever watched.
 
 SET_DRIVER records, on the position, the forward driver justifying a hold whose
 ORIGINAL thesis has played out. It places no order and moves no cash. The driver
@@ -303,6 +325,7 @@ recommendation had been executed) ===
 === Thesis accountability ===
 {thesis_review}
 
+{watchlist_review}
 Today: {today}
 
 Task — use web search to:
@@ -505,6 +528,7 @@ def build_prompt(shadow_val: dict, shadow_ledger: dict,
         trade_history=(json.dumps(recent_trades, indent=2, default=str)
                        if recent_trades else "(none yet)"),
         thesis_review=sp.build_thesis_review(shadow_ledger, shadow_val),
+        watchlist_review=sp.build_watchlist_review(shadow_ledger),
         today=datetime.now().strftime("%A, %d %B %Y"),
     )
     return ANALYSIS_SYSTEM, user_prompt
