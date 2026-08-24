@@ -219,6 +219,26 @@ before execution — prompt rules that were being violated are now mechanical:
 - **20% position cap**: BUY amounts are reduced to land at the cap, or blocked
   if the position is already over it (or the reduced order would be under
   £25). Multiple BUYs of one ticker in a run count cumulatively.
+- **Undriven played-out sell** (added Aug 2026): a position listed in the
+  new `played_out` JSON array with NO forward driver on record, no SET_DRIVER
+  this run and no TRIM/SELL is EXITED IN FULL. The forward driver is the
+  reason to hold a realized winner, so a position with none has no stated
+  case. The prompt always said this ("defaulting to HOLD with no named
+  forward driver is not permitted") but nothing enforced it: `thesis_played_out`
+  is set BY `_apply_set_driver`, so a position became played out only because
+  a driver was named, and "played out with no driver" could not be represented
+  in the ledger at all -- the judgement lived in prose that no guard reads.
+  `extract_played_out()` makes it machine-readable. Deliberately narrow: a
+  position that already HAS a driver is untouched, because re-confirming an
+  unchanged driver is legitimate and is covered by the weekly
+  confirm/replace/trim loop. Runs BEFORE the bank injection so the bank sees
+  the sell and doesn't also trim 33% of a position being closed. This is the
+  only guard that can close a position; every other mechanical path banks a
+  third at a time.
+  Watch for: since every mechanism here is triggered by Claude's own
+  admission, making the declaration more expensive raises the incentive to
+  declare less often. The tell is declarations getting RARER, not the sells
+  looking wrong.
 - **Played-out bank injection** (added Aug 2026): a played-out position owing
   a bank (no trim since declaration or in 12 weeks) gets a 33% TRIM inserted
   at the FRONT of the rec list — the only guard that creates a trade rather
@@ -414,7 +434,7 @@ or requires a name to persist N weeks before it can be bought. Those were
 considered and rejected — they forfeit real upside to buy a filter the data
 doesn't yet justify. Revisit only once there are ~3 months of scores.
 
-Test suite: `test_trading_agent.py` (215 tests, no network). Run it after any
+Test suite: `test_trading_agent.py` (225 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the

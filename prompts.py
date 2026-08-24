@@ -179,6 +179,17 @@ the 20% cap) and not a thesis-realized recycling trim under the rule above:
   For those, skip the checklist and instead state the realized thesis and
   where the proceeds should go.
 
+Every position you judge played out this run MUST also be listed in the
+"played_out" array of the JSON block, with a one-line reason. That array is
+read in code, not just by a human: a position named there with no forward
+driver on record, no SET_DRIVER this run, and no TRIM/SELL is EXITED IN FULL
+automatically. The forward driver is the reason to hold a realized winner —
+with none on record there is no stated case for the position, and the rule
+below stops being advice. Listing a position there is a real decision, so make
+it deliberately; but do not omit a position to dodge the consequence, because
+holding a played-out winner on nothing is the exact failure this exists to
+prevent.
+
 For every position you mark "played out" (thesis substantially realized) in the
 thesis-accountability check, you MUST do ONE of the following — defaulting to
 HOLD with no named forward driver is not permitted for a realized winner:
@@ -270,6 +281,13 @@ Use this exact schema:
       "yfinance_ticker": "CAT",
       "forward_driver": "Entry thesis (trough multiple) is played out at +90%; hold now rests only on the $40bn dealer backlog underwriting 12-18 months of revenue at expanding margins, which I would buy fresh today.",
       "previous_driver_status": "superseded"
+    }
+  ],
+  "played_out": [
+    {
+      "ticker": "CAT",
+      "yfinance_ticker": "CAT",
+      "reason": "Trough-multiple re-rating is complete at +90%; the entry mispricing has closed."
     }
   ],
   "watchlist": [

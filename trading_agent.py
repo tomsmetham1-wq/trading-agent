@@ -429,6 +429,27 @@ def extract_watchlist(text: str) -> list:
     return entries if isinstance(entries, list) else []
 
 
+def extract_played_out(text: str) -> list:
+    """
+    Extract the optional "played_out" array — the positions Claude judges to
+    have had their original thesis realized this run.
+
+    This judgement used to live only in the prose accountability table, where
+    no guard could see it: `thesis_played_out` is set BY `_apply_set_driver`,
+    so a position became played out only because a driver was named. A position
+    declared played out with no driver and no trim was therefore invisible to
+    the code and simply carried on as a plain HOLD — the one case the whole
+    thesis-realized rule exists to prevent.
+    """
+    data = _last_json_block_with(text, "recommendations")
+    if data is None or "played_out" not in data:
+        data = _last_json_block_with(text, "played_out")
+    if data is None:
+        return []
+    entries = data.get("played_out")
+    return entries if isinstance(entries, list) else []
+
+
 def strip_json_block(text: str) -> str:
     """Remove the trailing ```json ... ``` block from Claude's response."""
     return re.sub(r"```json.*?```", "", text, flags=re.DOTALL).strip()
@@ -436,10 +457,11 @@ def strip_json_block(text: str) -> str:
 
 def get_claude_recommendations(pre_val: dict, ledger: dict,
                                 t212_cash: dict, t212_positions: list
-                                ) -> tuple[str, list, list]:
+                                ) -> tuple[str, list, list, list]:
     """
-    Build the weekly prompt, call Claude (with web search), and extract both the
-    actionable recommendations and the (observational) watchlist.
+    Build the weekly prompt, call Claude (with web search), and extract the
+    actionable recommendations, the (observational) watchlist, and the
+    positions declared played out this run.
     """
     logger.info("Calling Claude (%s) with web search...", CLAUDE_MODEL_WEEKLY)
     system_prompt, user_prompt = build_prompt(pre_val, ledger, t212_cash, t212_positions)
@@ -447,9 +469,11 @@ def get_claude_recommendations(pre_val: dict, ledger: dict,
                            system_prompt=system_prompt)
     recs = extract_recommendations(response)
     watchlist = extract_watchlist(response)
-    logger.info("Claude made %d actionable recommendation(s), %d watchlist name(s)",
-                len(recs), len(watchlist))
-    return response, recs, watchlist
+    played_out = extract_played_out(response)
+    logger.info("Claude made %d actionable recommendation(s), %d watchlist "
+                "name(s), %d played-out declaration(s)",
+                len(recs), len(watchlist), len(played_out))
+    return response, recs, watchlist, played_out
 
 
 # =============================================================================
@@ -713,6 +737,84 @@ def _played_out_trim_alerts(recs: list, ledger: dict, pre_val: dict) -> list[str
     return alerts
 
 
+def _inject_undriven_played_out_sells(recs: list, ledger: dict, pre_val: dict,
+                                      played_out: list) -> tuple[list, list[str]]:
+    """
+    Sell a position declared played out that has no forward driver at all.
+
+    The forward driver IS the reason to hold a realized winner, so a position
+    with none has no stated reason to exist. The prompt has always said this —
+    "defaulting to HOLD with no named forward driver is not permitted for a
+    realized winner", either name a driver or TRIM/SELL — but nothing enforced
+    it, because the guards read the JSON recs and the judgement lived in prose.
+
+    Narrow by design. A position that ALREADY has a driver on record is not
+    touched: re-confirming an unchanged driver is legitimate (option (a)) and
+    that case is covered by the weekly confirm/replace/trim loop and the bank
+    clocks. This fires only where there is no forward case on record at all.
+
+    Returns (recs including any injected sell, guard_events).
+    """
+    events: list[str] = []
+    injected: list[dict] = []
+    if not played_out:
+        return recs, events
+
+    acted = {
+        _rec_ticker(r) for r in recs
+        if (r.get("action") or "").upper().strip() in ("SELL", "TRIM")
+    }
+    driven_this_run = {
+        _rec_ticker(r) for r in recs
+        if (r.get("action") or "").upper().strip() == "SET_DRIVER"
+    }
+    positions_val = pre_val.get("positions", {})
+
+    for entry in played_out:
+        ticker = (
+            entry.get("yfinance_ticker") or entry.get("ticker") or ""
+            if isinstance(entry, dict) else str(entry)
+        ).strip()
+        if not ticker:
+            continue
+        pos = (ledger.get("positions") or {}).get(ticker)
+        if pos is None:
+            continue                       # can't sell what isn't held
+        if ticker in acted or ticker in driven_this_run:
+            continue                       # Claude acted, or named a driver
+        if (pos.get("forward_driver") or "").strip():
+            continue                       # a driver is on record already
+
+        value = (positions_val.get(ticker, {}) or {}).get("current_value_gbp")
+        if value is None:
+            events.append(
+                f"ALERT {ticker}: declared played out with no forward driver "
+                f"and no trim, but no live price this run - sell NOT forced, "
+                f"will retry next run"
+            )
+            continue
+
+        injected.append({
+            "action": "SELL",
+            "ticker": ticker,
+            "yfinance_ticker": ticker,
+            "thesis_oneline": (
+                "Mechanical exit: thesis declared played out with no forward "
+                "driver named and no trim recommended. The forward driver is "
+                "the reason to hold a realized winner - with none on record "
+                "there is no stated case for the position."
+            ),
+            "guard_generated": True,
+        })
+        events.append(
+            f"FORCED SELL {ticker}: declared played out this run with no "
+            f"forward driver and no trim recommended - exiting the full "
+            f"position (~£{value:.2f})"
+        )
+
+    return injected + recs, events
+
+
 def _inject_played_out_banks(recs: list, ledger: dict,
                              pre_val: dict) -> tuple[list, list[str]]:
     """
@@ -867,7 +969,8 @@ def _theme_cap_alerts(theme_exposure: dict, themes_rebalanced_this_run: set,
     return alerts
 
 
-def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[list, list]:
+def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict,
+                            played_out: list = None) -> tuple[list, list]:
     """
     Filter Claude's recommendations against the hard strategy rules in code.
 
@@ -927,7 +1030,15 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[li
     ledger_positions = ledger.get("positions", {})
     today = datetime.now().date()
 
-    # Rule 0: played-out positions must bank — inject the mechanical trim
+    # Rule 0a: a position declared played out with no forward driver at all
+    # has no stated reason to be held — exit it in full. Runs BEFORE the bank
+    # injection so the bank sees the sell and doesn't also trim 33% of a
+    # position that is being closed.
+    recs, sell_events = _inject_undriven_played_out_sells(
+        recs, ledger, pre_val, played_out or [])
+    guard_events.extend(sell_events)
+
+    # Rule 0b: played-out positions must bank — inject the mechanical trim
     # BEFORE anything else so the theme/cash checks credit its proceeds and
     # the advisory alerts treat the position as acted on this run.
     recs, bank_events = _inject_played_out_banks(recs, ledger, pre_val)
@@ -1402,11 +1513,12 @@ def run_weekly(started: datetime) -> None:
         logger.info("[PEAK] %s", e)
 
     # Step 5: Claude analysis
-    response, recs, watchlist = get_claude_recommendations(
+    response, recs, watchlist, played_out = get_claude_recommendations(
         pre_val, ledger, t212_cash, t212_positions)
 
     # Step 5b: mechanical strategy guards (flip-flop rule, 20% position cap)
-    recs, guard_events = enforce_strategy_guards(recs, ledger, pre_val)
+    recs, guard_events = enforce_strategy_guards(
+        recs, ledger, pre_val, played_out)
     for e in guard_events:
         logger.warning("[GUARD] %s", e)
 

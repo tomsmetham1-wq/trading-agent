@@ -1589,6 +1589,77 @@ class TestForwardDriverFailure:
         assert "previous_driver_status" not in pos["forward_driver_history"][-1]
 
 
+class TestUndrivenPlayedOutSell:
+    """
+    The forward driver IS the reason to hold a realized winner. The prompt
+    always said a played-out position needs a driver or a trim/sell, but the
+    guards read JSON recs and the judgement lived in prose — so "played out
+    with no driver" was invisible and the position carried on as a plain HOLD.
+    """
+
+    def _ledger(self, driver=None):
+        pos = {"shares": 10, "avg_cost_gbp": 100.0, "first_bought": "2026-04-26"}
+        if driver:
+            pos.update(thesis_played_out=True, forward_driver=driver,
+                       forward_driver_set="2026-07-27")
+        return {"positions": {"X": pos}, "trades": []}
+
+    def _val(self):
+        return {"total_value_gbp": 6000.0,
+                "positions": {"X": {"pnl_pct": 90.0, "current_value_gbp": 1200.0}}}
+
+    def _declared(self):
+        return [{"ticker": "X", "yfinance_ticker": "X", "reason": "re-rating done"}]
+
+    def _forced(self, recs, played_out, ledger=None):
+        out, _ = ta._inject_undriven_played_out_sells(
+            recs, ledger or self._ledger(), self._val(), played_out)
+        return [(r["action"], r["ticker"]) for r in out if r.get("guard_generated")]
+
+    def test_no_driver_no_trim_forces_a_full_sell(self):
+        assert self._forced([], self._declared()) == [("SELL", "X")]
+
+    def test_set_driver_this_run_prevents_the_sell(self):
+        recs = [{"action": "SET_DRIVER", "ticker": "X", "yfinance_ticker": "X",
+                 "forward_driver": "New case."}]
+        assert self._forced(recs, self._declared()) == []
+
+    def test_claude_trimming_it_prevents_the_sell(self):
+        recs = [{"action": "TRIM", "ticker": "X", "yfinance_ticker": "X",
+                 "trim_pct": 33}]
+        assert self._forced(recs, self._declared()) == []
+
+    def test_existing_driver_on_record_is_left_alone(self):
+        # Re-confirming an unchanged driver is legitimate (option (a)) and is
+        # covered by the weekly confirm/replace/trim loop, not by this rule.
+        assert self._forced([], self._declared(),
+                            self._ledger(driver="Backlog converts.")) == []
+
+    def test_position_not_held_is_ignored(self):
+        assert self._forced([], [{"ticker": "TSLA", "yfinance_ticker": "TSLA"}]) == []
+
+    def test_nothing_declared_forces_nothing(self):
+        assert self._forced([], []) == []
+
+    def test_bare_ticker_strings_are_accepted(self):
+        assert self._forced([], ["X"]) == [("SELL", "X")]
+
+    def test_missing_price_alerts_instead_of_selling(self):
+        out, events = ta._inject_undriven_played_out_sells(
+            [], self._ledger(), {"positions": {}}, self._declared())
+        assert [r for r in out if r.get("guard_generated")] == []
+        assert any("no live price" in e for e in events)
+
+    def test_extracted_from_the_recommendations_block(self):
+        text = '''```json
+{"recommendations": [], "played_out": [{"ticker": "X", "reason": "done"}]}
+```'''
+        assert ta.extract_played_out(text) == [{"ticker": "X", "reason": "done"}]
+
+    def test_absent_played_out_array_is_not_an_error(self):
+        assert ta.extract_played_out('```json\n{"recommendations": []}\n```') == []
+
+
 class TestDriverFailureBanksSameRun:
     """
     _apply_set_driver writes driver_failed_on at EXECUTION, which is after the
