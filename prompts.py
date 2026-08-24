@@ -610,7 +610,7 @@ def build_deep_review_prompt(ledger: dict, valuation: dict) -> tuple[str, str]:
     }
     filtered_ledger["trades"] = [
         t for t in ledger.get("trades", [])
-        if t.get("action") != "SYNC_FROM_T212"
+        if not str(t.get("action", "")).startswith("SYNC")
     ]
 
     # Realised P&L computed in code; unrealised summed from the live valuation.
@@ -618,16 +618,38 @@ def build_deep_review_prompt(ledger: dict, valuation: dict) -> tuple[str, str]:
     unrealized_total = round(sum(
         p.get("pnl_gbp") or 0 for p in positions_val.values()
     ), 2)
+    notes = []
+    if realized["tickers_with_estimated_basis"]:
+        notes.append(
+            "Cost basis ESTIMATED from the position's current average cost "
+            "(shares entered via T212 sync with no BUY in the trade log) for: "
+            f"{realized['tickers_with_estimated_basis']} — right order of "
+            "magnitude, not exact."
+        )
+    if realized["tickers_with_incomplete_basis"]:
+        notes.append(
+            "Cost basis UNKNOWN and no position left to infer it from for: "
+            f"{realized['tickers_with_incomplete_basis']}. Proceeds that could "
+            f"not be priced: {realized['unpriced_proceeds_gbp']}. Realised P&L "
+            "for these names is missing from the totals, not zero."
+        )
+    if not notes:
+        notes.append("All sells matched against recorded buy cost basis.")
+
+    recon = sp.reconcile_trade_log(ledger)
+    if not recon["clean"]:
+        notes.append(
+            "WARNING: the trade log no longer explains the positions held "
+            f"({recon['drifts']}); cash implied by the log is "
+            f"£{recon['cash_log_gbp']} against £{recon['cash_ledger_gbp']} in "
+            "the ledger. Treat every figure in this block as suspect."
+        )
+
     realized_summary = {
         "realized_total_gbp":   realized["total_gbp"],
         "realized_by_ticker":   realized["by_ticker"],
         "unrealized_total_gbp": unrealized_total,
-        "note": (
-            "Cost basis partly unknown (position entered via T212 sync, no BUY "
-            f"in trade log) for: {realized['tickers_with_incomplete_basis']}"
-            if realized["tickers_with_incomplete_basis"] else
-            "All sells matched against recorded buy cost basis."
-        ),
+        "note": " ".join(notes),
     }
 
     user_prompt = DEEP_REVIEW_USER_TEMPLATE.format(

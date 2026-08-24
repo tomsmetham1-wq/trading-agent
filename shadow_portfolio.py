@@ -209,6 +209,7 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
     changed = False
     added: list[str] = []    # what actually got added/removed — the candidate
     removed: list[str] = []  # sets can shrink (skips, queued orders, wipe guard)
+    sync_records: list[dict] = []   # per-ticker SYNC_ADD / SYNC_REMOVE entries
 
     # Step 1: Add positions T212 holds that shadow is missing
     if missing_in_shadow:
@@ -221,14 +222,17 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
             # 2. averagePricePaid in native currency — needs FX conversion
             # 3. Current market price from yfinance  — stalest, but always available
             avg_cost_gbp = entry.get("avg_cost_gbp")  # from walletImpact
+            basis_source = "t212_wallet"
 
             if not avg_cost_gbp or avg_cost_gbp <= 0:
                 avg_native = entry.get("avg_price_native", 0)
                 if avg_native and avg_native > 0:
                     avg_cost_gbp = _native_to_gbp(avg_native, entry.get("currency", "USD"))
+                    basis_source = "t212_native_fx"
 
             if not avg_cost_gbp or avg_cost_gbp <= 0:
                 avg_cost_gbp = fetch_price_gbp(yf_ticker)
+                basis_source = "market_price"
 
             if avg_cost_gbp is None:
                 logger.warning("%s: couldn't determine GBP price, skipping sync", yf_ticker)
@@ -241,6 +245,16 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
                 "thesis":       "(synced from T212)",
             }
             added.append(yf_ticker)
+            # Per-ticker record so compute_realized_pnl() can price later sells
+            # of these shares. The summary entry below is prose only.
+            sync_records.append({
+                "date":         today,
+                "action":       "SYNC_ADD",
+                "ticker":       yf_ticker,
+                "shares":       entry["shares"],
+                "avg_cost_gbp": avg_cost_gbp,
+                "basis_source": basis_source,
+            })
             changed = True
 
     # Step 2: Remove positions shadow holds that T212 doesn't — bidirectional only.
@@ -268,6 +282,16 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
             logger.info("Sync: removing from shadow (not in T212): %s", sorted(to_remove))
             for yf_ticker in to_remove:
                 del ledger["positions"][yf_ticker]
+                # T212 never held these shares, so any BUY sitting in the log
+                # for them is phantom. Record the removal per-ticker or the
+                # realised-P&L replay keeps the phantom lots forever and
+                # blends them into the basis of a later real position.
+                sync_records.append({
+                    "date":   today,
+                    "action": "SYNC_REMOVE",
+                    "ticker": yf_ticker,
+                    "note":   "not held at T212 — order rejected or never executed",
+                })
             removed = sorted(to_remove)
             changed = True
 
@@ -277,6 +301,7 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
         changed = True
 
     if changed:
+        ledger["trades"].extend(sync_records)
         ledger["trades"].append({
             "date":   today,
             "action": "SYNC_FROM_T212",
@@ -935,10 +960,29 @@ def compute_realized_pnl(ledger: dict) -> dict:
     cost of the shares sold). This gives the deep review hard numbers instead
     of asking the model to derive them from the raw trade log.
 
-    Positions that entered via T212 sync have no BUY trade, so their cost
-    basis is unknown — sells of such shares are skipped and the ticker is
-    listed under "tickers_with_incomplete_basis" so the deep review knows the
-    figure is partial rather than silently wrong.
+    The replay must honour what sync did to the ledger, or it silently prices
+    sells against lots that never existed. Three sync actions are replayed:
+
+      SYNC_REMOVE  a position T212 never held (rejected order) — its BUYs are
+                   phantom, so drop the holding. Without this, the four April
+                   2026 phantom META lots (£2,900 of orders T212 rejected)
+                   stayed in the replay and blended into the cost basis of the
+                   real 13 May position, reporting its loss as -£93.79 when the
+                   shares actually bought and sold lost -£48.99.
+      SYNC_ADD     a position T212 holds that shadow was missing — seed the
+                   holding at T212's own cost. Reliable when it came from
+                   walletImpact.totalCost, an estimate otherwise.
+      SYNC_RESET   the ledger was rebuilt wholesale from T212 (the April 2026
+                   bootstrap runs) — every lot before it was replaced, so the
+                   replay starts over and pre-reset basis is not recoverable.
+
+    Shares sold with no recorded basis fall back to the position's current
+    avg_cost_gbp and the ticker is reported under "tickers_with_estimated_basis".
+    Skipping them instead understates realised P&L badly — DELL's five trims
+    banked ~£650 against shares mostly seeded by a rebuild, and reporting that
+    as +£90 misleads exactly the kill-criteria decomposition the deep review
+    exists to make. Tickers with no basis available at all stay under
+    "tickers_with_incomplete_basis".
 
     Args:
         ledger: Shadow portfolio ledger dict.
@@ -947,21 +991,60 @@ def compute_realized_pnl(ledger: dict) -> dict:
         dict: {
             "total_gbp": float,                      # sum of realised P&L
             "by_ticker": {ticker: realised_gbp},     # sorted best-first
-            "tickers_with_incomplete_basis": [str],  # cost basis partly unknown
+            "tickers_with_incomplete_basis": [str],  # no cost basis at all
+            "tickers_with_estimated_basis": [str],   # basis inferred, not recorded
+            "unpriced_proceeds_gbp": {ticker: gbp},  # sold, but P&L unknowable
         }
     """
     holdings: dict[str, list[float]] = {}   # ticker -> [shares_held, total_cost_gbp]
     realized: dict[str, float] = {}
     incomplete: set[str] = set()
+    estimated: set[str] = set()
+    unpriced: dict[str, float] = {}   # proceeds we cannot price at all
+    positions = ledger.get("positions", {}) or {}
+
+    def _fallback_basis(tk: str):
+        """Per-share cost for shares with no recorded BUY, or None."""
+        cost = (positions.get(tk) or {}).get("avg_cost_gbp")
+        try:
+            cost = float(cost)
+        except (TypeError, ValueError):
+            return None
+        return cost if cost > 0 else None
 
     for t in ledger.get("trades", []):
         action = t.get("action")
         ticker = t.get("ticker")
+
+        if action == "SYNC_RESET":
+            # Wholesale rebuild: anything still open was replaced by T212 state
+            # whose cost basis never reached the trade log. Clear the replay but
+            # don't flag the tickers here — a name re-bought after the reset has
+            # a perfectly good basis, and flagging it forever would wrongly mark
+            # META (cleanly bought 13 May, sold 24 Aug) as unpriceable. Sells
+            # that really have no basis are caught where they happen, below.
+            holdings.clear()
+            continue
+
         if not ticker or ticker == "-":
             continue
         shares = float(t.get("shares") or 0)
 
-        if action == "BUY":
+        if action == "SYNC_REMOVE":
+            holdings.pop(ticker, None)
+
+        elif action == "SYNC_ADD":
+            cost = float(t.get("avg_cost_gbp") or 0)
+            if shares > 0 and cost > 0:
+                h = holdings.setdefault(ticker, [0.0, 0.0])
+                h[0] += shares
+                h[1] += shares * cost
+                if t.get("basis_source") != "t212_wallet":
+                    estimated.add(ticker)
+            else:
+                incomplete.add(ticker)
+
+        elif action == "BUY":
             amount = float(t.get("amount_gbp") or 0)
             h = holdings.setdefault(ticker, [0.0, 0.0])
             h[0] += shares
@@ -969,22 +1052,40 @@ def compute_realized_pnl(ledger: dict) -> dict:
 
         elif action in ("SELL", "TRIM"):
             proceeds = float(t.get("amount_gbp") or 0)
-            h = holdings.setdefault(ticker, [0.0, 0.0])
-            if h[0] <= 0 or shares <= 0:
-                # Selling shares we never saw bought (synced from T212) —
-                # cost basis unknown, can't realise anything meaningful.
+            if shares <= 0:
                 incomplete.add(ticker)
                 continue
-            matched = min(shares, h[0])
-            avg_cost = h[1] / h[0]
-            matched_proceeds = proceeds * (matched / shares)
-            realized[ticker] = (
-                realized.get(ticker, 0.0) + matched_proceeds - matched * avg_cost
-            )
-            h[0] -= matched
-            h[1] -= matched * avg_cost
-            if matched < shares:
-                incomplete.add(ticker)
+            h = holdings.setdefault(ticker, [0.0, 0.0])
+
+            matched = min(shares, h[0]) if h[0] > 0 else 0.0
+            if matched > 0:
+                avg_cost = h[1] / h[0]
+                realized[ticker] = (
+                    realized.get(ticker, 0.0)
+                    + proceeds * (matched / shares)
+                    - matched * avg_cost
+                )
+                h[0] -= matched
+                h[1] -= matched * avg_cost
+
+            unmatched = shares - matched
+            if unmatched > 1e-9:
+                basis = _fallback_basis(ticker)
+                if basis is None:
+                    # Nothing to price these against. Report the proceeds so the
+                    # deep review sees unaccounted realised activity instead of
+                    # a silent zero.
+                    incomplete.add(ticker)
+                    unpriced[ticker] = (
+                        unpriced.get(ticker, 0.0) + proceeds * (unmatched / shares)
+                    )
+                else:
+                    realized[ticker] = (
+                        realized.get(ticker, 0.0)
+                        + proceeds * (unmatched / shares)
+                        - unmatched * basis
+                    )
+                    estimated.add(ticker)
 
     return {
         "total_gbp": round(sum(realized.values()), 2),
@@ -993,6 +1094,97 @@ def compute_realized_pnl(ledger: dict) -> dict:
             for k, v in sorted(realized.items(), key=lambda x: -x[1])
         },
         "tickers_with_incomplete_basis": sorted(incomplete),
+        "tickers_with_estimated_basis": sorted(estimated - incomplete),
+        "unpriced_proceeds_gbp": {
+            k: round(v, 2) for k, v in sorted(unpriced.items())
+        },
+    }
+
+
+def reconcile_trade_log(ledger: dict) -> dict:
+    """
+    Check the trade log still explains the positions the ledger holds.
+
+    The log and the position state can drift apart silently — sync used to
+    rewrite positions without recording per-ticker entries, so by August 2026
+    the log implied -3.79 DELL shares against 2.04 actually held, and a cash
+    balance of -£1,172.60 against £559.36. Nothing noticed, and the realised
+    P&L fed to the monthly deep review was computed from it regardless.
+
+    Args:
+        ledger: Shadow portfolio ledger dict.
+
+    Returns:
+        dict: {
+            "drifts": {ticker: {"log": float, "ledger": float, "diff": float}},
+            "cash_log_gbp": float,    # cash the log implies
+            "cash_ledger_gbp": float,
+            "cash_diff_gbp": float,
+            "clean": bool,
+        }
+    """
+    shares: dict[str, float] = {}
+    cash = float(ledger.get("starting_capital_gbp") or 0)
+
+    for t in ledger.get("trades", []):
+        action = t.get("action")
+        ticker = t.get("ticker")
+
+        if action == "SYNC_BASELINE":
+            # Known-good starting point stamped by migrate_trade_log.py. The
+            # April 2026 bootstrap rebuilt the ledger from T212 without ever
+            # recording what it held, so shares before the baseline are
+            # unrecoverable and reconciling from £5,000 can only ever fail.
+            # Anything that drifts after it is real and worth an alert.
+            shares.clear()
+            shares.update({
+                k: float(v) for k, v in (t.get("positions") or {}).items()
+            })
+            cash = float(t.get("cash_gbp") or 0)
+            continue
+        if action == "SYNC_RESET":
+            shares.clear()
+            continue
+        if not ticker or ticker == "-":
+            continue
+
+        qty    = float(t.get("shares") or 0)
+        amount = float(t.get("amount_gbp") or 0)
+
+        if action == "BUY":
+            shares[ticker] = shares.get(ticker, 0.0) + qty
+            cash -= amount
+        elif action in ("SELL", "TRIM"):
+            shares[ticker] = shares.get(ticker, 0.0) - qty
+            cash += amount
+        elif action == "SYNC_ADD":
+            shares[ticker] = shares.get(ticker, 0.0) + qty
+        elif action == "SYNC_REMOVE":
+            shares.pop(ticker, None)
+
+    ledger_shares = {
+        tk: float(p.get("shares") or 0)
+        for tk, p in (ledger.get("positions") or {}).items()
+    }
+
+    drifts = {}
+    for tk in sorted(set(shares) | set(ledger_shares)):
+        log_qty = round(shares.get(tk, 0.0), 6)
+        led_qty = round(ledger_shares.get(tk, 0.0), 6)
+        if abs(log_qty - led_qty) > 1e-4:
+            drifts[tk] = {
+                "log":    log_qty,
+                "ledger": led_qty,
+                "diff":   round(log_qty - led_qty, 6),
+            }
+
+    cash_ledger = float(ledger.get("cash_gbp") or 0)
+    return {
+        "drifts":           drifts,
+        "cash_log_gbp":     round(cash, 2),
+        "cash_ledger_gbp":  round(cash_ledger, 2),
+        "cash_diff_gbp":    round(cash - cash_ledger, 2),
+        "clean":            not drifts,
     }
 
 

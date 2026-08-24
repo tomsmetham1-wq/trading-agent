@@ -266,8 +266,33 @@ same-day re-runs are blocked (orders may already be at T212) — check the T212
 order history, then delete the file to re-enable runs.
 
 Realised P&L: `sp.compute_realized_pnl()` replays the trade log and feeds
-computed realised-vs-unrealised figures into the deep review prompt (tickers
-whose cost basis came from T212 sync are flagged as incomplete).
+computed realised-vs-unrealised figures into the deep review prompt.
+
+The replay honours what sync did to the ledger (Aug 2026 fix -- do not
+regress): `SYNC_REMOVE` drops a position T212 never held so its phantom BUYs
+can't blend into a later real position's basis, `SYNC_ADD` seeds a holding at
+T212's own cost, `SYNC_RESET` marks a wholesale rebuild and clears the replay.
+`sync_from_t212()` writes these per-ticker records itself; before it did, sync
+logged only a prose note and the replay never saw the change. Consequences as
+of 24 Aug 2026: the four April phantom META lots (2,900 GBP of rejected orders)
+were still blending into the real 13 May position, reporting its loss as
+-93.79 GBP when the shares actually bought and sold lost -48.99 GBP, and DELL's
+five trims scored +90 GBP against a real ~+650 GBP. Both fed the monthly deep
+review, which is where the kill-criteria decomposition is made.
+
+Shares sold with no recorded basis now fall back to the position's current
+`avg_cost_gbp` and land in `tickers_with_estimated_basis` (right order of
+magnitude, not exact) rather than being skipped -- skipping them understated
+realised P&L by hundreds. Names with no position left to infer from stay in
+`tickers_with_incomplete_basis`, and their `unpriced_proceeds_gbp` are reported
+so a missing figure doesn't read as a zero.
+
+`sp.reconcile_trade_log()` checks the log still explains the positions held and
+the cash balance; the deep review prompt carries a WARNING block when it
+doesn't. `migrate_trade_log.py` is the one-off (idempotent) backfill that
+converted the legacy prose sync entries and stamped a `SYNC_BASELINE` -- shares
+held before the April 2026 bootstrap rebuilds were never logged, so
+reconciliation counts from that baseline forward.
 
 Forward-driver accountability (SET_DRIVER, July 2026): the second ledger-only
 rec action (alongside SET_TRIMS) — no T212 order, no cash movement, confirmed
@@ -321,7 +346,7 @@ or requires a name to persist N weeks before it can be bought. Those were
 considered and rejected — they forfeit real upside to buy a filter the data
 doesn't yet justify. Revisit only once there are ~3 months of scores.
 
-Test suite: `test_trading_agent.py` (164 tests, no network). Run it after any
+Test suite: `test_trading_agent.py` (187 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the

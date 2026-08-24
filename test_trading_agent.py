@@ -1358,6 +1358,115 @@ class TestRealizedPnl:
         assert result["total_gbp"] == 0.0
         assert result["tickers_with_incomplete_basis"] == []
 
+    def test_sync_remove_drops_phantom_lots(self):
+        # The August 2026 META bug: buys T212 rejected stayed in the replay and
+        # blended into the basis of the real position bought later.
+        ledger = {"positions": {}, "trades": [
+            {"action": "BUY",         "ticker": "M", "shares": 10, "amount_gbp": 1000},
+            {"action": "SYNC_REMOVE", "ticker": "M"},
+            {"action": "BUY",         "ticker": "M", "shares": 10, "amount_gbp": 500},
+            {"action": "SELL",        "ticker": "M", "shares": 10, "amount_gbp": 450},
+        ]}
+        result = sp.compute_realized_pnl(ledger)
+        # Priced against the £500 lot that really existed, not the £750 blend.
+        assert result["by_ticker"]["M"] == pytest.approx(-50.0)
+        assert result["tickers_with_incomplete_basis"] == []
+
+    def test_sync_reset_clears_replay_without_flagging_later_buys(self):
+        ledger = {"positions": {}, "trades": [
+            {"action": "BUY",        "ticker": "X", "shares": 10, "amount_gbp": 900},
+            {"action": "SYNC_RESET", "ticker": "-"},
+            {"action": "BUY",        "ticker": "X", "shares": 10, "amount_gbp": 100},
+            {"action": "SELL",       "ticker": "X", "shares": 10, "amount_gbp": 150},
+        ]}
+        result = sp.compute_realized_pnl(ledger)
+        assert result["by_ticker"]["X"] == pytest.approx(50.0)
+        assert result["tickers_with_incomplete_basis"] == []
+
+    def test_sync_add_seeds_basis_from_t212_cost(self):
+        ledger = {"positions": {}, "trades": [
+            {"action": "SYNC_ADD", "ticker": "X", "shares": 10,
+             "avg_cost_gbp": 10.0, "basis_source": "t212_wallet"},
+            {"action": "SELL",     "ticker": "X", "shares": 10, "amount_gbp": 150},
+        ]}
+        result = sp.compute_realized_pnl(ledger)
+        assert result["by_ticker"]["X"] == pytest.approx(50.0)
+        assert result["tickers_with_estimated_basis"] == []
+
+    def test_sync_add_from_market_price_is_flagged_estimated(self):
+        ledger = {"positions": {}, "trades": [
+            {"action": "SYNC_ADD", "ticker": "X", "shares": 10,
+             "avg_cost_gbp": 10.0, "basis_source": "market_price"},
+            {"action": "SELL",     "ticker": "X", "shares": 10, "amount_gbp": 150},
+        ]}
+        result = sp.compute_realized_pnl(ledger)
+        assert result["tickers_with_estimated_basis"] == ["X"]
+
+    def test_unmatched_sell_falls_back_to_position_avg_cost(self):
+        # DELL: trims exceeded logged buys because sync seeded shares silently.
+        ledger = {
+            "positions": {"D": {"shares": 2, "avg_cost_gbp": 100.0}},
+            "trades": [
+                {"action": "TRIM", "ticker": "D", "shares": 5, "amount_gbp": 750},
+            ],
+        }
+        result = sp.compute_realized_pnl(ledger)
+        assert result["by_ticker"]["D"] == pytest.approx(250.0)
+        assert result["tickers_with_estimated_basis"] == ["D"]
+        assert result["tickers_with_incomplete_basis"] == []
+
+    def test_unpriceable_sell_reports_proceeds(self):
+        ledger = {"positions": {}, "trades": [
+            {"action": "SELL", "ticker": "Z", "shares": 5, "amount_gbp": 60},
+        ]}
+        result = sp.compute_realized_pnl(ledger)
+        assert result["tickers_with_incomplete_basis"] == ["Z"]
+        assert result["unpriced_proceeds_gbp"]["Z"] == pytest.approx(60.0)
+        assert result["total_gbp"] == 0.0
+
+
+class TestTradeLogReconciliation:
+    def test_clean_log_reconciles(self):
+        ledger = {
+            "starting_capital_gbp": 1000,
+            "cash_gbp": 900,
+            "positions": {"X": {"shares": 10}},
+            "trades": [
+                {"action": "BUY", "ticker": "X", "shares": 10, "amount_gbp": 100},
+            ],
+        }
+        r = sp.reconcile_trade_log(ledger)
+        assert r["clean"] is True
+        assert r["cash_diff_gbp"] == pytest.approx(0.0)
+
+    def test_drift_detected(self):
+        ledger = {
+            "starting_capital_gbp": 1000,
+            "cash_gbp": 900,
+            "positions": {"X": {"shares": 4}},
+            "trades": [
+                {"action": "BUY", "ticker": "X", "shares": 10, "amount_gbp": 100},
+            ],
+        }
+        r = sp.reconcile_trade_log(ledger)
+        assert r["clean"] is False
+        assert r["drifts"]["X"]["diff"] == pytest.approx(6.0)
+
+    def test_baseline_seeds_shares_and_cash(self):
+        ledger = {
+            "starting_capital_gbp": 1000,
+            "cash_gbp": 500,
+            "positions": {"X": {"shares": 10}},
+            "trades": [
+                {"action": "BUY", "ticker": "Q", "shares": 99, "amount_gbp": 9999},
+                {"action": "SYNC_BASELINE", "ticker": "-",
+                 "positions": {"X": 10}, "cash_gbp": 500},
+            ],
+        }
+        r = sp.reconcile_trade_log(ledger)
+        assert r["clean"] is True
+        assert r["cash_diff_gbp"] == pytest.approx(0.0)
+
 
 # =============================================================================
 # Sell settlement detection (position-delta based)
