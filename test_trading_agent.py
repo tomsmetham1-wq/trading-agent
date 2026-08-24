@@ -1054,6 +1054,62 @@ class TestWatchlistRecording:
         ]
         assert any("WATCHLIST +ZTS" in e for e in events)
 
+    def test_exited_position_is_tracked_even_if_not_listed(self):
+        # META, 2026-08-24: the report said the watchlist was the right place
+        # for it and then didn't list it, so the exit was scored nowhere.
+        ledger = make_ledger()
+        ledger["trades"].append({
+            "date": "2026-08-24", "action": "SELL", "ticker": "META",
+            "shares": 1.1197, "amount_gbp": 451.01,
+            "exit_thesis": "Thesis broken: FCF collapsed.",
+            "closed_position": True,
+        })
+        events = sp.record_watchlist(
+            ledger, [], "2026-08-24",
+            price_fn=self._prices({"META": 402.79}), benchmark_return_pct=6.82)
+        rec = ledger["watchlist"]["META"]
+        assert rec["source"] == "exit"
+        assert rec["active"] is False          # evidence, not a live idea
+        assert rec["exited_on"] == "2026-08-24"
+        assert rec["thesis"] == "Thesis broken: FCF collapsed."
+        assert rec["observations"][-1]["price_gbp"] == 402.79
+        assert any("WATCHLIST +META" in e for e in events)
+
+    def test_exit_does_not_clobber_a_name_claude_also_listed(self):
+        ledger = make_ledger()
+        ledger["trades"].append({
+            "date": "2026-08-24", "action": "SELL", "ticker": "ZTS",
+            "shares": 1, "amount_gbp": 100, "closed_position": True,
+        })
+        sp.record_watchlist(
+            ledger, [self._entry("ZTS")], "2026-08-24",
+            price_fn=self._prices({"ZTS": 100.0}))
+        rec = ledger["watchlist"]["ZTS"]
+        assert rec["active"] is True                    # Claude's entry wins
+        assert rec["thesis"] == "Cheap animal health."
+        assert "source" not in rec
+
+    def test_exit_tracking_is_idempotent_across_reruns(self):
+        ledger = make_ledger()
+        ledger["trades"].append({
+            "date": "2026-08-24", "action": "SELL", "ticker": "META",
+            "shares": 1, "amount_gbp": 451, "closed_position": True,
+        })
+        for _ in range(2):
+            sp.record_watchlist(ledger, [], "2026-08-24",
+                                price_fn=self._prices({"META": 402.79}))
+        assert len(ledger["watchlist"]["META"]["observations"]) == 1
+
+    def test_trim_that_does_not_close_is_not_tracked(self):
+        ledger = make_ledger()
+        ledger["trades"].append({
+            "date": "2026-08-24", "action": "TRIM", "ticker": "DELL",
+            "shares": 1, "amount_gbp": 343.35,
+        })
+        sp.record_watchlist(ledger, [], "2026-08-24",
+                            price_fn=self._prices({"DELL": 320.0}))
+        assert "DELL" not in ledger["watchlist"]
+
     def test_repeat_mention_appends_observation_not_duplicate_entry(self):
         ledger = make_ledger()
         sp.record_watchlist(ledger, [self._entry()], "2026-08-17",

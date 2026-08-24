@@ -1428,6 +1428,36 @@ def record_watchlist(ledger: dict, entries: list, run_date: str,
         if theme:
             rec["theme"] = theme
 
+    # Positions exited this run get tracked whether or not Claude listed them.
+    # A name the agent sold and then watched run is the most expensive blind
+    # spot it has, and relying on the report to remember is not enough: on
+    # 2026-08-24 it sold META saying "the watchlist is the right place for
+    # that" and then left it off the list, so the exit was scored nowhere.
+    # Recorded inactive — a sold position is evidence, not a live idea.
+    for t in ledger.get("trades", []):
+        if t.get("date") != run_date or not t.get("closed_position"):
+            continue
+        ticker = (t.get("ticker") or "").strip()
+        if not ticker or ticker in seen_now:
+            continue
+        rec = watchlist.get(ticker)
+        if rec is None:
+            rec = watchlist[ticker] = {
+                "first_seen":      run_date,
+                "yfinance_ticker": t.get("yfinance_ticker") or ticker,
+                "observations":    [],
+                "active":          False,
+                "source":          "exit",
+                "thesis":          (t.get("exit_thesis") or "").strip(),
+            }
+            events.append(
+                f"WATCHLIST +{ticker}: exited this run, tracked for "
+                f"{WATCHLIST_TRACK_WEEKS}w to score the exit"
+            )
+        rec["exited_on"] = run_date
+        rec["last_seen"] = run_date
+        rec.pop("tracking_ended", None)
+
     for ticker, rec in watchlist.items():
         if ticker not in seen_now and rec.get("active"):
             rec["active"] = False
@@ -1488,6 +1518,7 @@ def watchlist_performance(ledger: dict) -> list[dict]:
             "theme":           rec.get("theme"),
             "first_seen":      rec.get("first_seen"),
             "active":          bool(rec.get("active")),
+            "exited_on":       rec.get("exited_on"),
             "tracking_ended":  rec.get("tracking_ended"),
             "weeks_tracked":   _weeks_since(rec.get("first_seen")),
             "bought_date":     _watchlist_bought_date(
@@ -1543,7 +1574,14 @@ def build_watchlist_review(ledger: dict) -> str:
     for row in rows:
         weeks = row["weeks_tracked"]
         age = f"{weeks}w" if weeks is not None else "?"
-        state = "active" if row["active"] else "dropped"
+        # An exited holding isn't a dropped idea — it's a position that was
+        # sold, and the point of tracking it is to score that decision.
+        if row["active"]:
+            state = "active"
+        elif row["exited_on"]:
+            state = f"SOLD {row['exited_on']}"
+        else:
+            state = "dropped"
         if row["tracking_ended"]:
             state = "tracking ended"
         if row["bought_date"]:
@@ -1582,7 +1620,12 @@ def format_watchlist_for_email(ledger: dict) -> str:
     for row in rows:
         weeks = row["weeks_tracked"]
         age = f"{weeks}w" if weeks is not None else "?"
-        flags = [] if row["active"] else ["dropped"]
+        if row["active"]:
+            flags = []
+        elif row["exited_on"]:
+            flags = [f"sold {row['exited_on']}"]
+        else:
+            flags = ["dropped"]
         if row["tracking_ended"]:
             flags = ["tracking ended"]
         if row["bought_date"]:

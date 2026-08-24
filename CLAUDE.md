@@ -341,12 +341,30 @@ not "simplify" this to a subtraction). Surfaced in the prompt via
 Names dropped from the active list keep being priced for
 `sp.WATCHLIST_TRACK_WEEKS` (26) — an idea abandoned just before it ran is the
 single most important thing this captures, so do not "clean up" dropped names.
+
+Exits are tracked automatically (Aug 2026): any trade on this run carrying
+`closed_position: true` is added to the watchlist by `record_watchlist()`,
+recorded `active: false` with `source: "exit"` and `exited_on`, and rendered as
+"SOLD <date>" rather than "dropped" — a sold position is evidence about a
+decision, not a live idea. Relying on the report to list its own exits did not
+work: on 2026-08-24 the agent sold META saying "the watchlist is the right
+place for that" and then left it off the array, so the exit was scored nowhere.
+A name Claude also lists that run keeps its listed entry (active, with Claude's
+thesis); the exit path never clobbers it.
+
+Watchlist theses are replayed months later as the record of why a name was NOT
+bought, so the prompt reserves the word "blocked" for trades a strategy guard
+actually blocked. MSFT was logged on 2026-08-24 as "blocked on AI
+infrastructure theme concentration" when the buy would have taken the theme to
+55% against a 60% cap and the guard log shows no block — it was a preference
+for diversification. Both records were repaired by `fix_watchlist_records.py`
+(one-off, idempotent).
 Deliberately absent: any rule that blocks a BUY for not being on the watchlist,
 or requires a name to persist N weeks before it can be bought. Those were
 considered and rejected — they forfeit real upside to buy a filter the data
 doesn't yet justify. Revisit only once there are ~3 months of scores.
 
-Test suite: `test_trading_agent.py` (187 tests, no network). Run it after any
+Test suite: `test_trading_agent.py` (191 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the

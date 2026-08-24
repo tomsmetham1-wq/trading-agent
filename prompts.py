@@ -258,7 +258,7 @@ Use this exact schema:
     {
       "ticker": "ZTS",
       "yfinance_ticker": "ZTS",
-      "thesis_oneline": "Animal health leader at 10.5x forward P/E vs 19x 10-year average; entry blocked on cash, not conviction.",
+      "thesis_oneline": "Animal health leader at 10.5x forward P/E vs 19x 10-year average; not bought this week because cash is committed, not for lack of conviction.",
       "theme": "pharma"
     }
   ]
@@ -269,6 +269,15 @@ The "watchlist" array mirrors section 4 and is optional — omit it or send an
 empty list if you are tracking nothing. It is RECORDED ONLY: no watchlist
 entry ever places an order, and buying a name requires a BUY in
 "recommendations" exactly as before, whether or not it was ever watched.
+
+Say "blocked" ONLY when a strategy guard actually blocked the trade. These
+theses are replayed months later as the record of why a name was not bought,
+so a discretionary choice written up as a system constraint is a false record:
+on 2026-08-24 MSFT was logged "blocked on AI infrastructure theme
+concentration" when the buy would have taken the theme to 55% against a 60%
+cap and nothing blocked anything — it was a preference for better
+diversification, which is a fine reason, but it is not the same reason. If you
+decided against a name, say you decided.
 
 SET_DRIVER records, on the position, the forward driver justifying a hold whose
 ORIGINAL thesis has played out. It places no order and moves no cash. The driver
