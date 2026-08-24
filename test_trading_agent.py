@@ -1589,6 +1589,65 @@ class TestForwardDriverFailure:
         assert "previous_driver_status" not in pos["forward_driver_history"][-1]
 
 
+class TestDriverFailureBanksSameRun:
+    """
+    _apply_set_driver writes driver_failed_on at EXECUTION, which is after the
+    guards run — so reading the position alone would fire the bank a week late,
+    which is the delay the failed-driver rule exists to remove. The guard reads
+    this run's recs instead.
+    """
+
+    def _ledger(self):
+        return {"positions": {"X": {
+            "shares": 10, "avg_cost_gbp": 100.0, "first_bought": "2026-04-26",
+            "thesis_played_out": True, "forward_driver": "Old driver.",
+            "forward_driver_set": "2026-07-27",
+            "played_out_peak_gain_pct": 100.0,
+            "played_out_peak_date": "2026-08-10",
+        }}, "trades": [{"action": "TRIM", "ticker": "X", "date": "2026-08-10"}]}
+
+    def _val(self):
+        return {"positions": {"X": {"pnl_pct": 100.0, "current_value_gbp": 600.0}}}
+
+    def _driver(self, status=None):
+        rec = {"action": "SET_DRIVER", "ticker": "X", "yfinance_ticker": "X",
+               "forward_driver": "New driver."}
+        if status:
+            rec["previous_driver_status"] = status
+        return [rec]
+
+    def _injected(self, recs):
+        out, _ = ta._inject_played_out_banks(recs, self._ledger(), self._val())
+        return [r for r in out if r.get("guard_generated")]
+
+    def test_failed_driver_banks_in_the_same_run(self):
+        assert len(self._injected(self._driver("failed"))) == 1
+
+    def test_omitted_status_banks_in_the_same_run(self):
+        assert len(self._injected(self._driver())) == 1
+
+    def test_superseded_driver_does_not_bank(self):
+        assert self._injected(self._driver("superseded")) == []
+
+    def test_claude_selling_it_itself_pre_empts_the_injection(self):
+        recs = self._driver("failed") + [
+            {"action": "SELL", "ticker": "X", "yfinance_ticker": "X"}]
+        assert self._injected(recs) == []
+
+    def test_first_driver_on_a_played_out_position_does_not_bank(self):
+        # No previous driver to have failed — nothing to declare.
+        ledger = self._ledger()
+        ledger["positions"]["X"].pop("forward_driver")
+        out, _ = ta._inject_played_out_banks(
+            self._driver(), ledger, self._val())
+        assert [r for r in out if r.get("guard_generated")] == []
+
+    def test_unchanged_driver_text_is_not_a_failure(self):
+        recs = [{"action": "SET_DRIVER", "ticker": "X", "yfinance_ticker": "X",
+                 "forward_driver": "Old driver."}]
+        assert self._injected(recs) == []
+
+
 class TestPlayedOutGiveback:
     """
     Trim levels are gains from ENTRY, so on a big winner they sit above the

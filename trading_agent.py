@@ -746,14 +746,32 @@ def _inject_played_out_banks(recs: list, ledger: dict,
         _rec_ticker(r) for r in recs
         if (r.get("action") or "").upper().strip() == "SET_DRIVER"
     }
+    # A driver declared failed THIS run owes its bank THIS run. driver_failed_on
+    # is written by _apply_set_driver at execution time, which is after these
+    # guards, so reading the position alone would miss it and fire a week late —
+    # exactly the delay the rule exists to remove. Read the rec instead.
+    driver_failed_this_run: set[str] = set()
+    for r in recs:
+        if (r.get("action") or "").upper().strip() != "SET_DRIVER":
+            continue
+        tk = _rec_ticker(r)
+        pos_now = (ledger.get("positions", {}) or {}).get(tk) or {}
+        existing = (pos_now.get("forward_driver") or "").strip()
+        proposed = (r.get("forward_driver") or r.get("thesis_oneline") or "").strip()
+        if not existing or existing == proposed:
+            continue        # first driver for this position, or unchanged
+        if (r.get("previous_driver_status") or "").strip().lower() != "superseded":
+            driver_failed_this_run.add(tk)
     positions_val = pre_val.get("positions", {})
 
     for ticker, pos in ledger.get("positions", {}).items():
         if ticker in acted:
             continue
         gain_pct = (positions_val.get(ticker, {}) or {}).get("pnl_pct")
+        failed_now = ticker in driver_failed_this_run
         if pos.get("thesis_played_out"):
-            due = sp.played_out_bank_due(ledger, ticker, pos, gain_pct)
+            due = (sp.played_out_bank_due(ledger, ticker, pos, gain_pct)
+                   or failed_now)
             declared = sp.played_out_declared_date(pos) or "?"
         elif ticker in declared_this_run:
             due = True          # declared this very run, with no trim alongside
@@ -766,9 +784,9 @@ def _inject_played_out_banks(recs: list, ledger: dict,
         # Name the reason — "12 weeks elapsed" and "the driver failed" are very
         # different events and the email should not render them identically.
         giveback = sp.played_out_giveback_pct(pos, gain_pct)
-        if pos.get("driver_failed_on"):
-            reason = (f"forward driver failed {pos['driver_failed_on']}, "
-                      f"nothing banked since")
+        if failed_now or pos.get("driver_failed_on"):
+            when = "this run" if failed_now else pos["driver_failed_on"]
+            reason = (f"forward driver failed {when}, nothing banked since")
         elif sp.played_out_giveback_due(pos, gain_pct):
             reason = (f"handed back {giveback:.0f}% of its peak gain "
                       f"(+{pos.get('played_out_peak_gain_pct', 0):.0f}% peak, "

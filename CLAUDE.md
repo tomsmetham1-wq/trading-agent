@@ -332,7 +332,12 @@ driver must now carry `previous_driver_status`:
 - `"failed"` — evidence contradicted it. Prompt makes SELL the default and
   requires the thesis-break checklist to keep any of the position; code sets
   `driver_failed_on` and `played_out_bank_due()` returns True immediately
-  rather than in 12 weeks.
+  rather than in 12 weeks. `_inject_played_out_banks()` reads the failure off
+  THIS RUN'S RECS, not off the position -- `_apply_set_driver` writes
+  `driver_failed_on` at execution, which is after the guards, so reading the
+  position would fire the bank a week late and reintroduce the delay the rule
+  exists to remove. Skipped as normal when Claude's own recs already SELL/TRIM
+  the ticker.
 - `"superseded"` — the old driver still holds, the new one states it better.
   Leaves the 12-week clock alone.
 - Omitted → recorded as `"unstated"` and treated as failed. Declining to say
@@ -409,7 +414,7 @@ or requires a name to persist N weeks before it can be bought. Those were
 considered and rejected — they forfeit real upside to buy a filter the data
 doesn't yet justify. Revisit only once there are ~3 months of scores.
 
-Test suite: `test_trading_agent.py` (209 tests, no network). Run it after any
+Test suite: `test_trading_agent.py` (215 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the
