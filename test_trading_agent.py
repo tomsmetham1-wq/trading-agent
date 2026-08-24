@@ -1627,6 +1627,21 @@ class TestPlayedOutGiveback:
         pos = ledger["positions"]["X"]
         assert sp.played_out_bank_due(ledger, "X", pos, 70.0) is False
 
+    def test_small_winner_is_below_the_peak_floor(self):
+        # Peak +20%: a quarter of that gain is a 4.2% price fall, which is
+        # noise. The twelve-week clock is the only mechanism down here.
+        ledger = self._ledger(peak=20.0)
+        pos = ledger["positions"]["X"]
+        assert sp.played_out_giveback_pct(pos, 10.0) == pytest.approx(50.0)
+        assert sp.played_out_giveback_due(pos, 10.0) is False
+        assert sp.played_out_bank_due(ledger, "X", pos, 10.0) is False
+
+    def test_peak_at_the_floor_is_included(self):
+        ledger = self._ledger(peak=sp.PLAYED_OUT_GIVEBACK_MIN_PEAK_PCT)
+        pos = ledger["positions"]["X"]
+        floor = sp.PLAYED_OUT_GIVEBACK_MIN_PEAK_PCT
+        assert sp.played_out_giveback_due(pos, floor * 0.7) is True
+
     def test_trim_on_the_peak_date_does_not_clear_the_obligation(self):
         # DELL's peak is seeded from its 2026-08-10 trim, so peak date and
         # last-bank date are the same day. That trim happened at the top —

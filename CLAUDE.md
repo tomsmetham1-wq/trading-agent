@@ -345,7 +345,12 @@ break a thesis that had already played out, and was caught by nothing but the
 12-week drip — which is precisely the scenario kill criterion #2 describes.
 `update_played_out_peaks()` ratchets `played_out_peak_gain_pct` before the
 prompt is built; handing back `sp.PLAYED_OUT_GIVEBACK_PCT` (25%) of that peak
-makes the bank due early. 25% rather than 50% because 50% IS the kill
+makes the bank due early, but only once that peak is at least
+`sp.PLAYED_OUT_GIVEBACK_MIN_PEAK_PCT` (50%). The floor exists because the test
+measures the GAIN, so the price move it implies shrinks with the size of the
+winner: a quarter of the gain is a 16.7% fall at a +200% peak, 13.3% at +100%,
+but only 4.2% at +20% -- noise, not a giveback. Below the floor the 12-week
+clock is the only mechanism. 25% rather than 50% because 50% IS the kill
 criterion — acting there would only ever coincide with the shutdown it exists
 to prevent. Only a bank taken strictly AFTER the peak date clears the
 obligation (a trim on the peak date happened at the top). A missing peak is
@@ -404,7 +409,7 @@ or requires a name to persist N weeks before it can be bought. Those were
 considered and rejected — they forfeit real upside to buy a filter the data
 doesn't yet justify. Revisit only once there are ~3 months of scores.
 
-Test suite: `test_trading_agent.py` (207 tests, no network). Run it after any
+Test suite: `test_trading_agent.py` (209 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the

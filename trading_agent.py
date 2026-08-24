@@ -769,7 +769,7 @@ def _inject_played_out_banks(recs: list, ledger: dict,
         if pos.get("driver_failed_on"):
             reason = (f"forward driver failed {pos['driver_failed_on']}, "
                       f"nothing banked since")
-        elif giveback is not None and giveback >= sp.PLAYED_OUT_GIVEBACK_PCT:
+        elif sp.played_out_giveback_due(pos, gain_pct):
             reason = (f"handed back {giveback:.0f}% of its peak gain "
                       f"(+{pos.get('played_out_peak_gain_pct', 0):.0f}% peak, "
                       f"{gain_pct:+.0f}% now)")

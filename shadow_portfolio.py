@@ -1276,6 +1276,14 @@ PLAYED_OUT_REBANK_WEEKS = 12
 # is still something left to bank.
 PLAYED_OUT_GIVEBACK_PCT = 25.0
 
+# Peak gain a played-out position must have reached before the giveback test
+# applies at all. The test is measured on the GAIN, so the price move it
+# implies shrinks with the size of the winner: at a +200% peak it takes a 16.7%
+# fall to hand back a quarter, at +100% it takes 13.3%, but at +20% it takes
+# only 4.2% — noise, not a giveback. Below this floor the twelve-week clock is
+# the only mechanism, because there isn't enough profit at stake to protect.
+PLAYED_OUT_GIVEBACK_MIN_PEAK_PCT = 50.0
+
 
 def played_out_declared_date(pos: dict) -> Optional[str]:
     """
@@ -1321,6 +1329,23 @@ def played_out_giveback_pct(pos: dict, current_gain_pct: Optional[float]) -> Opt
     return max(0.0, (peak - current_gain_pct) / peak * 100.0)
 
 
+def played_out_giveback_due(pos: dict, current_gain_pct: Optional[float]) -> bool:
+    """
+    True when a played-out position has handed back enough of a big enough
+    peak gain to owe an early bank.
+
+    Both conditions matter: PLAYED_OUT_GIVEBACK_PCT of the gain surrendered,
+    on a peak of at least PLAYED_OUT_GIVEBACK_MIN_PEAK_PCT. The floor keeps
+    the rule off small winners, where a quarter of the gain is a few percent
+    of price and would fire on ordinary movement.
+    """
+    peak = pos.get("played_out_peak_gain_pct")
+    if peak is None or peak < PLAYED_OUT_GIVEBACK_MIN_PEAK_PCT:
+        return False
+    giveback = played_out_giveback_pct(pos, current_gain_pct)
+    return giveback is not None and giveback >= PLAYED_OUT_GIVEBACK_PCT
+
+
 def played_out_bank_due(ledger: dict, ticker: str, pos: dict,
                         current_gain_pct: Optional[float] = None) -> bool:
     """
@@ -1333,7 +1358,9 @@ def played_out_bank_due(ledger: dict, ticker: str, pos: dict,
          nothing has been banked since — a broken driver owes a bank now, not
          in twelve weeks.
       4. The position has handed back PLAYED_OUT_GIVEBACK_PCT of its peak gain
-         since being declared played out, with nothing banked since that peak.
+         since being declared played out, with nothing banked since that peak
+         — and that peak was at least PLAYED_OUT_GIVEBACK_MIN_PEAK_PCT, so the
+         rule stays off small winners where it would fire on noise.
 
     (4) closes the hole that mattered most: pre-committed trim levels are gains
     from ENTRY, so on a large winner they sit far above the current price and
@@ -1354,8 +1381,7 @@ def played_out_bank_due(ledger: dict, ticker: str, pos: dict,
     if failed_on and last_bank < failed_on:
         return True
 
-    giveback = played_out_giveback_pct(pos, current_gain_pct)
-    if giveback is not None and giveback >= PLAYED_OUT_GIVEBACK_PCT:
+    if played_out_giveback_due(pos, current_gain_pct):
         peak_date = pos.get("played_out_peak_date") or ""
         # Only a bank taken strictly AFTER the peak clears the obligation. A
         # trim on the peak date happened at the top, before any of the gain was
@@ -1485,12 +1511,24 @@ def _format_forward_driver(pos: dict, bank_due: bool = False) -> str:
     if peak is not None:
         block += (
             f"\n    Peak gain since declaration: {peak:+.1f}%"
-            f" (set {pos.get('played_out_peak_date', '?')}). Handing back"
-            f" {PLAYED_OUT_GIVEBACK_PCT:.0f}% of that peak forces the"
-            f" mechanical bank early — trim levels are entry-relative and only"
-            f"\n    trigger on a rally, so nothing else catches a played-out"
-            f" winner sliding back down."
+            f" (set {pos.get('played_out_peak_date', '?')})."
         )
+        if peak >= PLAYED_OUT_GIVEBACK_MIN_PEAK_PCT:
+            trigger_gain = peak * (1 - PLAYED_OUT_GIVEBACK_PCT / 100)
+            block += (
+                f" Handing back {PLAYED_OUT_GIVEBACK_PCT:.0f}% of that"
+                f"\n    peak — a fall to {trigger_gain:+.1f}% from entry —"
+                f" forces the mechanical bank early. Trim"
+                f"\n    levels are entry-relative and only trigger on a rally,"
+                f" so nothing else"
+                f"\n    catches a played-out winner sliding back down."
+            )
+        else:
+            block += (
+                f" Below the {PLAYED_OUT_GIVEBACK_MIN_PEAK_PCT:.0f}% peak"
+                f"\n    floor, so the giveback bank does not apply to this"
+                f" position."
+            )
 
     block += (
         "\n    REQUIRED THIS RUN — pick one, do not default to HOLD:"
