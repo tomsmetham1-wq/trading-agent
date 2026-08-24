@@ -1481,6 +1481,203 @@ class TestRealizedPnl:
         assert result["total_gbp"] == 0.0
 
 
+class TestTrimTriggerParsing:
+    """
+    DELL's alert was dead: the regex read a superseded level out of bracketed
+    commentary, and honoured-level counting started at first_bought when the
+    levels were set three months later.
+    """
+
+    def test_bracketed_commentary_is_not_a_trigger(self):
+        text = ("Trim 1/3 at +110% from entry (~£335/share) [EXECUTED THIS RUN]; "
+                "trim another 1/3 at +130% from entry (~£367/share) "
+                "[tightened from prior +150%/~£399 - old level was 17.4% above]")
+        assert ta._parse_trim_triggers(text) == [110.0, 130.0]
+
+    def test_plain_levels_still_parse(self):
+        assert ta._parse_trim_triggers(
+            "Trim 1/3 at +40%, trim another 1/3 at +80%.") == [40.0, 80.0]
+
+    def test_honoured_count_starts_at_first_set_trims(self):
+        pos = {"first_bought": "2026-04-26",
+               "pre_commit_trims": "Trim 1/3 at +110%, another 1/3 at +130%."}
+        ledger = {"positions": {"DELL": pos}, "trades": [
+            # Four cap-breach trims BEFORE any levels existed.
+            {"action": "TRIM", "ticker": "DELL", "date": "2026-05-10"},
+            {"action": "TRIM", "ticker": "DELL", "date": "2026-05-26"},
+            {"action": "TRIM", "ticker": "DELL", "date": "2026-06-01"},
+            {"action": "TRIM", "ticker": "DELL", "date": "2026-06-08"},
+            {"action": "SET_TRIMS", "ticker": "DELL", "date": "2026-07-27"},
+            {"action": "TRIM", "ticker": "DELL", "date": "2026-08-10"},
+        ]}
+        triggers, done = ta._trim_triggers_and_honoured(ledger, "DELL", pos)
+        assert triggers == [110.0, 130.0]
+        assert done == 1                      # not 5
+        assert len(triggers) > done           # the alert can fire at all
+
+    def test_restating_levels_does_not_reset_the_count(self):
+        pos = {"first_bought": "2026-04-26",
+               "pre_commit_trims": "Trim 1/3 at +110%, another 1/3 at +130%."}
+        ledger = {"positions": {"DELL": pos}, "trades": [
+            {"action": "SET_TRIMS", "ticker": "DELL", "date": "2026-07-27"},
+            {"action": "TRIM",      "ticker": "DELL", "date": "2026-08-10"},
+            {"action": "SET_TRIMS", "ticker": "DELL", "date": "2026-08-31"},
+        ]}
+        _, done = ta._trim_triggers_and_honoured(ledger, "DELL", pos)
+        assert done == 1
+
+
+class TestForwardDriverFailure:
+    """
+    A forward driver is the whole basis for holding a played-out position, so a
+    driver that FAILED is a thesis break. Before Aug 2026 nothing distinguished
+    a failed driver from a superseded one, and swapping in a fresh
+    justification was free.
+    """
+
+    def _played_out(self):
+        return {"shares": 10, "avg_cost_gbp": 100.0, "first_bought": "2026-04-26",
+                "thesis_played_out": True, "forward_driver": "Old driver.",
+                "forward_driver_set": "2026-07-27",
+                "forward_driver_history": [
+                    {"date": "2026-07-27", "driver": "Old driver."}]}
+
+    def test_failed_driver_records_break_and_makes_bank_due(self):
+        ledger = {"positions": {"X": self._played_out()}, "trades": [
+            {"action": "TRIM", "ticker": "X", "date": "2026-08-10"},
+        ]}
+        sp._apply_set_driver(ledger, {
+            "forward_driver": "New driver.",
+            "previous_driver_status": "failed",
+        }, "X", "2026-08-31")
+        pos = ledger["positions"]["X"]
+        assert pos["driver_failed_on"] == "2026-08-31"
+        # Trim on 10 Aug predates the failure, so a fresh bank is owed now —
+        # not in 12 weeks.
+        assert sp.played_out_bank_due(ledger, "X", pos) is True
+
+    def test_superseded_driver_leaves_the_twelve_week_clock_alone(self):
+        ledger = {"positions": {"X": self._played_out()}, "trades": [
+            {"action": "TRIM", "ticker": "X", "date": "2026-08-10"},
+        ]}
+        sp._apply_set_driver(ledger, {
+            "forward_driver": "New driver.",
+            "previous_driver_status": "superseded",
+        }, "X", "2026-08-31")
+        pos = ledger["positions"]["X"]
+        assert "driver_failed_on" not in pos
+        assert sp.played_out_bank_due(ledger, "X", pos) is False
+
+    def test_unstated_status_is_treated_as_failed(self):
+        ledger = {"positions": {"X": self._played_out()}, "trades": [
+            {"action": "TRIM", "ticker": "X", "date": "2026-08-10"},
+        ]}
+        sp._apply_set_driver(ledger, {"forward_driver": "New driver."},
+                             "X", "2026-08-31")
+        pos = ledger["positions"]["X"]
+        assert pos["forward_driver_history"][-1]["previous_driver_status"] == "unstated"
+        assert sp.played_out_bank_due(ledger, "X", pos) is True
+
+    def test_first_driver_needs_no_status(self):
+        ledger = {"positions": {"X": {"shares": 10, "avg_cost_gbp": 100.0,
+                                      "first_bought": "2026-04-26"}},
+                  "trades": []}
+        sp._apply_set_driver(ledger, {"forward_driver": "First driver."},
+                             "X", "2026-07-27")
+        pos = ledger["positions"]["X"]
+        assert "driver_failed_on" not in pos
+        assert "previous_driver_status" not in pos["forward_driver_history"][-1]
+
+
+class TestPlayedOutGiveback:
+    """
+    Trim levels are gains from ENTRY, so on a big winner they sit above the
+    price and only fire on a rally. A played-out winner sliding back down
+    passed no level and broke no thesis — the scenario kill criterion #2
+    describes, with no rule acting on it.
+    """
+
+    def _ledger(self, peak, peak_date="2026-08-10", last_trim="2026-08-03"):
+        pos = {"shares": 10, "avg_cost_gbp": 100.0, "first_bought": "2026-04-26",
+               "thesis_played_out": True, "forward_driver": "d",
+               "forward_driver_set": "2026-07-27",
+               "played_out_peak_gain_pct": peak,
+               "played_out_peak_date": peak_date}
+        return {"positions": {"X": pos}, "trades": [
+            {"action": "TRIM", "ticker": "X", "date": last_trim},
+        ]}
+
+    def test_giveback_percentage(self):
+        assert sp.played_out_giveback_pct({"played_out_peak_gain_pct": 100.0},
+                                          40.0) == pytest.approx(60.0)
+        assert sp.played_out_giveback_pct({"played_out_peak_gain_pct": 100.0},
+                                          100.0) == pytest.approx(0.0)
+
+    def test_bank_due_once_giveback_threshold_crossed(self):
+        ledger = self._ledger(peak=100.0)
+        pos = ledger["positions"]["X"]
+        # 80% gain = 20% of the peak handed back — under the 25% threshold.
+        assert sp.played_out_bank_due(ledger, "X", pos, 80.0) is False
+        # 70% gain = 30% handed back.
+        assert sp.played_out_bank_due(ledger, "X", pos, 70.0) is True
+
+    def test_bank_taken_after_the_peak_clears_the_obligation(self):
+        ledger = self._ledger(peak=100.0, peak_date="2026-08-10",
+                              last_trim="2026-08-17")
+        pos = ledger["positions"]["X"]
+        assert sp.played_out_bank_due(ledger, "X", pos, 70.0) is False
+
+    def test_trim_on_the_peak_date_does_not_clear_the_obligation(self):
+        # DELL's peak is seeded from its 2026-08-10 trim, so peak date and
+        # last-bank date are the same day. That trim happened at the top —
+        # it cannot count as banking a giveback that came later.
+        ledger = self._ledger(peak=113.6, peak_date="2026-08-10",
+                              last_trim="2026-08-10")
+        pos = ledger["positions"]["X"]
+        assert sp.played_out_bank_due(ledger, "X", pos, 80.0) is True
+
+    def test_peak_seeded_from_trade_history(self):
+        ledger = {
+            "positions": {"X": {
+                "avg_cost_gbp": 100.0, "thesis_played_out": True,
+                "forward_driver_set": "2026-07-27",
+            }},
+            "trades": [
+                {"action": "TRIM", "ticker": "X", "date": "2026-07-01",
+                 "price_gbp": 300.0},          # before declaration, ignored
+                {"action": "TRIM", "ticker": "X", "date": "2026-08-10",
+                 "price_gbp": 213.6},
+            ],
+        }
+        sp.update_played_out_peaks(
+            ledger, {"positions": {"X": {"pnl_pct": 100.0}}}, "2026-08-31")
+        pos = ledger["positions"]["X"]
+        assert pos["played_out_peak_gain_pct"] == pytest.approx(113.6)
+        assert pos["played_out_peak_date"] == "2026-08-10"
+
+    def test_peak_ratchets_up_only(self):
+        ledger = {"positions": {"X": {"thesis_played_out": True}}}
+        val = {"positions": {"X": {"pnl_pct": 100.0}}}
+        sp.update_played_out_peaks(ledger, val, "2026-08-24")
+        assert ledger["positions"]["X"]["played_out_peak_gain_pct"] == 100.0
+
+        val = {"positions": {"X": {"pnl_pct": 60.0}}}
+        sp.update_played_out_peaks(ledger, val, "2026-08-31")
+        assert ledger["positions"]["X"]["played_out_peak_gain_pct"] == 100.0
+        assert ledger["positions"]["X"]["played_out_peak_date"] == "2026-08-24"
+
+    def test_positions_not_played_out_get_no_peak(self):
+        ledger = {"positions": {"X": {}}}
+        sp.update_played_out_peaks(ledger, {"positions": {"X": {"pnl_pct": 50.0}}},
+                                   "2026-08-24")
+        assert "played_out_peak_gain_pct" not in ledger["positions"]["X"]
+
+    def test_missing_price_does_not_trigger_a_bank(self):
+        ledger = self._ledger(peak=100.0)
+        pos = ledger["positions"]["X"]
+        assert sp.played_out_bank_due(ledger, "X", pos, None) is False
+
+
 class TestTradeLogReconciliation:
     def test_clean_log_reconciles(self):
         ledger = {

@@ -198,6 +198,23 @@ SET_DRIVER replacing it, or TRIM/SELL. Only issue SET_DRIVER when the driver is
 new or changed — re-confirming an unchanged driver needs no action, just the
 evidence in section 3.
 
+A SET_DRIVER that REPLACES an existing driver must carry
+"previous_driver_status": "failed" or "superseded".
+  - "failed"     — evidence contradicted the old driver. A forward driver is
+                   the entire basis for holding a played-out position, so a
+                   failed one is a thesis break: SELL is the default, and
+                   retaining any of the position requires answering the
+                   thesis-break checklist and saying why you would buy it
+                   fresh today. A failed driver also makes the mechanical
+                   bank due immediately rather than in 12 weeks.
+  - "superseded" — the old driver still holds; the new one states the same
+                   case better or at larger scale. This is NOT for swapping in
+                   a fresh-sounding justification because the old one has gone
+                   quiet. If you cannot say the old driver is still true, it
+                   failed.
+Omitting the field is recorded as "unstated" and treated as "failed", because
+declining to say cannot be cheaper than saying it.
+
 **4. Watchlist**
 1–3 names to research further but not yet actionable, one line each.
 
@@ -251,7 +268,8 @@ Use this exact schema:
       "action": "SET_DRIVER",
       "ticker": "CAT",
       "yfinance_ticker": "CAT",
-      "forward_driver": "Entry thesis (trough multiple) is played out at +90%; hold now rests only on the $40bn dealer backlog underwriting 12-18 months of revenue at expanding margins, which I would buy fresh today."
+      "forward_driver": "Entry thesis (trough multiple) is played out at +90%; hold now rests only on the $40bn dealer backlog underwriting 12-18 months of revenue at expanding margins, which I would buy fresh today.",
+      "previous_driver_status": "superseded"
     }
   ],
   "watchlist": [

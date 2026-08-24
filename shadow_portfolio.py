@@ -599,14 +599,38 @@ def _apply_set_driver(ledger: dict, rec: dict, ticker: str, run_date: str) -> st
         return f"SKIP SET_DRIVER {ticker}: no forward_driver text provided"
 
     previous = (pos.get("forward_driver") or "").strip()
+    replacing = bool(previous and previous != driver)
+
+    # Why the old driver is going matters more than what replaces it. A driver
+    # that FAILED is a thesis break on the claim the position is being held by,
+    # and a break has always meant sell. A driver merely SUPERSEDED by a better
+    # framing is not. Nothing distinguished the two before, so a falsified
+    # driver could be swapped for a fresh one indefinitely at no cost — DELL's
+    # driver #1 was not tested and found valid on 2026-08-10, it was simply
+    # replaced when a better-sounding fact turned up.
+    status = (rec.get("previous_driver_status") or "").strip().lower()
+    if replacing and status not in ("failed", "superseded"):
+        status = "unstated"      # surfaced as a guard alert, never silent
+    elif not replacing:
+        status = ""
+
     pos["thesis_played_out"]  = True
     pos["forward_driver"]     = driver
     pos["forward_driver_set"] = run_date
     # History includes the current driver as its last element, so repeatedly
     # swapping in a fresh justification each week is itself visible.
-    pos.setdefault("forward_driver_history", []).append(
-        {"date": run_date, "driver": driver}
-    )
+    entry = {"date": run_date, "driver": driver}
+    if status:
+        entry["previous_driver_status"] = status
+    pos.setdefault("forward_driver_history", []).append(entry)
+
+    if status in ("failed", "unstated"):
+        # Drives the mechanical bank: a failed driver owes a bank now, not in
+        # twelve weeks. "unstated" is treated the same way — declining to say
+        # whether the old driver failed cannot be cheaper than saying it did.
+        pos["driver_failed_on"] = run_date
+    else:
+        pos.pop("driver_failed_on", None)
 
     trade = {
         "date":           run_date,
@@ -614,12 +638,14 @@ def _apply_set_driver(ledger: dict, rec: dict, ticker: str, run_date: str) -> st
         "ticker":         ticker,
         "forward_driver": driver,
     }
-    if previous and previous != driver:
+    if replacing:
         trade["replaces_driver"] = previous
+        trade["previous_driver_status"] = status
     ledger.setdefault("trades", []).append(trade)
 
-    if previous and previous != driver:
-        return f"SET_DRIVER {ticker}: {driver} (replaces: {previous})"
+    if replacing:
+        return (f"SET_DRIVER {ticker} [previous driver {status}]: {driver} "
+                f"(replaces: {previous})")
     return f"SET_DRIVER {ticker}: {driver}"
 
 
@@ -1243,6 +1269,13 @@ def _weeks_since(iso_date: str | None) -> Optional[int]:
 # remainder of a realized winner, never the whole position indefinitely.
 PLAYED_OUT_REBANK_WEEKS = 12
 
+# How much of a played-out position's PEAK gain may be handed back before the
+# mechanical bank fires early. Kill criterion #2 shuts the agent down when the
+# top contributor gives back >50% of its gains, so acting at 50% would only
+# ever coincide with the shutdown it exists to prevent — this fires while there
+# is still something left to bank.
+PLAYED_OUT_GIVEBACK_PCT = 25.0
+
 
 def played_out_declared_date(pos: dict) -> Optional[str]:
     """
@@ -1275,20 +1308,134 @@ def last_bank_since(ledger: dict, ticker: str, since: str) -> Optional[str]:
     return latest
 
 
-def played_out_bank_due(ledger: dict, ticker: str, pos: dict) -> bool:
+def played_out_giveback_pct(pos: dict, current_gain_pct: Optional[float]) -> Optional[float]:
     """
-    True when a played-out position owes a mechanical bank: no TRIM/SELL since
-    the played-out declaration, or the most recent one is at least
-    PLAYED_OUT_REBANK_WEEKS old.
+    How much of a played-out position's PEAK gain has been handed back, as a
+    percentage of that peak. None when there is no peak on record or no price.
+
+    Peak gain 100%, now 40% -> 60.0 (sixty percent of the gain surrendered).
+    """
+    peak = pos.get("played_out_peak_gain_pct")
+    if peak is None or current_gain_pct is None or peak <= 0:
+        return None
+    return max(0.0, (peak - current_gain_pct) / peak * 100.0)
+
+
+def played_out_bank_due(ledger: dict, ticker: str, pos: dict,
+                        current_gain_pct: Optional[float] = None) -> bool:
+    """
+    True when a played-out position owes a mechanical bank.
+
+    Three ways to owe one:
+      1. No TRIM/SELL since the played-out declaration.
+      2. The most recent one is at least PLAYED_OUT_REBANK_WEEKS old.
+      3. The forward driver FAILED (or its replacement declined to say), and
+         nothing has been banked since — a broken driver owes a bank now, not
+         in twelve weeks.
+      4. The position has handed back PLAYED_OUT_GIVEBACK_PCT of its peak gain
+         since being declared played out, with nothing banked since that peak.
+
+    (4) closes the hole that mattered most: pre-committed trim levels are gains
+    from ENTRY, so on a large winner they sit far above the current price and
+    only ever trigger on a rally. A played-out winner sliding back down passed
+    no level, could not break a thesis that had already played out, and was
+    caught by nothing except the twelve-week drip — which is the scenario kill
+    criterion #2 describes ("top contributor gives back >50% of gains").
     """
     declared = played_out_declared_date(pos)
     if not declared:
         return False
+
     last_bank = last_bank_since(ledger, ticker, declared)
     if last_bank is None:
         return True
+
+    failed_on = pos.get("driver_failed_on")
+    if failed_on and last_bank < failed_on:
+        return True
+
+    giveback = played_out_giveback_pct(pos, current_gain_pct)
+    if giveback is not None and giveback >= PLAYED_OUT_GIVEBACK_PCT:
+        peak_date = pos.get("played_out_peak_date") or ""
+        # Only a bank taken strictly AFTER the peak clears the obligation. A
+        # trim on the peak date happened at the top, before any of the gain was
+        # handed back — and when the peak is seeded from that very trim the two
+        # dates are identical, which is exactly DELL's case.
+        if last_bank <= peak_date:
+            return True
+
     weeks = _weeks_since(last_bank)
     return weeks is not None and weeks >= PLAYED_OUT_REBANK_WEEKS
+
+
+def _peak_from_trades(ledger: dict, ticker: str, pos: dict):
+    """
+    Best gain evidenced by a SELL/TRIM price since the played-out declaration,
+    as (gain_pct, date), or (None, None). Used only to seed a missing peak.
+    """
+    declared = played_out_declared_date(pos)
+    cost = pos.get("avg_cost_gbp")
+    if not declared or not cost:
+        return None, None
+
+    best, best_date = None, None
+    for t in ledger.get("trades", []):
+        if (t.get("ticker") != ticker
+                or t.get("action") not in ("SELL", "TRIM")
+                or (t.get("date") or "") < declared):
+            continue
+        price = t.get("price_gbp")
+        if not price:
+            continue
+        gain = (float(price) / float(cost) - 1) * 100.0
+        if best is None or gain > best:
+            best, best_date = gain, t.get("date")
+    return best, best_date
+
+
+def update_played_out_peaks(ledger: dict, valuation: dict, run_date: str) -> list[str]:
+    """
+    Record the high-water gain of every played-out position.
+
+    Runs before the guards each week so the giveback test in
+    played_out_bank_due() has a peak to measure against. The peak only ever
+    ratchets up; the date moves with it so a bank taken after a peak clears the
+    obligation until a new peak is set.
+    """
+    events: list[str] = []
+    positions_val = (valuation or {}).get("positions", {}) or {}
+
+    for ticker, pos in (ledger.get("positions") or {}).items():
+        if not pos.get("thesis_played_out"):
+            continue
+        gain = (positions_val.get(ticker) or {}).get("pnl_pct")
+        if gain is None:
+            continue
+        peak = pos.get("played_out_peak_gain_pct")
+        if peak is None:
+            # First time this position is measured. Starting the high-water
+            # mark at today's gain would forget everything it already reached:
+            # DELL was trimmed at +113.6% on 2026-08-10 and sits at +100.5%,
+            # so a cold start would erase a giveback that has already happened.
+            # Sells since the declaration are the only priced history there is.
+            seed, seed_date = _peak_from_trades(ledger, ticker, pos)
+            if seed is not None and seed > gain:
+                pos["played_out_peak_gain_pct"] = round(seed, 4)
+                pos["played_out_peak_date"] = seed_date
+                events.append(
+                    f"{ticker}: high-water gain seeded at {seed:+.1f}% from the "
+                    f"{seed_date} trim (now {gain:+.1f}%)"
+                )
+                continue
+        if peak is None or gain > peak:
+            pos["played_out_peak_gain_pct"] = round(gain, 4)
+            pos["played_out_peak_date"] = run_date
+            if peak is not None:
+                events.append(
+                    f"{ticker}: new high-water gain {gain:+.1f}% "
+                    f"(was {peak:+.1f}%)"
+                )
+    return events
 
 
 def _format_forward_driver(pos: dict, bank_due: bool = False) -> str:
@@ -1334,6 +1481,17 @@ def _format_forward_driver(pos: dict, bank_due: bool = False) -> str:
             "\n       its place — weigh that.)"
         )
 
+    peak = pos.get("played_out_peak_gain_pct")
+    if peak is not None:
+        block += (
+            f"\n    Peak gain since declaration: {peak:+.1f}%"
+            f" (set {pos.get('played_out_peak_date', '?')}). Handing back"
+            f" {PLAYED_OUT_GIVEBACK_PCT:.0f}% of that peak forces the"
+            f" mechanical bank early — trim levels are entry-relative and only"
+            f"\n    trigger on a rally, so nothing else catches a played-out"
+            f" winner sliding back down."
+        )
+
     block += (
         "\n    REQUIRED THIS RUN — pick one, do not default to HOLD:"
         "\n      (a) Confirm the driver is STILL live, citing evidence from the past"
@@ -1341,7 +1499,15 @@ def _format_forward_driver(pos: dict, bank_due: bool = False) -> str:
         "\n          with no new evidence is NOT a defence."
         "\n      (b) Replace it with a different forward driver you would underwrite"
         "\n          as a fresh BUY at today's price and weight — issue a new"
-        "\n          SET_DRIVER action so the replacement is on record."
+        "\n          SET_DRIVER action so the replacement is on record, and set"
+        "\n          \"previous_driver_status\" to \"failed\" or \"superseded\"."
+        "\n          FAILED means the old driver was contradicted by evidence:"
+        "\n          that is a thesis break on the claim this position is held by,"
+        "\n          so SELL is the default and keeping any of it needs the"
+        "\n          thesis-break checklist answered. SUPERSEDED means the old"
+        "\n          driver is still true but a better statement of the same case"
+        "\n          exists — it is NOT a licence to swap in a fresh justification"
+        "\n          because the old one grew stale."
         "\n      (c) TRIM or SELL and state where the freed capital goes."
     )
     if bank_due:

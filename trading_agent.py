@@ -483,6 +483,22 @@ PLAYED_OUT_BANK_TRIM_PCT = 33.0
 # e.g. "Trim 1/3 at +40%, trim another 1/3 at +80%."
 _TRIM_TRIGGER_RE = re.compile(r"\+\s*(\d+(?:\.\d+)?)\s*%")
 
+# Bracketed annotations carry commentary, not levels — DELL's stored text reads
+# "...at +130% [tightened from prior +150%/~£399 ...]", and parsing the whole
+# string picked up +150% as if it were a live trigger.
+_TRIM_ANNOTATION_RE = re.compile(r"\[[^\]]*\]")
+
+
+def _parse_trim_triggers(trims_text: str) -> list[float]:
+    """
+    Trim trigger percentages from a pre_commit_trims string, ascending.
+
+    Only the instruction survives: bracketed commentary is stripped first, so
+    superseded levels quoted in an explanation can't be mistaken for live ones.
+    """
+    cleaned = _TRIM_ANNOTATION_RE.sub(" ", trims_text or "")
+    return sorted(float(m) for m in _TRIM_TRIGGER_RE.findall(cleaned))
+
 
 def _rec_ticker(rec: dict) -> str:
     return (rec.get("yfinance_ticker") or rec.get("ticker") or "").strip()
@@ -499,14 +515,25 @@ def _trim_triggers_and_honoured(ledger: dict, ticker: str,
     so they compare directly against a position's pnl_pct. Honoured levels are
     counted as TRIM trades since the position was opened.
     """
-    triggers = sorted(
-        float(m) for m in
-        _TRIM_TRIGGER_RE.findall(pos.get("pre_commit_trims") or "")
+    triggers = _parse_trim_triggers(pos.get("pre_commit_trims") or "")
+    # Count from the date levels were FIRST set, not from when the position was
+    # opened. DELL's levels were set 2026-07-27 but it had already been trimmed
+    # four times for cap breaches since April, so counting from first_bought
+    # said four levels were honoured before any existed — the alert needed six
+    # levels hit when only three were parsed, and could never fire.
+    # Earliest rather than latest SET_TRIMS, so re-stating levels (which the
+    # tighten-only guard permits) can't reset the count and re-alert a level
+    # already acted on.
+    since = min(
+        (t.get("date", "") for t in ledger.get("trades", [])
+         if t.get("action") == "SET_TRIMS" and t.get("ticker") == ticker
+         and t.get("date")),
+        default=pos.get("first_bought", ""),
     )
     trims_done = sum(
         1 for t in ledger.get("trades", [])
         if t.get("action") == "TRIM" and t.get("ticker") == ticker
-        and t.get("date", "") >= pos.get("first_bought", "")
+        and t.get("date", "") >= since
     )
     return triggers, trims_done
 
@@ -606,6 +633,16 @@ def _forward_driver_alerts(recs: list, ledger: dict) -> list[str]:
             f"NOTE {ticker}: thesis played out - held on a forward driver "
             f"named {set_date}{age}, not the entry thesis"
         )
+        failed_on = pos.get("driver_failed_on")
+        if failed_on:
+            history = pos.get("forward_driver_history") or []
+            status = (history[-1].get("previous_driver_status")
+                      if history else None) or "failed"
+            alerts.append(
+                f"ALERT {ticker}: previous forward driver {status} on "
+                f"{failed_on} - a failed driver is a thesis break on the only "
+                f"claim holding this position; mechanical bank is due now"
+            )
         drivers = len(pos.get("forward_driver_history") or [])
         if drivers >= 3:
             alerts.append(
@@ -714,8 +751,9 @@ def _inject_played_out_banks(recs: list, ledger: dict,
     for ticker, pos in ledger.get("positions", {}).items():
         if ticker in acted:
             continue
+        gain_pct = (positions_val.get(ticker, {}) or {}).get("pnl_pct")
         if pos.get("thesis_played_out"):
-            due = sp.played_out_bank_due(ledger, ticker, pos)
+            due = sp.played_out_bank_due(ledger, ticker, pos, gain_pct)
             declared = sp.played_out_declared_date(pos) or "?"
         elif ticker in declared_this_run:
             due = True          # declared this very run, with no trim alongside
@@ -725,12 +763,24 @@ def _inject_played_out_banks(recs: list, ledger: dict,
         if not due:
             continue
 
+        # Name the reason — "12 weeks elapsed" and "the driver failed" are very
+        # different events and the email should not render them identically.
+        giveback = sp.played_out_giveback_pct(pos, gain_pct)
+        if pos.get("driver_failed_on"):
+            reason = (f"forward driver failed {pos['driver_failed_on']}, "
+                      f"nothing banked since")
+        elif giveback is not None and giveback >= sp.PLAYED_OUT_GIVEBACK_PCT:
+            reason = (f"handed back {giveback:.0f}% of its peak gain "
+                      f"(+{pos.get('played_out_peak_gain_pct', 0):.0f}% peak, "
+                      f"{gain_pct:+.0f}% now)")
+        else:
+            reason = f"no gain banked since declaration {declared}"
+
         value = (positions_val.get(ticker, {}) or {}).get("current_value_gbp")
         if value is None:
             events.append(
-                f"ALERT {ticker}: mechanical bank due (thesis played out, "
-                f"declared {declared}) but no live price this run - trim NOT "
-                f"forced, will retry next run"
+                f"ALERT {ticker}: mechanical bank due ({reason}) but no live "
+                f"price this run - trim NOT forced, will retry next run"
             )
             continue
         trim_value = value * PLAYED_OUT_BANK_TRIM_PCT / 100
@@ -748,15 +798,15 @@ def _inject_played_out_banks(recs: list, ledger: dict,
             "yfinance_ticker": ticker,
             "trim_pct": PLAYED_OUT_BANK_TRIM_PCT,
             "thesis_oneline": (
-                f"Mechanical bank: thesis played out (declared {declared}) "
-                f"with no gain banked since - strategy rule, not a thesis "
-                f"change. Forward driver carries the remaining position."
+                f"Mechanical bank: thesis played out (declared {declared}) - "
+                f"{reason}. Strategy rule, not a thesis change. Forward "
+                f"driver carries the remaining position."
             ),
             "guard_generated": True,
         })
         events.append(
-            f"FORCED TRIM {ticker}: thesis played out (declared {declared}) "
-            f"with no gain banked since - mechanically trimming "
+            f"FORCED TRIM {ticker}: thesis played out (declared {declared}) - "
+            f"{reason} - mechanically trimming "
             f"{PLAYED_OUT_BANK_TRIM_PCT:.0f}% (~£{trim_value:.2f}) to convert "
             f"paper alpha into realised alpha"
         )
@@ -982,14 +1032,8 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict) -> tuple[li
             # — moving the goalpost up removes the only mechanical exit.
             # Compared on the next un-hit trigger, the one that actually bites.
             pos = ledger_positions.get(ticker) or {}
-            old_triggers = sorted(
-                float(m) for m in
-                _TRIM_TRIGGER_RE.findall(pos.get("pre_commit_trims") or "")
-            )
-            new_triggers = sorted(
-                float(m) for m in
-                _TRIM_TRIGGER_RE.findall(rec.get("pre_commit_trims") or "")
-            )
+            old_triggers = _parse_trim_triggers(pos.get("pre_commit_trims") or "")
+            new_triggers = _parse_trim_triggers(rec.get("pre_commit_trims") or "")
             if old_triggers and new_triggers:
                 pnl_pct = (positions_val.get(ticker, {}) or {}).get("pnl_pct")
                 if pnl_pct is not None:
@@ -1332,6 +1376,12 @@ def run_weekly(started: datetime) -> None:
         pre_val["total_return_pct"],
         pre_val["benchmark_return_pct"] or 0,
     )
+
+    # Step 4b: ratchet the high-water gain on played-out positions BEFORE the
+    # prompt is built, so both Claude and the bank guard measure giveback
+    # against the same peak.
+    for e in sp.update_played_out_peaks(ledger, pre_val, run_date):
+        logger.info("[PEAK] %s", e)
 
     # Step 5: Claude analysis
     response, recs, watchlist = get_claude_recommendations(

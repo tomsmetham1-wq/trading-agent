@@ -227,6 +227,15 @@ before execution — prompt rules that were being violated are now mechanical:
   or the trim would be under £25.
 - **SET_TRIMS tighten-only** (added Aug 2026): blocks any SET_TRIMS that
   raises or removes the next un-hit trim trigger.
+- **Trim trigger parsing** (fixed Aug 2026): `_parse_trim_triggers()` strips
+  bracketed commentary before reading "+N%" levels, and honoured levels are
+  counted from the FIRST SET_TRIMS for that ticker, not from `first_bought`.
+  Both bugs were live on DELL and between them made its alert unfireable: the
+  regex read a superseded "+150%" out of an explanatory bracket, and four
+  cap-breach trims from May–June were counted as honouring levels that were
+  not set until 27 July — so the alert needed six levels hit when only three
+  parsed. Earliest rather than latest SET_TRIMS so re-stating levels cannot
+  reset the count and re-alert a level already acted on.
 - **60% theme cap** (added July 2026 after AI exposure hit 81% in June): BUYs
   whose `theme` label would push that theme above 60% are reduced or blocked.
   Exposure freed by same-run SELL/TRIM recs of the same theme is credited
@@ -313,6 +322,37 @@ winner is itself a signal. `thesis_played_out` is never cleared (a realized
 thesis doesn't un-realize); selling the position removes it with the position.
 DELL's driver was backfilled from the 2026-07-27 report.
 
+Driver failure is a thesis break (Aug 2026). A forward driver is the ENTIRE
+basis for holding a played-out position, so a driver contradicted by evidence
+is a break on that claim — but nothing distinguished a failed driver from a
+superseded one, and "name a new driver" was always available at no cost. DELL's
+driver #1 was not tested and found valid on 2026-08-10; it was simply replaced
+when a better-sounding fact appeared. A SET_DRIVER that replaces an existing
+driver must now carry `previous_driver_status`:
+- `"failed"` — evidence contradicted it. Prompt makes SELL the default and
+  requires the thesis-break checklist to keep any of the position; code sets
+  `driver_failed_on` and `played_out_bank_due()` returns True immediately
+  rather than in 12 weeks.
+- `"superseded"` — the old driver still holds, the new one states it better.
+  Leaves the 12-week clock alone.
+- Omitted → recorded as `"unstated"` and treated as failed. Declining to say
+  must not be cheaper than saying it.
+
+High-water giveback bank (Aug 2026). Pre-committed trim levels are gains from
+ENTRY, so on a large winner they sit far above the price and only ever fire on
+a rally. A played-out winner sliding back down passed no trim level, could not
+break a thesis that had already played out, and was caught by nothing but the
+12-week drip — which is precisely the scenario kill criterion #2 describes.
+`update_played_out_peaks()` ratchets `played_out_peak_gain_pct` before the
+prompt is built; handing back `sp.PLAYED_OUT_GIVEBACK_PCT` (25%) of that peak
+makes the bank due early. 25% rather than 50% because 50% IS the kill
+criterion — acting there would only ever coincide with the shutdown it exists
+to prevent. Only a bank taken strictly AFTER the peak date clears the
+obligation (a trim on the peak date happened at the top). A missing peak is
+seeded from the best SELL/TRIM price since declaration, not from today — DELL
+was trimmed at +113.6% and sits at +100.5%, so a cold start would have erased
+a giveback that already happened.
+
 Two advisory guards make the same thing visible outside the prompt (see the
 alerts list above) — without them the whole mechanism lived inside Claude's
 context and never reached the weekly email. The prompt also now requires that a
@@ -364,7 +404,7 @@ or requires a name to persist N weeks before it can be bought. Those were
 considered and rejected — they forfeit real upside to buy a filter the data
 doesn't yet justify. Revisit only once there are ~3 months of scores.
 
-Test suite: `test_trading_agent.py` (191 tests, no network). Run it after any
+Test suite: `test_trading_agent.py` (207 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the
