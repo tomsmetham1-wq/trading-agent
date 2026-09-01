@@ -1421,6 +1421,13 @@ def build_weekly_email_body(started: datetime, post_val: dict,
     if attribution:
         perf_section += "\n\n" + attribution
 
+    # Currency decomposition: the GBP P&L above blends the business with
+    # sterling, and nothing separated them until now.
+    fx_block = sp.format_fx_for_email(
+        sp.fx_neutral_returns(ledger, post_val))
+    if fx_block:
+        perf_section += "\n\n" + fx_block
+
     t212_section = (
         f"=== T212 Demo Account ===\n"
         f"  Account value:  £{t212_total:.2f}\n"

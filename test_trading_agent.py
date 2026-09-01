@@ -2396,3 +2396,130 @@ class TestCreateWithRetry:
         client = _FakeClient([exc, "final-message"])
         assert ta._create_with_retry(client) == "final-message"
         assert client.calls == 2
+
+
+class TestCurrencyDecomposition:
+    """
+    Every holding is priced in GBP, so its reported P&L blends what the business
+    did with what sterling did. Nothing separated them, which let a loss be
+    explained away as "a GBP FX artefact" with no number attached — done on
+    2026-09-01 for the three red AI names while the two largest real FX drags
+    sat on XOM and JPM, described in the same report as unqualified winners.
+    """
+
+    def _ledger(self, **over):
+        pos = {"shares": 10, "avg_cost_gbp": 100.0, "first_bought": "2026-04-26",
+               "fx_at_entry": 1.3466, "fx_basis": "estimated"}
+        pos.update(over)
+        return {"positions": {"AMZN": pos}, "trades": [], "cash_gbp": 1000.0}
+
+    def test_currency_from_ticker_suffix(self):
+        assert sp.position_currency("AMZN") == "USD"
+        assert sp.position_currency("SHEL.L") == "GBP"
+        assert sp.position_currency("ASML.AS") == "EUR"
+
+    def test_gbp_return_splits_into_business_and_currency(self, monkeypatch):
+        monkeypatch.setattr(sp, "_fx_rate", lambda pair: 1.3530)
+        out = sp.fx_neutral_returns(
+            self._ledger(), {"positions": {"AMZN": {"pnl_pct": -3.59}}})["AMZN"]
+        # Sterling barely moved: 1.3466 -> 1.3530 is 0.5%, so almost the whole
+        # loss is the business, not the currency.
+        assert out["local_pct"] == pytest.approx(-3.15, abs=0.05)
+        assert out["fx_pts"] == pytest.approx(-0.44, abs=0.05)
+
+    def test_fx_contribution_is_gbp_minus_native(self, monkeypatch):
+        monkeypatch.setattr(sp, "_fx_rate", lambda pair: 1.3530)
+        out = sp.fx_neutral_returns(
+            self._ledger(), {"positions": {"AMZN": {"pnl_pct": -3.59}}})["AMZN"]
+        assert out["gbp_pct"] - out["local_pct"] == pytest.approx(out["fx_pts"])
+
+    def test_sterling_weakness_flatters_the_gbp_return(self, monkeypatch):
+        # fx_now BELOW fx_at_entry means sterling fell: a USD asset translates
+        # into MORE pounds, so the GBP return overstates the business.
+        monkeypatch.setattr(sp, "_fx_rate", lambda pair: 1.2000)
+        out = sp.fx_neutral_returns(
+            self._ledger(), {"positions": {"AMZN": {"pnl_pct": 10.0}}})["AMZN"]
+        assert out["local_pct"] < out["gbp_pct"]
+        assert out["fx_pts"] > 0
+
+    def test_gbp_listed_position_has_no_currency_effect(self, monkeypatch):
+        monkeypatch.setattr(sp, "_fx_rate", lambda pair: 1.3530)
+        ledger = {"positions": {"SHEL.L": {
+            "shares": 10, "avg_cost_gbp": 25.0, "first_bought": "2026-04-26",
+            "fx_at_entry": 1.0, "fx_basis": "none"}}}
+        out = sp.fx_neutral_returns(
+            ledger, {"positions": {"SHEL.L": {"pnl_pct": 8.0}}})["SHEL.L"]
+        assert out["fx_pts"] == pytest.approx(0.0)
+
+    def test_position_with_no_entry_rate_is_omitted_not_guessed(self, monkeypatch):
+        monkeypatch.setattr(sp, "_fx_rate", lambda pair: 1.3530)
+        ledger = self._ledger()
+        ledger["positions"]["AMZN"].pop("fx_at_entry")
+        assert sp.fx_neutral_returns(
+            ledger, {"positions": {"AMZN": {"pnl_pct": -3.59}}}) == {}
+
+    def test_unavailable_live_rate_is_omitted_not_treated_as_no_effect(self, monkeypatch):
+        monkeypatch.setattr(sp, "_fx_rate", lambda pair: None)
+        assert sp.fx_neutral_returns(
+            self._ledger(), {"positions": {"AMZN": {"pnl_pct": -3.59}}}) == {}
+
+    def test_backfill_is_idempotent_and_does_not_refetch(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(sp, "fx_rate_on",
+                            lambda pair, d: calls.append(d) or 1.3466)
+        ledger = self._ledger()
+        ledger["positions"]["AMZN"].pop("fx_at_entry")
+        assert sp.ensure_entry_fx(ledger) != []
+        assert ledger["positions"]["AMZN"]["fx_basis"] == "estimated"
+        assert sp.ensure_entry_fx(ledger) == []      # already present
+        assert len(calls) == 1
+
+    def test_backfill_leaves_position_alone_when_rate_unavailable(self, monkeypatch):
+        monkeypatch.setattr(sp, "fx_rate_on", lambda pair, d: None)
+        ledger = self._ledger()
+        ledger["positions"]["AMZN"].pop("fx_at_entry")
+        sp.ensure_entry_fx(ledger)
+        assert "fx_at_entry" not in ledger["positions"]["AMZN"]
+
+    def test_new_buy_records_the_live_rate_as_actual(self, monkeypatch):
+        monkeypatch.setattr(sp, "fetch_price_gbp", lambda t: 100.0)
+        monkeypatch.setattr(sp, "_fx_rate", lambda pair: 1.3530)
+        ledger = {"positions": {}, "trades": [], "cash_gbp": 1000.0}
+        sp.apply_recommendations(ledger, [{
+            "action": "BUY", "ticker": "NVDA", "yfinance_ticker": "NVDA",
+            "amount_gbp": 500.0}], "2026-09-07")
+        pos = ledger["positions"]["NVDA"]
+        assert pos["fx_at_entry"] == pytest.approx(1.3530)
+        assert pos["fx_basis"] == "actual"
+
+    def test_top_up_blends_the_entry_rate_cost_weighted(self, monkeypatch):
+        monkeypatch.setattr(sp, "fetch_price_gbp", lambda t: 100.0)
+        monkeypatch.setattr(sp, "_fx_rate", lambda pair: 1.4000)
+        ledger = self._ledger(fx_basis="actual")   # 10 sh @ £100 = £1000 cost
+        ledger["cash_gbp"] = 1000.0
+        sp.apply_recommendations(ledger, [{
+            "action": "BUY", "ticker": "AMZN", "yfinance_ticker": "AMZN",
+            "amount_gbp": 1000.0}], "2026-09-07")
+        # Equal cost either side, so the blend sits midway.
+        assert ledger["positions"]["AMZN"]["fx_at_entry"] == pytest.approx(
+            (1.3466 + 1.4000) / 2)
+
+    def test_estimated_leg_keeps_the_whole_basis_estimated(self, monkeypatch):
+        monkeypatch.setattr(sp, "fetch_price_gbp", lambda t: 100.0)
+        monkeypatch.setattr(sp, "_fx_rate", lambda pair: 1.4000)
+        ledger = self._ledger()                    # fx_basis "estimated"
+        ledger["cash_gbp"] = 1000.0
+        sp.apply_recommendations(ledger, [{
+            "action": "BUY", "ticker": "AMZN", "yfinance_ticker": "AMZN",
+            "amount_gbp": 500.0}], "2026-09-07")
+        assert ledger["positions"]["AMZN"]["fx_basis"] == "estimated"
+
+    def test_prompt_review_warns_against_attributing_to_currency(self, monkeypatch):
+        monkeypatch.setattr(sp, "_fx_rate", lambda pair: 1.3530)
+        review = sp.build_fx_review(
+            self._ledger(), {"positions": {"AMZN": {"pnl_pct": -3.59}}})
+        assert "Currency decomposition" in review
+        assert "can never explain why one position is down" in review
+
+    def test_email_block_is_empty_when_nothing_can_be_decomposed(self):
+        assert sp.format_fx_for_email({}) == ""

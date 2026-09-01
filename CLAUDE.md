@@ -433,6 +433,44 @@ context and never reached the weekly email. The prompt also now requires that a
 played-out position's next trim level be within ~15% of TODAY's price, tightened
 via SET_TRIMS alongside the SET_DRIVER if it isn't.
 
+Currency decomposition (Sep 2026). Every holding is priced in GBP, so its
+reported P&L blends what the business did with what sterling did, and the
+prompt carried NO FX data at all -- every price in it is GBP. So "that loss is
+a GBP FX artefact" could be neither supported nor refuted from anything the
+agent was given, and on 2026-09-01 it was asserted for exactly the three red
+positions (NVDA, AMZN, GOOGL) and for none of the six green ones. The real
+numbers invert that: sterling moved from ~1.347 to ~1.353 over the whole
+period, so the FX drag on AMZN was 0.44pts of a 3.59% loss and on GOOGL
+0.44pts of 2.70%, while NVDA's was +0.07pts -- FX helped it slightly, so its
+loss is entirely real. The two largest drags, XOM at -2.83pts and JPM at
+-2.57pts, sat on positions the same report called unqualified winners.
+
+`fx_neutral_returns()` splits each position: `local_pct` is the return in the
+position's own currency, `(1 + gbp_return) * (fx_now / fx_at_entry) - 1`, and
+`fx_pts` is `gbp_pct - local_pct` (negative = sterling strength cost you).
+Surfaced by `build_fx_review()` in the prompt and `format_fx_for_email()` in
+the weekly email. The prompt block states the rule the numbers embody: an FX
+move is common to every holding in the same currency over the same window, so
+it can never explain why one position is down and another is up.
+
+`fx_at_entry` is recorded on the position. A BUY stores the live rate
+(`fx_basis: "actual"`) and a top-up blends it cost-weighted exactly as
+`avg_cost_gbp` does; an estimated leg keeps the whole basis estimated.
+`ensure_entry_fx()` runs before the prompt is built and reconstructs a missing
+rate from `fx_rate_on(pair, first_bought)`, marking it `"estimated"` -- for a
+position built from several buys that is the first rate, not the blend, so it
+is the right order of magnitude and not exact, in the same spirit as
+`tickers_with_estimated_basis`. It is idempotent, so it costs one FX history
+fetch on the first run and nothing after, and it doubles as the backfill --
+no migration script. A position with no stored entry rate or no live rate is
+OMITTED from the decomposition rather than guessed at; a missing rate must
+never read as "no FX effect".
+
+Note `fx_rate_on()` and `_fx_rate()` need `os_ca_bundle.ensure_os_ca_bundle()`
+to have run (it does, at shadow_portfolio import). Importing yfinance directly
+in a scratch script skips it and every FX call fails with "unable to get local
+issuer certificate".
+
 Watchlist recording (Aug 2026) — RECORDING ONLY, deliberately not a gate:
 `ledger["watchlist"]` tracks every name Claude flags in section 4, with the
 price at first mention and a weekly observation thereafter. Claude emits an
@@ -478,7 +516,7 @@ or requires a name to persist N weeks before it can be bought. Those were
 considered and rejected — they forfeit real upside to buy a filter the data
 doesn't yet justify. Revisit only once there are ~3 months of scores.
 
-Test suite: `test_trading_agent.py` (232 tests, no network). Run it after any
+Test suite: `test_trading_agent.py` (246 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the

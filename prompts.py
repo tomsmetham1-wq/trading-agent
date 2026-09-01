@@ -379,6 +379,7 @@ recommendation had been executed) ===
 === Thesis accountability ===
 {thesis_review}
 
+{fx_review}
 {watchlist_review}
 Today: {today}
 
@@ -615,6 +616,7 @@ def build_prompt(shadow_val: dict, shadow_ledger: dict,
         trade_history=(json.dumps(recent_trades, indent=2, default=str)
                        if recent_trades else "(none yet)"),
         thesis_review=sp.build_thesis_review(shadow_ledger, shadow_val),
+        fx_review=sp.build_fx_review(shadow_ledger, shadow_val),
         watchlist_review=sp.build_watchlist_review(shadow_ledger),
         today=datetime.now().strftime("%A, %d %B %Y"),
     )

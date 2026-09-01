@@ -347,6 +347,131 @@ def _fx_rate(pair: str) -> Optional[float]:
         return None
 
 
+# Currency a listing trades in, by yfinance suffix. Everything unsuffixed on
+# yfinance is US-listed and therefore USD.
+_SUFFIX_CURRENCY = {"L": "GBP", "AS": "EUR", "DE": "EUR", "PA": "EUR",
+                    "MI": "EUR", "MC": "EUR", "BR": "EUR", "IR": "EUR"}
+FX_PAIR_BY_CURRENCY = {"USD": "GBPUSD=X", "EUR": "GBPEUR=X"}
+
+
+def position_currency(yf_ticker: str) -> str:
+    """Native trading currency for a yfinance ticker, from its suffix."""
+    if "." in yf_ticker:
+        return _SUFFIX_CURRENCY.get(yf_ticker.rsplit(".", 1)[1].upper(), "USD")
+    return "USD"
+
+
+_fx_history_cache: dict = {}
+
+
+def fx_rate_on(pair: str, date_iso: str) -> Optional[float]:
+    """
+    The FX rate on a past date — the last close at or before it.
+
+    Used to reconstruct the rate a position was entered at, so a GBP return can
+    be split into the part the business earned and the part the currency moved.
+    Falls back to the earliest available close when the date predates the
+    series, and returns None if the fetch fails; callers must treat a missing
+    rate as "unknown", never as "no FX effect".
+    """
+    if pair not in _fx_history_cache:
+        try:
+            hist = yf.Ticker(pair).history(period="2y")["Close"]
+            _fx_history_cache[pair] = {
+                d.strftime("%Y-%m-%d"): float(v) for d, v in hist.items()
+            }
+        except Exception as e:
+            logger.warning("FX history fetch failed for %s: %s", pair, e)
+            _fx_history_cache[pair] = {}
+    series = _fx_history_cache[pair]
+    if not series:
+        return None
+    on_or_before = [d for d in series if d <= date_iso]
+    if on_or_before:
+        return series[max(on_or_before)]
+    return series[min(series)]        # position predates the series
+
+
+def ensure_entry_fx(ledger: dict) -> list[str]:
+    """
+    Backfill fx_at_entry on any position missing it, from the rate on
+    first_bought. Idempotent: a position that already carries the field is left
+    alone, so this costs one FX history fetch on the first run and nothing after.
+
+    A rate reconstructed from first_bought is marked fx_basis "estimated" — for
+    a position built from several buys at different rates it is the first one,
+    not the cost-weighted blend that a position bought under this code records.
+    Right order of magnitude, not exact, in the same spirit as
+    tickers_with_estimated_basis in the realised-P&L replay.
+
+    Returns a list of human-readable notes for the run log.
+    """
+    notes: list[str] = []
+    for ticker, pos in (ledger.get("positions") or {}).items():
+        if pos.get("fx_at_entry") or not pos.get("first_bought"):
+            continue
+        currency = position_currency(ticker)
+        if currency == "GBP":
+            pos["fx_at_entry"] = 1.0
+            pos["fx_basis"] = "none"        # no currency risk to decompose
+            continue
+        pair = FX_PAIR_BY_CURRENCY.get(currency)
+        rate = fx_rate_on(pair, pos["first_bought"]) if pair else None
+        if rate is None:
+            continue                        # leave absent; retry next run
+        pos["fx_at_entry"] = rate
+        pos["fx_basis"] = "estimated"
+        notes.append(f"{ticker}: entry FX {rate:.4f} ({pos['first_bought']})")
+    return notes
+
+
+def fx_neutral_returns(ledger: dict, valuation_result: dict) -> dict:
+    """
+    Split each position's GBP return into the business return and the currency.
+
+    Every holding is priced in GBP, so a USD position's reported P&L blends what
+    the company did with what sterling did, and nothing in the ledger separated
+    them. That let a losing position be explained away as "a GBP FX artefact"
+    with no number attached — and on 2026-09-01 it was, for the three red AI
+    names, while the largest actual FX drags sat on XOM and JPM, which the same
+    report described as unqualified winners.
+
+    local_pct is the return in the position's own currency:
+        (1 + gbp_return) * (fx_now / fx_at_entry) - 1
+    fx_pts is gbp_pct - local_pct: negative means sterling strength cost you,
+    positive means it helped.
+
+    Returns {ticker: {gbp_pct, local_pct, fx_pts, currency, estimated}} for the
+    positions it can decompose. A position with no stored entry rate, no live
+    rate, or no P&L is omitted rather than guessed at.
+    """
+    out: dict = {}
+    positions = ledger.get("positions") or {}
+    for ticker, pv in (valuation_result.get("positions") or {}).items():
+        pos = positions.get(ticker) or {}
+        gbp_pct = pv.get("pnl_pct")
+        fx0 = pos.get("fx_at_entry")
+        if gbp_pct is None or not fx0:
+            continue
+        currency = position_currency(ticker)
+        if currency == "GBP":
+            fx_now = 1.0
+        else:
+            pair = FX_PAIR_BY_CURRENCY.get(currency)
+            fx_now = _fx_rate(pair) if pair else None
+        if not fx_now:
+            continue
+        local_pct = ((1 + gbp_pct / 100) * (fx_now / fx0) - 1) * 100
+        out[ticker] = {
+            "gbp_pct":   gbp_pct,
+            "local_pct": local_pct,
+            "fx_pts":    gbp_pct - local_pct,
+            "currency":  currency,
+            "estimated": pos.get("fx_basis") == "estimated",
+        }
+    return out
+
+
 def fetch_price_gbp(yf_ticker: str) -> Optional[float]:
     """
     Fetch the latest price for a ticker and return it in GBP.
@@ -436,10 +561,32 @@ def _apply_buy(ledger: dict, rec: dict, ticker: str,
     pre_commit_trims = (rec.get("pre_commit_trims") or "").strip()
     positions = ledger["positions"]
 
+    # Rate this buy actually went on at, so the position's GBP return can later
+    # be split from the currency's contribution. A top-up blends cost-weighted,
+    # exactly as avg_cost_gbp does; the blend is only as good as its weakest
+    # part, so an estimated leg keeps the whole basis estimated.
+    currency = position_currency(ticker)
+    if currency == "GBP":
+        buy_fx, buy_basis = 1.0, "none"
+    else:
+        pair = FX_PAIR_BY_CURRENCY.get(currency)
+        buy_fx = _fx_rate(pair) if pair else None
+        buy_basis = "actual" if buy_fx else None
+
     if ticker in positions:
         # Adding to an existing position: recalculate weighted average cost
         pos = positions[ticker]
-        total_cost = pos["shares"] * pos["avg_cost_gbp"] + amount_gbp
+        prior_cost = pos["shares"] * pos["avg_cost_gbp"]
+        total_cost = prior_cost + amount_gbp
+        prior_fx = pos.get("fx_at_entry")
+        if buy_fx and prior_fx and total_cost > 0:
+            pos["fx_at_entry"] = (
+                (prior_cost * prior_fx + amount_gbp * buy_fx) / total_cost)
+            if pos.get("fx_basis") != "estimated":
+                pos["fx_basis"] = buy_basis
+        elif buy_fx and not prior_fx:
+            pos["fx_at_entry"] = buy_fx
+            pos["fx_basis"] = "estimated"   # earlier legs went on at unknown rates
         pos["shares"] += shares
         pos["avg_cost_gbp"] = total_cost / pos["shares"]
         # Append the new thesis alongside the original so history is preserved
@@ -457,6 +604,9 @@ def _apply_buy(ledger: dict, rec: dict, ticker: str,
             "first_bought": run_date,
             "thesis":       thesis,
         }
+        if buy_fx:
+            positions[ticker]["fx_at_entry"] = buy_fx
+            positions[ticker]["fx_basis"] = buy_basis
         if theme:
             positions[ticker]["theme"] = theme
         if pre_commit_trims:
@@ -2030,6 +2180,72 @@ def format_attribution_for_email(val: dict) -> str:
             f"P&L: £{p['pnl_gbp']:>+8.2f} ({p['pnl_pct']:>+6.2f}%)  "
             f"contrib: {contrib:>+5.2f}pts"
         )
+    return "\n".join(lines)
+
+
+def build_fx_review(ledger: dict, valuation_result: dict) -> str:
+    """
+    Currency decomposition section for the weekly prompt.
+
+    The prompt carried no FX data at all — every price in it is GBP — so a
+    claim like "the loss is a GBP FX artefact" could be neither supported nor
+    refuted from anything the agent was given, and on 2026-09-01 it was made
+    for exactly the three red positions while the two largest real FX drags
+    sat on positions described as unqualified winners. Putting the split in
+    front of Claude makes the currency claim answerable with a number.
+    """
+    fx = fx_neutral_returns(ledger, valuation_result)
+    if not fx:
+        return ""
+    lines = ["=== Currency decomposition (GBP return vs native return) ==="]
+    for ticker, d in sorted(fx.items(), key=lambda x: x[1]["fx_pts"]):
+        est = " (entry rate estimated)" if d["estimated"] else ""
+        lines.append(
+            f"  {ticker:<6} GBP {d['gbp_pct']:>+7.2f}%  "
+            f"{d['currency']} {d['local_pct']:>+7.2f}%  "
+            f"FX contribution {d['fx_pts']:>+5.2f}pts{est}"
+        )
+    drags = [d["fx_pts"] for d in fx.values()]
+    lines.append(
+        f"  Range across the book: {min(drags):+.2f} to {max(drags):+.2f} pts."
+    )
+    lines.append(
+        "  READ THIS BEFORE ATTRIBUTING ANYTHING TO CURRENCY: the FX move is\n"
+        "  common to every holding in the same currency over the same window,\n"
+        "  so it can never explain why one position is down and another is up.\n"
+        "  The native-currency column is what the business did. Do not describe\n"
+        "  a loss as an FX artefact unless the FX contribution column above\n"
+        "  actually accounts for it, and quote the number when you do."
+    )
+    return "\n".join(lines) + "\n"
+
+
+def format_fx_for_email(fx: dict) -> str:
+    """
+    Format the currency decomposition for the weekly email.
+
+    Every holding is priced in GBP, so the reported P&L blends the business with
+    sterling. Showing both side by side is the only thing that makes a claim
+    like "that loss is a GBP FX artefact" checkable rather than rhetorical.
+    """
+    if not fx:
+        return ""
+    lines = ["Currency decomposition (GBP return vs native return):"]
+    for ticker, d in sorted(fx.items(), key=lambda x: x[1]["fx_pts"]):
+        est = " ~" if d["estimated"] else "  "
+        lines.append(
+            f"  {ticker:<6}{est}GBP {d['gbp_pct']:>+7.2f}%   "
+            f"{d['currency']} {d['local_pct']:>+7.2f}%   "
+            f"FX {d['fx_pts']:>+5.2f}pts"
+        )
+    drags = [d["fx_pts"] for d in fx.values()]
+    lines.append(
+        f"  ---\n  FX moved the book between {min(drags):+.2f} and "
+        f"{max(drags):+.2f} pts. It applies to every USD holding at once,\n"
+        f"  so it cannot explain why one position is down and another is up."
+    )
+    if any(d["estimated"] for d in fx.values()):
+        lines.append("  (~ entry rate reconstructed from first_bought, not exact.)")
     return "\n".join(lines)
 
 
