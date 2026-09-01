@@ -1697,8 +1697,19 @@ class TestDriverFailureBanksSameRun:
     def test_omitted_status_banks_in_the_same_run(self):
         assert len(self._injected(self._driver())) == 1
 
-    def test_superseded_driver_does_not_bank(self):
-        assert self._injected(self._driver("superseded")) == []
+    def test_superseded_driver_banks_at_the_reduced_rate(self):
+        # "superseded" used to cost nothing, which made the label a free
+        # option — taken on DELL the first week it existed. It now costs less
+        # than "failed", never nothing.
+        injected = self._injected(self._driver("superseded"))
+        assert len(injected) == 1
+        assert injected[0]["trim_pct"] == ta.PLAYED_OUT_SUPERSEDE_TRIM_PCT
+
+    def test_failed_driver_costs_more_than_superseded(self):
+        failed = self._injected(self._driver("failed"))[0]["trim_pct"]
+        superseded = self._injected(self._driver("superseded"))[0]["trim_pct"]
+        assert failed == ta.PLAYED_OUT_BANK_TRIM_PCT
+        assert failed > superseded
 
     def test_claude_selling_it_itself_pre_empts_the_injection(self):
         recs = self._driver("failed") + [
@@ -1717,6 +1728,78 @@ class TestDriverFailureBanksSameRun:
         recs = [{"action": "SET_DRIVER", "ticker": "X", "yfinance_ticker": "X",
                  "forward_driver": "Old driver."}]
         assert self._injected(recs) == []
+
+
+class TestDriverChurnEscalation:
+    """
+    The COUNT of drivers named for one position is itself the signal: a hold
+    re-argued from scratch every few weeks is carried by churn, not by a claim.
+    DELL reached driver #3 in five weeks, each "confirmed with fresh evidence".
+    The count bites whatever the label says.
+    """
+
+    def _ledger(self, history_len):
+        history = [{"date": "2026-07-27", "driver": f"d{i}"}
+                   for i in range(history_len)]
+        return {"positions": {"X": {
+            "shares": 10, "avg_cost_gbp": 100.0, "first_bought": "2026-04-26",
+            "thesis_played_out": True, "forward_driver": "Old driver.",
+            "forward_driver_set": "2026-08-24",
+            "forward_driver_history": history,
+        }}, "trades": [{"action": "TRIM", "ticker": "X", "date": "2026-08-24"}]}
+
+    def _val(self):
+        return {"positions": {"X": {"pnl_pct": 110.0,
+                                    "current_value_gbp": 686.84}}}
+
+    def _injected(self, history_len, status="superseded"):
+        recs = [{"action": "SET_DRIVER", "ticker": "X", "yfinance_ticker": "X",
+                 "forward_driver": "New driver.",
+                 "previous_driver_status": status}]
+        out, events = ta._inject_played_out_banks(
+            recs, self._ledger(history_len), self._val())
+        return [r for r in out if r.get("guard_generated")], events
+
+    def test_second_driver_banks_at_the_supersede_rate(self):
+        injected, _ = self._injected(1)
+        assert injected[0]["trim_pct"] == ta.PLAYED_OUT_SUPERSEDE_TRIM_PCT
+
+    def test_third_driver_banks_the_full_third_despite_superseded(self):
+        injected, _ = self._injected(2)
+        assert injected[0]["action"] == "TRIM"
+        assert injected[0]["trim_pct"] == ta.PLAYED_OUT_BANK_TRIM_PCT
+
+    def test_fourth_driver_exits_the_position(self):
+        injected, events = self._injected(3)
+        assert injected[0]["action"] == "SELL"
+        assert any("FORCED SELL X" in e for e in events)
+
+    def test_legacy_driver_with_no_history_counts_as_the_first(self):
+        # A position can carry a driver predating forward_driver_history; the
+        # driver on record is #1, so the replacement is #2, not #1.
+        ledger = self._ledger(0)
+        recs = [{"action": "SET_DRIVER", "ticker": "X", "yfinance_ticker": "X",
+                 "forward_driver": "New driver.",
+                 "previous_driver_status": "superseded"}]
+        out, _ = ta._inject_played_out_banks(recs, ledger, self._val())
+        injected = [r for r in out if r.get("guard_generated")]
+        assert injected[0]["trim_pct"] == ta.PLAYED_OUT_SUPERSEDE_TRIM_PCT
+
+    def test_claude_acting_itself_still_pre_empts_the_escalation(self):
+        recs = [{"action": "SET_DRIVER", "ticker": "X", "yfinance_ticker": "X",
+                 "forward_driver": "New driver.",
+                 "previous_driver_status": "superseded"},
+                {"action": "TRIM", "ticker": "X", "yfinance_ticker": "X",
+                 "trim_pct": 40}]
+        out, _ = ta._inject_played_out_banks(recs, self._ledger(3), self._val())
+        assert [r for r in out if r.get("guard_generated")] == []
+
+    def test_churn_alert_counts_the_driver_named_this_run(self):
+        recs = [{"action": "SET_DRIVER", "ticker": "X", "yfinance_ticker": "X",
+                 "forward_driver": "New driver.",
+                 "previous_driver_status": "superseded"}]
+        alerts = ta._forward_driver_alerts(recs, self._ledger(2))
+        assert any("3 different forward drivers" in a for a in alerts)
 
 
 class TestPlayedOutGiveback:

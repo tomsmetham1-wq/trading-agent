@@ -1284,6 +1284,38 @@ PLAYED_OUT_GIVEBACK_PCT = 25.0
 # the only mechanism, because there isn't enough profit at stake to protect.
 PLAYED_OUT_GIVEBACK_MIN_PEAK_PCT = 50.0
 
+# Declaring a thesis played out costs a third of the position: the forward
+# driver may carry the remainder, never the whole win. If Claude doesn't
+# include the trim itself, this is the one injected mechanically.
+PLAYED_OUT_BANK_TRIM_PCT = 33.0
+
+# Replacing a live forward driver costs something even when the old one is
+# declared "superseded" rather than "failed" (Sep 2026).
+#
+# The failed/superseded split was meant to separate a driver contradicted by
+# evidence from one merely restated better. It priced them at 33% and NOTHING,
+# which made the label a free-text field with a third of a position attached
+# and no adjudication — so the label drifts towards the cheap word whatever the
+# evidence says. It did exactly that on its first live run: on 2026-09-01 DELL's
+# driver #2 ("ISG margin-expansion story") was replaced after Claude itself
+# quoted ISG operating margin FALLING 110bp, and the swap was filed as
+# "superseded", banking nothing on a +110% position.
+#
+# The fix is not a better definition of "failed" — no prompt wording survives a
+# free option. Rewriting the reason you hold a realized winner is evidence about
+# the hold whatever the reason, so every replacement banks. The label now sets
+# the SIZE, not whether money moves: an honest "failed" still costs more, but
+# "superseded" can no longer cost nothing.
+PLAYED_OUT_SUPERSEDE_TRIM_PCT = 15.0
+
+# Churn escalation: the count of drivers named for one position is itself the
+# signal. Naming a third distinct driver banks the full third whatever the
+# label; a fourth exits the position. DELL reached driver #3 in five weeks,
+# each one "confirmed with fresh evidence" — for a secular theme there always
+# is some, which is why the count, not the content, has to be what bites.
+DRIVER_CHURN_BANK_COUNT = 3
+DRIVER_CHURN_EXIT_COUNT = 4
+
 
 def played_out_declared_date(pos: dict) -> Optional[str]:
     """
@@ -1546,6 +1578,18 @@ def _format_forward_driver(pos: dict, bank_due: bool = False) -> str:
         "\n          driver is still true but a better statement of the same case"
         "\n          exists — it is NOT a licence to swap in a fresh justification"
         "\n          because the old one grew stale."
+        f"\n          EITHER LABEL BANKS. Replacing a live driver"
+        f" costs {PLAYED_OUT_SUPERSEDE_TRIM_PCT:.0f}% of the position if"
+        "\n          superseded and"
+        f" {PLAYED_OUT_BANK_TRIM_PCT:.0f}% if failed, injected"
+        "\n          automatically unless your own recs trim or sell"
+        "\n          the ticker. The label sets the SIZE, never"
+        "\n          whether the bank happens, so choose it on the"
+        "\n          evidence and not on the cost."
+        f"\n          Driver #{DRIVER_CHURN_BANK_COUNT} for one"
+        f" position banks the full {PLAYED_OUT_BANK_TRIM_PCT:.0f}% whatever"
+        f"\n          the label; driver #{DRIVER_CHURN_EXIT_COUNT}"
+        " exits it outright."
         "\n      (c) TRIM or SELL and state where the freed capital goes."
     )
     if bank_due:
@@ -1554,7 +1598,8 @@ def _format_forward_driver(pos: dict, bank_due: bool = False) -> str:
             "\n    since declaration (or in the last 12 weeks). Options (a) and (b)"
             "\n    keep the hold but do NOT waive the bank — unless your"
             "\n    recommendations include a TRIM or SELL for this ticker, the"
-            "\n    system will automatically add a 33% TRIM this run. Recommend"
+            f"\n    system will automatically add a"
+        f" {PLAYED_OUT_BANK_TRIM_PCT:.0f}% TRIM this run. Recommend"
             "\n    your own trim (with sizing and destination for the proceeds)"
             "\n    rather than letting the mechanical default decide."
         )

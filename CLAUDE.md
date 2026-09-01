@@ -363,6 +363,50 @@ driver must now carry `previous_driver_status`:
 - Omitted → recorded as `"unstated"` and treated as failed. Declining to say
   must not be cheaper than saying it.
 
+Every driver replacement banks (Sep 2026). The failed/superseded split above
+priced a replacement at 33% or at NOTHING, decided by a free-text field that
+Claude fills in about its own reasoning with nothing adjudicating it. That is a
+free option, and it was taken the first week it existed: on 2026-09-01 DELL's
+driver #2 ("ISG margin-expansion story") was replaced after the report itself
+quoted ISG operating margin FALLING 110bp -- evidence contradicting the driver,
+which is the definition of `"failed"` -- and the swap was filed `"superseded"`,
+banking nothing on a +110% position that is 11% of the book.
+
+The fix is not a sharper definition of "failed"; no prompt wording survives a
+free option. The label now sets the SIZE of the bank, never whether one
+happens:
+- `"failed"` / `"unstated"` -> `PLAYED_OUT_BANK_TRIM_PCT` (33%), as before.
+- `"superseded"` -> `PLAYED_OUT_SUPERSEDE_TRIM_PCT` (15%). Rewriting the reason
+  you hold a realized winner is evidence about the hold whatever the reason.
+  Honest labelling still saves 18 points, so the incentive points the right
+  way; it just cannot reach zero.
+- A SET_DRIVER naming a position's FIRST driver, or restating the existing one
+  verbatim, is not a replacement and banks nothing.
+
+Above that the driver COUNT escalates regardless of label, because a hold
+re-argued from scratch every few weeks is carried by churn, not by a claim:
+`DRIVER_CHURN_BANK_COUNT` (#3) banks the full 33%, `DRIVER_CHURN_EXIT_COUNT`
+(#4) exits the position outright. DELL reached driver #3 in five weeks, each
+one "confirmed with fresh evidence" -- for a secular theme there always is
+some, which is why the count and not the content has to be what bites. Under
+this rule the 1 Sep DELL swap banks £227 on either label, and DELL now stands
+at driver #3: the next replacement, whatever it is called, closes the position.
+
+All four constants live in `shadow_portfolio.py` beside the other played-out
+policy numbers (`build_thesis_review()` quotes them into the prompt, so they
+cannot live in `trading_agent.py` without an import cycle); `trading_agent.py`
+aliases them. The prompt states the price list, so the label is chosen with the
+cost known rather than discovered afterwards.
+
+`_driver_replacements()` reads replacements off THIS RUN'S RECS, never off the
+position -- `_apply_set_driver` appends to `forward_driver_history` and writes
+`driver_failed_on` at execution, which is after the guards, so reading the
+position fires every consequence a week late. That bug was already fixed once
+for the failed-driver bank and was still live in `_forward_driver_alerts()`,
+where the churn alert counted only executed history: DELL named driver #3 on
+1 Sep and the "3 different forward drivers" alert did not fire. Both now share
+the one helper.
+
 High-water giveback bank (Aug 2026). Pre-committed trim levels are gains from
 ENTRY, so on a large winner they sit far above the price and only ever fire on
 a rally. A played-out winner sliding back down passed no trim level, could not
@@ -434,7 +478,7 @@ or requires a name to persist N weeks before it can be bought. Those were
 considered and rejected — they forfeit real upside to buy a filter the data
 doesn't yet justify. Revisit only once there are ~3 months of scores.
 
-Test suite: `test_trading_agent.py` (225 tests, no network). Run it after any
+Test suite: `test_trading_agent.py` (232 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the

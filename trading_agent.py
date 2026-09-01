@@ -498,10 +498,13 @@ MIN_TOPUP_PCT        = 0.03
 # on a big winner they can sit far above the current price and never bite.
 PLAYED_OUT_TRIM_MAX_UPSIDE = 15.0
 
-# Declaring a thesis played out costs a third of the position: the forward
-# driver may carry the remainder, never the whole win. If Claude doesn't
-# include the trim itself, this is the one injected mechanically.
-PLAYED_OUT_BANK_TRIM_PCT = 33.0
+# Played-out banking policy lives in shadow_portfolio next to the other
+# played-out constants, because build_thesis_review() quotes the numbers
+# into the prompt. Aliased here so the guards read naturally.
+PLAYED_OUT_BANK_TRIM_PCT      = sp.PLAYED_OUT_BANK_TRIM_PCT
+PLAYED_OUT_SUPERSEDE_TRIM_PCT = sp.PLAYED_OUT_SUPERSEDE_TRIM_PCT
+DRIVER_CHURN_BANK_COUNT       = sp.DRIVER_CHURN_BANK_COUNT
+DRIVER_CHURN_EXIT_COUNT       = sp.DRIVER_CHURN_EXIT_COUNT
 
 # Matches "+40%" style triggers inside pre-committed trim text,
 # e.g. "Trim 1/3 at +40%, trim another 1/3 at +80%."
@@ -625,6 +628,40 @@ def _pre_commit_trim_alerts(recs: list, ledger: dict, pre_val: dict) -> list[str
     return alerts
 
 
+def _driver_replacements(recs: list, ledger: dict) -> dict:
+    """
+    Forward-driver REPLACEMENTS proposed in this run's recs, by ticker.
+
+    Returns {ticker: {"failed": bool, "number": int}} where "number" is the
+    driver number the proposed driver would become, counting from 1.
+
+    Read from the recs, never from the position: _apply_set_driver writes
+    driver_failed_on and appends to forward_driver_history at EXECUTION, which
+    is after the guards run. Reading the position would fire every consequence
+    a week late — the delay these rules exist to remove.
+
+    A SET_DRIVER that names the FIRST driver for a position, or restates the
+    existing one verbatim, is not a replacement and is absent from the result.
+    """
+    out: dict = {}
+    positions = ledger.get("positions", {}) or {}
+    for r in recs:
+        if (r.get("action") or "").upper().strip() != "SET_DRIVER":
+            continue
+        ticker = _rec_ticker(r)
+        pos = positions.get(ticker) or {}
+        existing = (pos.get("forward_driver") or "").strip()
+        proposed = (r.get("forward_driver") or r.get("thesis_oneline") or "").strip()
+        if not existing or existing == proposed:
+            continue        # first driver for this position, or unchanged
+        # A legacy position can carry a driver with no history behind it; the
+        # driver on record is then #1 and the replacement is #2.
+        prior = len(pos.get("forward_driver_history") or []) or 1
+        status = (r.get("previous_driver_status") or "").strip().lower()
+        out[ticker] = {"failed": status != "superseded", "number": prior + 1}
+    return out
+
+
 def _forward_driver_alerts(recs: list, ledger: dict) -> list[str]:
     """
     Advisory alerts (never blocking) for positions being carried by a recorded
@@ -646,6 +683,7 @@ def _forward_driver_alerts(recs: list, ledger: dict) -> list[str]:
         _rec_ticker(r) for r in recs
         if (r.get("action") or "").upper().strip() in ("SELL", "TRIM")
     }
+    replaced = _driver_replacements(recs, ledger)
 
     for ticker, pos in ledger.get("positions", {}).items():
         if not pos.get("thesis_played_out") or ticker in acted:
@@ -667,8 +705,13 @@ def _forward_driver_alerts(recs: list, ledger: dict) -> list[str]:
                 f"{failed_on} - a failed driver is a thesis break on the only "
                 f"claim holding this position; mechanical bank is due now"
             )
-        drivers = len(pos.get("forward_driver_history") or [])
-        if drivers >= 3:
+        # Count the driver proposed THIS run too — forward_driver_history is
+        # appended at execution, after the guards, so counting the position
+        # alone reports the churn a week late.
+        swap = replaced.get(ticker)
+        drivers = (swap["number"] if swap
+                   else len(pos.get("forward_driver_history") or []))
+        if drivers >= DRIVER_CHURN_BANK_COUNT:
             alerts.append(
                 f"ALERT {ticker}: {drivers} different forward drivers named to "
                 f"justify holding this position - review whether it still earns "
@@ -836,7 +879,15 @@ def _inject_played_out_banks(recs: list, ledger: dict,
     (T212-first, shadow mirrors on confirmation). The prompt tells Claude
     the bank is coming, so a deliberate recycling trim can pre-empt it.
 
-    Returns (recs including any injected trims, guard_events).
+    Replacing a live driver also banks (Sep 2026), because the previous split
+    — 33% for "failed", nothing for "superseded" — made the label a free option
+    and it was taken the first week it existed. The label now sets the size:
+    PLAYED_OUT_BANK_TRIM_PCT for failed/unstated, PLAYED_OUT_SUPERSEDE_TRIM_PCT
+    for superseded. Above that, the driver COUNT escalates regardless of label:
+    #DRIVER_CHURN_BANK_COUNT banks the full third, #DRIVER_CHURN_EXIT_COUNT
+    exits the position outright.
+
+    Returns (recs including any injected trims/sells, guard_events).
     """
     events: list[str] = []
     injected: list[dict] = []
@@ -848,32 +899,22 @@ def _inject_played_out_banks(recs: list, ledger: dict,
         _rec_ticker(r) for r in recs
         if (r.get("action") or "").upper().strip() == "SET_DRIVER"
     }
-    # A driver declared failed THIS run owes its bank THIS run. driver_failed_on
-    # is written by _apply_set_driver at execution time, which is after these
-    # guards, so reading the position alone would miss it and fire a week late —
-    # exactly the delay the rule exists to remove. Read the rec instead.
-    driver_failed_this_run: set[str] = set()
-    for r in recs:
-        if (r.get("action") or "").upper().strip() != "SET_DRIVER":
-            continue
-        tk = _rec_ticker(r)
-        pos_now = (ledger.get("positions", {}) or {}).get(tk) or {}
-        existing = (pos_now.get("forward_driver") or "").strip()
-        proposed = (r.get("forward_driver") or r.get("thesis_oneline") or "").strip()
-        if not existing or existing == proposed:
-            continue        # first driver for this position, or unchanged
-        if (r.get("previous_driver_status") or "").strip().lower() != "superseded":
-            driver_failed_this_run.add(tk)
+    # Every replacement of a live driver owes a bank THIS run — failed at the
+    # full rate, superseded at the reduced one. Read off the recs, not the
+    # position: _apply_set_driver writes at execution, after these guards.
+    replaced = _driver_replacements(recs, ledger)
     positions_val = pre_val.get("positions", {})
 
     for ticker, pos in ledger.get("positions", {}).items():
         if ticker in acted:
             continue
         gain_pct = (positions_val.get(ticker, {}) or {}).get("pnl_pct")
-        failed_now = ticker in driver_failed_this_run
+        swap = replaced.get(ticker)
+        failed_now = bool(swap and swap["failed"])
+        driver_num = swap["number"] if swap else None
         if pos.get("thesis_played_out"):
             due = (sp.played_out_bank_due(ledger, ticker, pos, gain_pct)
-                   or failed_now)
+                   or swap is not None)
             declared = sp.played_out_declared_date(pos) or "?"
         elif ticker in declared_this_run:
             due = True          # declared this very run, with no trim alongside
@@ -883,12 +924,34 @@ def _inject_played_out_banks(recs: list, ledger: dict,
         if not due:
             continue
 
-        # Name the reason — "12 weeks elapsed" and "the driver failed" are very
-        # different events and the email should not render them identically.
+        # Churn escalation: the count of drivers named for one position bites
+        # before their contents do. A third distinct driver banks the full
+        # third whatever the label; a fourth ends the position.
+        force_exit = bool(driver_num and driver_num >= DRIVER_CHURN_EXIT_COUNT)
+        churn_bank = bool(driver_num and driver_num >= DRIVER_CHURN_BANK_COUNT)
+        if swap and not failed_now and not churn_bank:
+            trim_pct = PLAYED_OUT_SUPERSEDE_TRIM_PCT
+        else:
+            trim_pct = PLAYED_OUT_BANK_TRIM_PCT
+
+        # Name the reason — "12 weeks elapsed", "the driver failed" and "this
+        # is the fourth story about the same position" are very different
+        # events and the email should not render them identically.
         giveback = sp.played_out_giveback_pct(pos, gain_pct)
-        if failed_now or pos.get("driver_failed_on"):
+        if force_exit:
+            reason = (f"driver #{driver_num} named for this position - a hold "
+                      f"re-argued this many times is carried by churn, not by "
+                      f"a claim")
+        elif churn_bank and swap:
+            reason = (f"driver #{driver_num} named for this position - a third "
+                      f"rewrite banks the full third whatever the label")
+        elif failed_now or pos.get("driver_failed_on"):
             when = "this run" if failed_now else pos["driver_failed_on"]
             reason = (f"forward driver failed {when}, nothing banked since")
+        elif swap:
+            reason = (f"forward driver #{driver_num - 1} replaced this run "
+                      f"(superseded) - rewriting the reason to hold a realized "
+                      f"winner is evidence about the hold, whatever the label")
         elif sp.played_out_giveback_due(pos, gain_pct):
             reason = (f"handed back {giveback:.0f}% of its peak gain "
                       f"(+{pos.get('played_out_peak_gain_pct', 0):.0f}% peak, "
@@ -903,11 +966,31 @@ def _inject_played_out_banks(recs: list, ledger: dict,
                 f"price this run - trim NOT forced, will retry next run"
             )
             continue
-        trim_value = value * PLAYED_OUT_BANK_TRIM_PCT / 100
+
+        if force_exit:
+            injected.append({
+                "action": "SELL",
+                "ticker": ticker,
+                "yfinance_ticker": ticker,
+                "thesis_oneline": (
+                    f"Mechanical exit: thesis played out (declared "
+                    f"{declared}) - {reason}. Strategy rule, not a thesis "
+                    f"change."
+                ),
+                "guard_generated": True,
+            })
+            events.append(
+                f"FORCED SELL {ticker}: thesis played out (declared "
+                f"{declared}) - {reason} - exiting the full position "
+                f"(~£{value:.2f})"
+            )
+            continue
+
+        trim_value = value * trim_pct / 100
         if trim_value < MIN_ORDER_GBP:
             events.append(
                 f"ALERT {ticker}: mechanical bank due but a "
-                f"{PLAYED_OUT_BANK_TRIM_PCT:.0f}% trim is only "
+                f"{trim_pct:.0f}% trim is only "
                 f"£{trim_value:.2f} - too small to force, review manually"
             )
             continue
@@ -916,7 +999,7 @@ def _inject_played_out_banks(recs: list, ledger: dict,
             "action": "TRIM",
             "ticker": ticker,
             "yfinance_ticker": ticker,
-            "trim_pct": PLAYED_OUT_BANK_TRIM_PCT,
+            "trim_pct": trim_pct,
             "thesis_oneline": (
                 f"Mechanical bank: thesis played out (declared {declared}) - "
                 f"{reason}. Strategy rule, not a thesis change. Forward "
@@ -927,7 +1010,7 @@ def _inject_played_out_banks(recs: list, ledger: dict,
         events.append(
             f"FORCED TRIM {ticker}: thesis played out (declared {declared}) - "
             f"{reason} - mechanically trimming "
-            f"{PLAYED_OUT_BANK_TRIM_PCT:.0f}% (~£{trim_value:.2f}) to convert "
+            f"{trim_pct:.0f}% (~£{trim_value:.2f}) to convert "
             f"paper alpha into realised alpha"
         )
 
