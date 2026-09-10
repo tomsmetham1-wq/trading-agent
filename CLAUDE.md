@@ -155,14 +155,26 @@ All sizing rules are percentage-based so they scale as the portfolio grows.
   `TOPUP_REPEAT_MIN_WEEKS`). Prompt rule plus an advisory alert
   (`_repeat_topup_alerts`), deliberately not a block. Why it exists: every
   dead-zone top-up is individually legal, so choosing the same destination run
-  after run accumulates a large position that was never argued for — by
-  10 Sep 2026 NVDA had been topped up four times (10 May, 13 May, 1 Sep,
-  10 Sep), was the biggest holding at 15.9%, and sat at -0.07%. Why it is not a
+  after run accumulates a large position that was never argued for — NVDA was
+  topped up on 1 Sep (£246) and again on 10 Sep (£259), nine days apart, taking
+  it to the biggest holding at 15.9% while sitting at -0.07%. Why it is not a
   block: a block leaves the slice undeployed with no mechanism to pick another
   destination, which is the idle-cash trap closed in Aug 2026. The Sep 2026
   deep review asked instead for price confirmation ("new local high on volume")
   — NOT implemented, and do not implement it: it is a momentum signal in a
   fundamentals-only strategy.
+  Correction to that review, verified against the trade log (do not restate its
+  version): it reported "four top-ups — 10 May, 13 May, 1 Sep, 10 Sep". The
+  10 May order was REJECTED at T212 and removed by sync the same day, and
+  13 May was the retry that opened the position; the held share count
+  reconciles to 13 May + 1 Sep + 10 Sep exactly (6.196315). There have been two
+  top-ups, not four, and the May pair is a rejected order plus its retry — the
+  same episode that motivated the flip-flop guard, not evidence of fixation.
+  What survives the correction is the real bias: the top-up criterion Claude
+  keeps using is "most upside to the first trim level", which is measured from
+  ENTRY and therefore always favours the holding that has gone up least. That
+  is averaging down in the language of forward risk/reward, and it is why the
+  slice went to the same name twice. The prompt now names it.
 - Do NOT exit a position solely because it shrank below 8% — only exit if thesis broken
 - Thesis realized ≠ thesis intact (added July 2026): when a position's ORIGINAL
   thesis has substantially played out (mispricing closed, gain captured), HOLD is

@@ -500,7 +500,7 @@ PLAYED_OUT_TRIM_MAX_UPSIDE = 15.0
 
 # A top-up of a position bought into this recently is flagged: adding to the
 # same name run after run builds a large position without ever arguing for one
-# (NVDA, four adds, biggest holding in the book, flat). Advisory — see
+# (NVDA, two adds nine days apart, biggest holding in the book, flat). Advisory — see
 # _repeat_topup_alerts for why this is not a block.
 TOPUP_REPEAT_MIN_WEEKS = 8
 
@@ -613,12 +613,19 @@ def _repeat_topup_alerts(recs: list, ledger: dict, pre_val: dict) -> list[str]:
     Flag a top-up of a position that was already topped up in the last
     TOPUP_REPEAT_MIN_WEEKS.
 
-    The Sep 2026 deep review found NVDA had been added to four times (10 May,
-    13 May, 1 Sep, 10 Sep), was the largest position in the book at 15.9%, and
-    was sitting at -0.07% — a position built by drip-feed on a "blowout
-    earnings" narrative price had not confirmed, with each individual add
-    passing every existing guard (under the 20% cap, under the 60% theme cap,
-    inside the 3-8% dead-zone band).
+    NVDA was topped up on 2026-09-01 (£246) and again on 2026-09-10 (£259),
+    nine days apart, taking it to the largest position in the book at 15.9%
+    while it sat at -0.07%. Both passed every existing guard — under the 20%
+    cap, under the 60% theme cap, inside the 3-8% dead-zone band, live forward
+    driver stated — because nothing looked at the sequence.
+
+    Do NOT restate the Sep 2026 deep review's version of this history: it
+    counted "four top-ups (10 May, 13 May, 1 Sep, 10 Sep)". The 10 May order
+    was REJECTED at T212 and removed by sync the same day (SYNC_REMOVE, "order
+    rejected or never executed"), and 13 May was the retry that actually opened
+    the position — the held share count reconciles to 13 May + 1 Sep + 10 Sep
+    exactly. Two of the four "adds" were one position opening, and the review
+    also read a rejected-order retry as evidence of fixation.
 
     The review's own prescription was to require price confirmation ("new local
     high on volume"). That is a momentum signal and this strategy is

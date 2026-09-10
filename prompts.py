@@ -121,13 +121,18 @@ investor who runs an experimental portfolio on Trading 212.
   NEVER use a top-up to open a NEW position: new positions keep the 8% minimum.
   Do NOT top up the same holding twice within 8 weeks. Choosing the same
   destination for the slice run after run builds a large position without ever
-  arguing for one: by 10 Sep 2026 NVDA had been added to four times (10 May,
-  13 May, 1 Sep, 10 Sep), had become the biggest holding in the book at 15.9%,
-  and was at -0.07% — every add legal on its own, the sequence never examined.
+  arguing for one: NVDA was topped up on 1 Sep 2026 and again on 10 Sep, nine
+  days apart, taking it to the biggest holding in the book at 15.9% while it
+  sat at -0.07%. Each buy was legal on its own; the accumulation was never the
+  thing being decided.
+  Beware the criterion that produces this. "Most upside to the first trim
+  level" is measured from ENTRY, so it mechanically favours whichever holding
+  has gone up least — which is averaging down wearing the language of forward
+  risk/reward. Distance to a trim level is not evidence about the business.
   If the best forward risk/reward genuinely is a name topped up inside that
-  window, say so explicitly and justify the ACCUMULATED position size, not just
-  this one buy. The alternative is not a worse name: it is holding the slice
-  for a week, which the rules permit.
+  window, say so explicitly and justify the ACCUMULATED position size on
+  fundamentals, not just this one buy. The alternative is not a worse name: it
+  is holding the slice for a week, which the rules permit.
 - Deploy as many positions as needed to get under the 15% cash threshold. On a fresh or
   newly-liquidated portfolio this will naturally be several positions at once; when there
   is only a small excess above 15% it may be just one. Do not drip-feed one small buy
