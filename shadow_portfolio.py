@@ -1167,6 +1167,9 @@ def compute_realized_pnl(ledger: dict) -> dict:
         dict: {
             "total_gbp": float,                      # sum of realised P&L
             "by_ticker": {ticker: realised_gbp},     # sorted best-first
+            "peak_cost_gbp": {ticker: gbp},          # most basis ever open at
+                                                     # once, the capital the
+                                                     # name actually tied up
             "tickers_with_incomplete_basis": [str],  # no cost basis at all
             "tickers_with_estimated_basis": [str],   # basis inferred, not recorded
             "unpriced_proceeds_gbp": {ticker: gbp},  # sold, but P&L unknowable
@@ -1174,10 +1177,17 @@ def compute_realized_pnl(ledger: dict) -> dict:
     """
     holdings: dict[str, list[float]] = {}   # ticker -> [shares_held, total_cost_gbp]
     realized: dict[str, float] = {}
+    peak_cost: dict[str, float] = {}
     incomplete: set[str] = set()
     estimated: set[str] = set()
     unpriced: dict[str, float] = {}   # proceeds we cannot price at all
     positions = ledger.get("positions", {}) or {}
+
+    def _bump_peak(tk: str) -> None:
+        """Ratchet the most cost basis this ticker has ever had open at once."""
+        held = holdings.get(tk)
+        if held:
+            peak_cost[tk] = max(peak_cost.get(tk, 0.0), held[1])
 
     def _fallback_basis(tk: str):
         """Per-share cost for shares with no recorded BUY, or None."""
@@ -1215,6 +1225,7 @@ def compute_realized_pnl(ledger: dict) -> dict:
                 h = holdings.setdefault(ticker, [0.0, 0.0])
                 h[0] += shares
                 h[1] += shares * cost
+                _bump_peak(ticker)
                 if t.get("basis_source") != "t212_wallet":
                     estimated.add(ticker)
             else:
@@ -1225,6 +1236,7 @@ def compute_realized_pnl(ledger: dict) -> dict:
             h = holdings.setdefault(ticker, [0.0, 0.0])
             h[0] += shares
             h[1] += amount
+            _bump_peak(ticker)
 
         elif action in ("SELL", "TRIM"):
             proceeds = float(t.get("amount_gbp") or 0)
@@ -1269,12 +1281,187 @@ def compute_realized_pnl(ledger: dict) -> dict:
             k: round(v, 2)
             for k, v in sorted(realized.items(), key=lambda x: -x[1])
         },
+        "peak_cost_gbp": {k: round(v, 2) for k, v in sorted(peak_cost.items())},
         "tickers_with_incomplete_basis": sorted(incomplete),
         "tickers_with_estimated_basis": sorted(estimated - incomplete),
         "unpriced_proceeds_gbp": {
             k: round(v, 2) for k, v in sorted(unpriced.items())
         },
     }
+
+
+# Kill criterion #5 ("remove the top contributor and the rest still
+# underperforms VUSA") TRIGGERED at the 10 Sep 2026 Opus deep review, which
+# also pointed out that every other recommendation it made was housekeeping:
+# the finding is that the picks other than the top one generate no alpha, and
+# no rule tightening creates a second good idea. What it asked for instead was
+# a number, checked every run rather than argued about monthly, plus a date by
+# which the number has to come good. These two constants are that test.
+#
+# On 10 Sep 2026 the book was +26.56% against VUSA's +7.12%, of which DELL was
+# ~£1,117 of ~£1,328 - roughly 85% of every pound of profit.
+EX_TOP_TEST_DATE = "2026-11-30"
+
+# ...OR one non-top position must have earned this much in its own right, so
+# the test can also be passed by finding a second good idea rather than only by
+# the remainder out-running the index in aggregate.
+EX_TOP_SECOND_IDEA_GBP = 150.0
+
+
+def ex_top_contributor_performance(ledger: dict, valuation_result: dict) -> dict:
+    """
+    Strip the single best contributor out of the book and score what is left.
+
+    The headline return is the number that decides whether this strategy is
+    worth running, and a book carried by one name reports the same headline as
+    a book that picks well nine times. Kill criterion #5 exists for exactly
+    that, but it was only ever evaluated inside the monthly deep review - a
+    prose argument, made against whichever figures the model derived for
+    itself, four weeks apart. This computes it in code so it can be shown every
+    run.
+
+    Contribution is realised + unrealised per ticker, so a name whose gains
+    were banked counts them: DELL's realised ~£804 is most of its case and is
+    invisible to an unrealised-only ranking (which is what the deep review
+    prompt used to pick its "top contributor").
+
+    The remainder is scored against the capital it actually had to work with -
+    starting capital less the most cost basis the top name ever had open at
+    once (peak_cost_gbp from the replay). Charging the whole starting capital to
+    the remainder would understate it; ignoring the top name's capital entirely
+    would overstate it. Neither is exact, because capital recycles through the
+    book, and the figure is labelled approximate wherever it is shown.
+
+    Returns {} when nothing can be scored yet. Otherwise the dict documented in
+    the keys below; passing is beats_benchmark OR has_second_idea.
+    """
+    positions_val = valuation_result.get("positions") or {}
+    realized = compute_realized_pnl(ledger)
+
+    contributions: dict[str, float] = dict(realized.get("by_ticker") or {})
+    for ticker, pv in positions_val.items():
+        pnl = pv.get("pnl_gbp")
+        if pnl is None:
+            continue
+        contributions[ticker] = contributions.get(ticker, 0.0) + pnl
+    if not contributions:
+        return {}
+
+    top_ticker = max(contributions, key=lambda k: contributions[k])
+    top_pnl = contributions[top_ticker]
+
+    start = (valuation_result.get("starting_capital_gbp")
+             or ledger.get("starting_capital_gbp") or 0)
+    total_pnl = valuation_result.get("total_return_gbp")
+    if not start or total_pnl is None:
+        return {}
+    ex_top_pnl = total_pnl - top_pnl
+
+    peak_cost = (realized.get("peak_cost_gbp") or {}).get(top_ticker, 0.0)
+    capital_ex_top = start - peak_cost
+    ex_top_pct = (ex_top_pnl / capital_ex_top * 100) if capital_ex_top > 0 else None
+
+    bench = valuation_result.get("benchmark_return_pct")
+    vs_bench = (round(ex_top_pct - bench, 2)
+                if ex_top_pct is not None and bench is not None else None)
+
+    others = {k: v for k, v in contributions.items() if k != top_ticker}
+    second_ticker = max(others, key=lambda k: others[k]) if others else None
+    second_pnl = others[second_ticker] if second_ticker else 0.0
+
+    beats = bool(vs_bench is not None and vs_bench > 0)
+    has_second = bool(second_pnl >= EX_TOP_SECOND_IDEA_GBP)
+
+    return {
+        "top_ticker":                top_ticker,
+        "top_pnl_gbp":               round(top_pnl, 2),
+        "total_pnl_gbp":             round(total_pnl, 2),
+        "ex_top_pnl_gbp":            round(ex_top_pnl, 2),
+        "capital_ex_top_gbp":        round(capital_ex_top, 2),
+        "ex_top_return_pct":         round(ex_top_pct, 2) if ex_top_pct is not None else None,
+        "benchmark_return_pct":      bench,
+        "ex_top_vs_benchmark_pts":   vs_bench,
+        "second_ticker":             second_ticker,
+        "second_pnl_gbp":            round(second_pnl, 2),
+        "second_idea_threshold_gbp": EX_TOP_SECOND_IDEA_GBP,
+        "test_date":                 EX_TOP_TEST_DATE,
+        "beats_benchmark":           beats,
+        "has_second_idea":           has_second,
+        "passing":                   beats or has_second,
+        "contributions": {
+            k: round(v, 2)
+            for k, v in sorted(contributions.items(), key=lambda x: -x[1])
+        },
+        "basis_estimated": realized.get("tickers_with_estimated_basis") or [],
+    }
+
+
+def _ex_top_lines(ex: dict) -> list[str]:
+    """Shared body of the single-name dependency block (prompt and email)."""
+    pct = ("n/a" if ex["ex_top_return_pct"] is None
+           else f"{ex['ex_top_return_pct']:+.2f}%")
+    bench = ("n/a" if ex["benchmark_return_pct"] is None
+             else f"{ex['benchmark_return_pct']:+.2f}%")
+    gap = ("n/a" if ex["ex_top_vs_benchmark_pts"] is None
+           else f"{ex['ex_top_vs_benchmark_pts']:+.2f} pts")
+    verdict = "PASSING" if ex["passing"] else "FAILING"
+    lines = [
+        f"  Top contributor:   {ex['top_ticker']} "
+        f"£{ex['top_pnl_gbp']:+.2f} (realised + unrealised)",
+        f"  Whole book:        £{ex['total_pnl_gbp']:+.2f}",
+        f"  Everything else:   £{ex['ex_top_pnl_gbp']:+.2f} on "
+        f"~£{ex['capital_ex_top_gbp']:.2f} of capital = {pct} (approximate)",
+        f"  Benchmark:         {bench}   ex-{ex['top_ticker']} vs benchmark: {gap}",
+        f"  Best of the rest:  {ex['second_ticker'] or 'n/a'} "
+        f"£{ex['second_pnl_gbp']:+.2f} "
+        f"(second-idea bar: £{ex['second_idea_threshold_gbp']:.0f})",
+        f"  {ex['test_date']} TEST: {verdict} - the remainder must be beating "
+        f"the benchmark, OR one non-{ex['top_ticker']} position must have "
+        f"earned £{ex['second_idea_threshold_gbp']:.0f} in its own right.",
+    ]
+    if ex["basis_estimated"]:
+        lines.append(
+            f"  (cost basis estimated for {', '.join(ex['basis_estimated'])} - "
+            f"right order of magnitude, not exact)"
+        )
+    return lines
+
+
+def build_ex_top_review(ledger: dict, valuation_result: dict) -> str:
+    """
+    Single-name dependency block for the weekly prompt.
+
+    Kill criterion #5 triggered on 10 Sep 2026, and the deep review's own
+    verdict was that the ONLY one of its seven recommendations that touched the
+    trigger was making this number visible every run instead of once a month,
+    so the dependency "can't hide". Carrying it in the weekly prompt means each
+    week's picking is argued in front of the evidence about the last five
+    months of picking.
+    """
+    ex = ex_top_contributor_performance(ledger, valuation_result)
+    if not ex:
+        return ""
+    lines = ["=== Single-name dependency (kill criterion #5) ==="]
+    lines.extend(_ex_top_lines(ex))
+    lines.append(
+        "  READ THIS BEFORE CLAIMING THE STRATEGY IS WORKING: the headline\n"
+        "  return is not evidence of stock-picking while this test is failing\n"
+        f"  - it is evidence about {ex['top_ticker']}. A HOLD on a position\n"
+        "  that has earned nothing is a decision being made again this week,\n"
+        "  not a decision already made. For each such holding, say what would\n"
+        "  have to happen for it to become the second good idea; if you cannot\n"
+        "  name it, recycle the capital into something that can."
+    )
+    return "\n".join(lines) + "\n"
+
+
+def format_ex_top_for_email(ledger: dict, valuation_result: dict) -> str:
+    """Format the single-name dependency check for the weekly email."""
+    ex = ex_top_contributor_performance(ledger, valuation_result)
+    if not ex:
+        return ""
+    return "\n".join(["Single-name dependency (kill criterion #5):"]
+                     + _ex_top_lines(ex))
 
 
 def reconcile_trade_log(ledger: dict) -> dict:

@@ -151,6 +151,18 @@ All sizing rules are percentage-based so they scale as the portfolio grows.
   couldn't fund the £507 minimum new position. Nothing fired; the agent
   deployed nothing for eight weeks (last new position 22 June). Keying off the
   slice strictly generalises the old rule and closes the gap.
+- No repeat top-up of the SAME holding within 8 weeks (Sep 2026,
+  `TOPUP_REPEAT_MIN_WEEKS`). Prompt rule plus an advisory alert
+  (`_repeat_topup_alerts`), deliberately not a block. Why it exists: every
+  dead-zone top-up is individually legal, so choosing the same destination run
+  after run accumulates a large position that was never argued for — by
+  10 Sep 2026 NVDA had been topped up four times (10 May, 13 May, 1 Sep,
+  10 Sep), was the biggest holding at 15.9%, and sat at -0.07%. Why it is not a
+  block: a block leaves the slice undeployed with no mechanism to pick another
+  destination, which is the idle-cash trap closed in Aug 2026. The Sep 2026
+  deep review asked instead for price confirmation ("new local high on volume")
+  — NOT implemented, and do not implement it: it is a momentum signal in a
+  fundamentals-only strategy.
 - Do NOT exit a position solely because it shrank below 8% — only exit if thesis broken
 - Thesis realized ≠ thesis intact (added July 2026): when a position's ORIGINAL
   thesis has substantially played out (mispricing closed, gain captured), HOLD is
@@ -205,6 +217,10 @@ All sizing rules are percentage-based so they scale as the portfolio grows.
 - **Any single-week drawdown >15% with no thesis explanation** → risk-management failure
 - **Buy-sell-rebuy flip-flop on same ticker >2× in a month** → agent is reacting to price, not fundamentals
 - **End of August 2026: remove top contributor, rest still underperforms VUSA** → lottery-ticket buyer, not stock-picker → shut down
+  **TRIGGERED 10 Sep 2026.** Ex-DELL the book had returned ~4.7% on ~£4,600
+  against VUSA's +7.12%; DELL was ~£1,117 of ~£1,333 total profit (~85%).
+  Continuing was accepted as an explicit bet with a deadline, not as a
+  comfortable assumption — see the single-name dependency check below.
 
 ## Code-level strategy guards (added June 2026 code review)
 
@@ -276,7 +292,14 @@ before execution — prompt rules that were being violated are now mechanical:
   5% reserve floor; the deployable slice can't fund a new position at the 8%
   minimum but is big enough for a dead-zone top-up and no BUY was proposed
   (`CASH_RESERVE_FLOOR` / `MIN_NEW_POSITION_PCT` / `MIN_TOPUP_PCT` — the
-  idle-cash trap, see the dead-zone rule above); a theme is STILL over the 60% cap after this run's recs are
+  idle-cash trap, see the dead-zone rule above); a BUY tops up a holding
+  bought into within the last 8 weeks (`_repeat_topup_alerts`); a SET_TRIMS is
+  the third or later rewrite of one position's levels
+  (`TRIM_RESET_ALERT_COUNT`, `_trim_reset_alerts` — DELL's were re-set on
+  27 Jul, 3 Aug, 10 Aug and 10 Sep; counting rather than blocking because once
+  every level has been honoured there is no un-hit trigger for the tighten-only
+  rule to compare against, and blocking would leave the residual with no
+  mechanical exit at all); a theme is STILL over the 60% cap after this run's recs are
   applied (added after the July 2026 Opus deep review flagged that AI infra
   was still ~58-63% weeks after the BUY-side cap existed, because nothing
   forces a correction when Claude doesn't propose a new buy in that theme —
@@ -466,10 +489,60 @@ no migration script. A position with no stored entry rate or no live rate is
 OMITTED from the decomposition rather than guessed at; a missing rate must
 never read as "no FX effect".
 
+`ensure_entry_fx()` must be CALLED, and is, from `run_weekly()` step 3b —
+after sync, before the valuation and prompt are built (Sep 2026 fix, do not
+regress). It shipped written and unit-tested but never wired into the run, so
+the only position carrying an entry rate was the one the BUY path had recorded:
+on 2026-09-10 the decomposition covered NVDA alone and the email read "FX moved
+the book between +0.00 and +0.00 pts" — a missing rate rendering as "no FX
+effect", the one thing the docstring says must never happen. With it wired, all
+nine positions backfill (DELL/AMZN/GOOGL 1.3466, MRVL 1.3496, ABBV 1.3336,
+XOM/JPM 1.3208, V 1.3654), which is what surfaces the real FX drag on XOM and
+JPM that the Sep 2026 commit was written to expose.
+
 Note `fx_rate_on()` and `_fx_rate()` need `os_ca_bundle.ensure_os_ca_bundle()`
 to have run (it does, at shadow_portfolio import). Importing yfinance directly
 in a scratch script skips it and every FX call fails with "unable to get local
 issuer certificate".
+
+Single-name dependency check (Sep 2026). Kill criterion #5 triggered at the
+10 Sep 2026 deep review, whose own §7(a) verdict was that six of its seven
+recommendations were housekeeping: the finding is that the picks other than the
+top one generate no alpha, and no rule tightening creates a second good idea.
+The one recommendation that addressed the trigger was to make the number
+visible every run so the dependency cannot hide. That is
+`sp.ex_top_contributor_performance()` — in the weekly prompt via
+`build_ex_top_review()`, in the weekly email via `format_ex_top_for_email()`,
+and in the deep review in place of the old ad-hoc `top_contributor` line.
+
+Contribution is realised + unrealised per ticker. Ranking on unrealised alone
+(what the deep review prompt did) is wrong for exactly the case the criterion
+exists to catch: a name whose gains have been BANKED shows a small unrealised
+figure because it delivered. DELL's £804 realised was more than the entire
+realised book and was invisible to that ranking.
+
+The remainder is scored against the capital it actually had — starting capital
+less `peak_cost_gbp` for the top name (the most cost basis it ever had open at
+once, now returned by `compute_realized_pnl()`). Charging the whole starting
+capital to the remainder understates it; ignoring the top name's capital
+overstates it. Neither is exact because capital recycles, so every rendering
+labels the figure approximate. On the 10 Sep book this reproduces the review's
+own arithmetic independently: DELL £1,117.11, remainder £216.16 on ~£4,600 =
++4.70% against +7.12%.
+
+The test has a deadline and two ways to pass, both from the review:
+`EX_TOP_TEST_DATE` = 30 Nov 2026, and by then either the ex-top book beats the
+benchmark OR one non-top position has earned `EX_TOP_SECOND_IDEA_GBP` (£150) in
+its own right. As of 10 Sep the second leg is live and close — XOM at £134.32.
+If neither is true by the date, the strategy is funding variance, not skill.
+
+Deliberately NOT implemented from the same review: raising the cash floor to
+8–10%. It contradicts the Aug 2026 dead-zone rule (an 8% floor would have made
+this run's £259 slice a £69 slice, below the 3% top-up minimum — nothing
+deployable, which is the trap that rule exists to close), and it contradicts
+the review's own §7(c) finding that the failure is idea generation and NOT
+deployment or constraints. Holding more cash does not produce a second good
+idea; it just adds drag against a fully-invested benchmark.
 
 Watchlist recording (Aug 2026) — RECORDING ONLY, deliberately not a gate:
 `ledger["watchlist"]` tracks every name Claude flags in section 4, with the
@@ -516,7 +589,7 @@ or requires a name to persist N weeks before it can be bought. Those were
 considered and rejected — they forfeit real upside to buy a filter the data
 doesn't yet justify. Revisit only once there are ~3 months of scores.
 
-Test suite: `test_trading_agent.py` (246 tests, no network). Run it after any
+Test suite: `test_trading_agent.py` (262 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the

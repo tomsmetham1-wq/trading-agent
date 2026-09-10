@@ -119,6 +119,15 @@ investor who runs an experimental portfolio on Trading 212.
   choose the best forward risk/reward among current holdings; do NOT
   mechanically average down the biggest loser or chase the biggest winner.
   NEVER use a top-up to open a NEW position: new positions keep the 8% minimum.
+  Do NOT top up the same holding twice within 8 weeks. Choosing the same
+  destination for the slice run after run builds a large position without ever
+  arguing for one: by 10 Sep 2026 NVDA had been added to four times (10 May,
+  13 May, 1 Sep, 10 Sep), had become the biggest holding in the book at 15.9%,
+  and was at -0.07% — every add legal on its own, the sequence never examined.
+  If the best forward risk/reward genuinely is a name topped up inside that
+  window, say so explicitly and justify the ACCUMULATED position size, not just
+  this one buy. The alternative is not a worse name: it is holding the slice
+  for a week, which the rules permit.
 - Deploy as many positions as needed to get under the 15% cash threshold. On a fresh or
   newly-liquidated portfolio this will naturally be several positions at once; when there
   is only a small excess above 15% it may be just one. Do not drip-feed one small buy
@@ -380,6 +389,7 @@ recommendation had been executed) ===
 {thesis_review}
 
 {fx_review}
+{ex_top_review}
 {watchlist_review}
 Today: {today}
 
@@ -489,7 +499,8 @@ DEEP_REVIEW_USER_TEMPLATE = """=== Full shadow portfolio ledger ===
 figures for section 1 rather than re-deriving them) ===
 {realized_pnl}
 
-Top contributor by unrealised P&L: {top_contributor}
+=== Single-name dependency (kill criterion #5, computed in code) ===
+{top_contributor}
 
 === Watchlist tracking — ideas flagged but NOT bought ===
 Scored against the benchmark over each name's own window. This is the
@@ -617,6 +628,7 @@ def build_prompt(shadow_val: dict, shadow_ledger: dict,
                        if recent_trades else "(none yet)"),
         thesis_review=sp.build_thesis_review(shadow_ledger, shadow_val),
         fx_review=sp.build_fx_review(shadow_ledger, shadow_val),
+        ex_top_review=sp.build_ex_top_review(shadow_ledger, shadow_val),
         watchlist_review=sp.build_watchlist_review(shadow_ledger),
         today=datetime.now().strftime("%A, %d %B %Y"),
     )
@@ -631,19 +643,19 @@ def build_deep_review_prompt(ledger: dict, valuation: dict) -> tuple[str, str]:
     criteria (eligible for prompt caching). The user_prompt carries the full ledger,
     snapshots, valuation, and dynamically computed top contributor.
     """
-    # Compute top contributor by unrealised P&L so the kill-criteria section
-    # is always accurate regardless of what the portfolio holds
+    # Kill criterion #5 needs the top contributor ranked on realised AND
+    # unrealised P&L. Ranking on unrealised alone was wrong for the case the
+    # criterion exists to catch: a name whose gains have been banked shows a
+    # small unrealised figure precisely BECAUSE it delivered — on 10 Sep 2026
+    # DELL's £804 of realised profit was more than the entire realised book and
+    # invisible here. The block below is computed in code so the review argues
+    # against a number rather than deriving its own.
     positions_val = valuation.get("positions", {})
-    top_contributor = "none identified"
-    if positions_val:
-        best = max(
-            positions_val.items(),
-            key=lambda kv: kv[1].get("pnl_gbp") or 0,
-        )
-        top_ticker, top_data = best
-        top_pnl = top_data.get("pnl_gbp")
-        if top_pnl and top_pnl > 0:
-            top_contributor = f"{top_ticker} (unrealised P&L: £{top_pnl:+.2f})"
+    ex_top = sp.ex_top_contributor_performance(ledger, valuation)
+    if ex_top:
+        top_contributor = "\n".join(sp._ex_top_lines(ex_top))
+    else:
+        top_contributor = "none identified"
 
     # Strip sync noise from trades and drop weekly_snapshots from the ledger
     # copy — snapshots are passed separately below, so including them here

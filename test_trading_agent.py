@@ -2523,3 +2523,169 @@ class TestCurrencyDecomposition:
 
     def test_email_block_is_empty_when_nothing_can_be_decomposed(self):
         assert sp.format_fx_for_email({}) == ""
+
+
+class TestExTopContributor:
+    """
+    Kill criterion #5 as a standing metric (Sep 2026 deep review).
+
+    The reference numbers are the real 10 Sep 2026 book: +£1,333 total, of
+    which DELL was ~£1,117 (£804 realised + £313 unrealised), leaving ~£216 on
+    ~£4,600 of capital — ~4.7% against VUSA's +7.12%.
+    """
+
+    def _ledger(self):
+        return {
+            "starting_capital_gbp": 5000.0,
+            "positions": {"DELL": {}, "XOM": {}},
+            "trades": [
+                {"action": "BUY",  "ticker": "DELL", "shares": 4, "amount_gbp": 400},
+                {"action": "TRIM", "ticker": "DELL", "shares": 2, "amount_gbp": 1004},
+                {"action": "BUY",  "ticker": "XOM",  "shares": 7, "amount_gbp": 700},
+            ],
+        }
+
+    def _val(self, dell_unrealised=313.10, xom_unrealised=134.32):
+        return {
+            "starting_capital_gbp": 5000.0,
+            "total_return_gbp": round(804.0 + dell_unrealised + xom_unrealised, 2),
+            "benchmark_return_pct": 7.12,
+            "positions": {
+                "DELL": {"pnl_gbp": dell_unrealised, "current_value_gbp": 531.75},
+                "XOM":  {"pnl_gbp": xom_unrealised,  "current_value_gbp": 834.32},
+            },
+        }
+
+    def test_top_contributor_counts_realised_and_unrealised(self):
+        ex = sp.ex_top_contributor_performance(self._ledger(), self._val())
+        # DELL's unrealised (£313) is SMALLER than XOM's total, so an
+        # unrealised-only ranking picks the wrong name — the bug this replaces.
+        assert ex["top_ticker"] == "DELL"
+        assert ex["top_pnl_gbp"] == pytest.approx(1117.1, abs=1.0)
+
+    def test_remainder_is_scored_against_the_capital_it_had(self):
+        ex = sp.ex_top_contributor_performance(self._ledger(), self._val())
+        # DELL never had more than £400 of basis open at once.
+        assert ex["capital_ex_top_gbp"] == pytest.approx(4600.0)
+        assert ex["ex_top_pnl_gbp"] == pytest.approx(134.32, abs=1.0)
+        assert ex["ex_top_return_pct"] == pytest.approx(2.9, abs=0.2)
+
+    def test_failing_when_remainder_lags_and_no_second_idea(self):
+        ex = sp.ex_top_contributor_performance(self._ledger(), self._val())
+        assert ex["ex_top_vs_benchmark_pts"] < 0
+        assert ex["beats_benchmark"] is False
+        assert ex["has_second_idea"] is False        # XOM £134 < £150 bar
+        assert ex["passing"] is False
+
+    def test_a_single_second_idea_passes_the_test(self):
+        ex = sp.ex_top_contributor_performance(
+            self._ledger(), self._val(xom_unrealised=200.0))
+        assert ex["has_second_idea"] is True
+        assert ex["passing"] is True
+
+    def test_remainder_beating_the_benchmark_passes_the_test(self):
+        ex = sp.ex_top_contributor_performance(
+            self._ledger(), self._val(xom_unrealised=400.0))
+        assert ex["beats_benchmark"] is True
+        assert ex["passing"] is True
+
+    def test_peak_cost_is_the_most_basis_ever_open_not_what_is_left(self):
+        peaks = sp.compute_realized_pnl(self._ledger())["peak_cost_gbp"]
+        assert peaks["DELL"] == pytest.approx(400.0)   # not the £200 residual
+
+    def test_email_and_prompt_blocks_carry_the_verdict_and_date(self):
+        led, val = self._ledger(), self._val()
+        email = sp.format_ex_top_for_email(led, val)
+        prompt = sp.build_ex_top_review(led, val)
+        for block in (email, prompt):
+            assert "FAILING" in block
+            assert sp.EX_TOP_TEST_DATE in block
+            assert "DELL" in block
+        assert "not evidence of stock-picking" in prompt
+
+    def test_blocks_are_empty_when_nothing_can_be_scored(self):
+        empty = {"starting_capital_gbp": 5000.0, "total_return_gbp": 0.0,
+                 "positions": {}}
+        assert sp.ex_top_contributor_performance({"trades": []}, empty) == {}
+        assert sp.format_ex_top_for_email({"trades": []}, empty) == ""
+        assert sp.build_ex_top_review({"trades": []}, empty) == ""
+
+    def test_missing_benchmark_does_not_read_as_passing(self):
+        val = self._val()
+        val["benchmark_return_pct"] = None
+        ex = sp.ex_top_contributor_performance(self._ledger(), val)
+        assert ex["ex_top_vs_benchmark_pts"] is None
+        assert ex["beats_benchmark"] is False
+
+
+class TestRepeatTopUpAlert:
+    """
+    NVDA was added to four times and became the biggest position in the book
+    while flat. Advisory, not blocking — a block would idle the deployable
+    slice with no way to choose another destination.
+    """
+
+    def _ledger(self, last_buy):
+        return {
+            "positions": {"NVDA": {"theme": "AI infrastructure"}},
+            "trades": [{"action": "BUY", "ticker": "NVDA",
+                        "date": last_buy, "shares": 1, "amount_gbp": 259}],
+        }
+
+    def _pre_val(self):
+        return {"total_value_gbp": 6333.0,
+                "positions": {"NVDA": {"current_value_gbp": 1009.25}}}
+
+    def test_top_up_inside_the_window_is_flagged(self):
+        recs = [{"action": "BUY", "ticker": "NVDA", "amount_gbp": 259}]
+        alerts = ta._repeat_topup_alerts(
+            recs, self._ledger("2026-09-01"), self._pre_val())
+        assert len(alerts) == 1
+        assert "2026-09-01" in alerts[0] and "NVDA" in alerts[0]
+
+    def test_top_up_outside_the_window_is_not_flagged(self):
+        recs = [{"action": "BUY", "ticker": "NVDA", "amount_gbp": 259}]
+        assert ta._repeat_topup_alerts(
+            recs, self._ledger("2026-05-13"), self._pre_val()) == []
+
+    def test_a_new_position_is_never_a_repeat_top_up(self):
+        recs = [{"action": "BUY", "ticker": "LLY", "amount_gbp": 600}]
+        assert ta._repeat_topup_alerts(
+            recs, self._ledger("2026-09-01"), self._pre_val()) == []
+
+    def test_the_alert_never_blocks_the_buy(self, monkeypatch):
+        monkeypatch.setattr(ta, "_recent_full_exit_date", lambda *a: None)
+        recs = [{"action": "BUY", "ticker": "NVDA", "amount_gbp": 259,
+                 "theme": "AI infrastructure"}]
+        led = self._ledger("2026-09-01")
+        pre_val = {"total_value_gbp": 6333.0, "cash_gbp": 575.0,
+                   "positions": {"NVDA": {"current_value_gbp": 1009.25}}}
+        allowed, events = ta.enforce_strategy_guards(recs, led, pre_val)
+        assert [r["ticker"] for r in allowed] == ["NVDA"]
+        assert any("repeat" in e for e in events)
+
+
+class TestTrimResetAlert:
+    def _ledger(self, resets):
+        return {"positions": {"DELL": {}},
+                "trades": [{"action": "SET_TRIMS", "ticker": "DELL"}] * resets}
+
+    def test_third_reset_is_flagged(self):
+        recs = [{"action": "SET_TRIMS", "ticker": "DELL",
+                 "pre_commit_trims": "Final 1/3 exit at +165%"}]
+        alerts = ta._trim_reset_alerts(recs, self._ledger(2))
+        assert len(alerts) == 1 and "#3" in alerts[0]
+
+    def test_first_reset_is_not_flagged(self):
+        recs = [{"action": "SET_TRIMS", "ticker": "DELL"}]
+        assert ta._trim_reset_alerts(recs, self._ledger(0)) == []
+
+    def test_alert_does_not_block_the_set_trims(self):
+        recs = [{"action": "SET_TRIMS", "ticker": "DELL",
+                 "pre_commit_trims": "Final 1/3 exit at +165% from entry"}]
+        led = self._ledger(3)
+        led["positions"]["DELL"] = {}     # no existing levels to compare
+        allowed, events = ta.enforce_strategy_guards(
+            recs, led, {"total_value_gbp": 6333.0, "positions": {}})
+        assert len(allowed) == 1
+        assert any("re-set #4" in e for e in events)

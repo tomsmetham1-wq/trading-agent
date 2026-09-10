@@ -498,6 +498,16 @@ MIN_TOPUP_PCT        = 0.03
 # on a big winner they can sit far above the current price and never bite.
 PLAYED_OUT_TRIM_MAX_UPSIDE = 15.0
 
+# A top-up of a position bought into this recently is flagged: adding to the
+# same name run after run builds a large position without ever arguing for one
+# (NVDA, four adds, biggest holding in the book, flat). Advisory — see
+# _repeat_topup_alerts for why this is not a block.
+TOPUP_REPEAT_MIN_WEEKS = 8
+
+# How many times a ticker's pre-committed trim levels may be rewritten before
+# the rewrite itself is reported. DELL reached four.
+TRIM_RESET_ALERT_COUNT = 3
+
 # Played-out banking policy lives in shadow_portfolio next to the other
 # played-out constants, because build_thesis_review() quotes the numbers
 # into the prompt. Aliased here so the guards read naturally.
@@ -588,6 +598,107 @@ def _recent_full_exit_date(ledger: dict, ticker: str, today) -> str | None:
             return t["date"]
         return None
     return None
+
+
+def _last_buy_date(ledger: dict, ticker: str) -> str | None:
+    """ISO date of the most recent BUY of this ticker in the trade log."""
+    for t in reversed(ledger.get("trades", [])):
+        if t.get("action") == "BUY" and t.get("ticker") == ticker:
+            return t.get("date")
+    return None
+
+
+def _repeat_topup_alerts(recs: list, ledger: dict, pre_val: dict) -> list[str]:
+    """
+    Flag a top-up of a position that was already topped up in the last
+    TOPUP_REPEAT_MIN_WEEKS.
+
+    The Sep 2026 deep review found NVDA had been added to four times (10 May,
+    13 May, 1 Sep, 10 Sep), was the largest position in the book at 15.9%, and
+    was sitting at -0.07% — a position built by drip-feed on a "blowout
+    earnings" narrative price had not confirmed, with each individual add
+    passing every existing guard (under the 20% cap, under the 60% theme cap,
+    inside the 3-8% dead-zone band).
+
+    The review's own prescription was to require price confirmation ("new local
+    high on volume"). That is a momentum signal and this strategy is
+    fundamentals-only, so it is not implemented. What IS implemented is the
+    part that needs no price signal: repeatedly choosing the same destination
+    for the deployable slice is a concentration decision, and it should have to
+    be argued each time rather than accumulating by default.
+
+    Advisory, not blocking. A block would leave the slice undeployed with no
+    mechanism to pick an alternative destination — reopening the idle-cash trap
+    that was deliberately closed in Aug 2026. The prompt carries the rule, so a
+    fired alert means Claude was told and did it anyway.
+    """
+    alerts: list[str] = []
+    positions = ledger.get("positions") or {}
+    total = pre_val.get("total_value_gbp") or 0
+    today = datetime.now().date()
+    for rec in recs:
+        if (rec.get("action") or "").upper().strip() != "BUY":
+            continue
+        ticker = _rec_ticker(rec)
+        if not ticker or ticker not in positions:
+            continue            # a new position, not a top-up
+        last = _last_buy_date(ledger, ticker)
+        if not last:
+            continue
+        try:
+            days = (today - datetime.strptime(last, "%Y-%m-%d").date()).days
+        except (TypeError, ValueError):
+            continue
+        if days > TOPUP_REPEAT_MIN_WEEKS * 7:
+            continue
+        weight = ((pre_val.get("positions", {}).get(ticker, {}) or {})
+                  .get("current_value_gbp") or 0)
+        weight_txt = f", now {weight / total * 100:.1f}% of portfolio" if total else ""
+        alerts.append(
+            f"ALERT: BUY {ticker} tops up a position last added to on {last} "
+            f"({days}d ago, inside the {TOPUP_REPEAT_MIN_WEEKS}-week repeat "
+            f"window{weight_txt}) - averaging into one name across runs is a "
+            f"concentration decision, not a fresh idea"
+        )
+    return alerts
+
+
+def _trim_reset_alerts(recs: list, ledger: dict) -> list[str]:
+    """
+    Flag a SET_TRIMS on a ticker whose levels have already been re-set several
+    times.
+
+    The tighten-only guard stops levels being LOOSENED, but nothing counts how
+    often they are rewritten. DELL's were re-set on 27 Jul, 3 Aug, 10 Aug and
+    10 Sep, and the Sep 2026 deep review called the pattern "manufacturing the
+    appearance of discipline" — each individual re-set was legal and the
+    sequence still meant the pre-committed exit was never the same line twice.
+
+    Counting rather than blocking, deliberately: once every level on a big
+    winner has been honoured there is no un-hit trigger left for the
+    tighten-only rule to compare against, and blocking the next SET_TRIMS would
+    leave the residual position with no mechanical exit at all. The count is
+    the signal, in the same spirit as the driver-churn escalation.
+    """
+    alerts: list[str] = []
+    for rec in recs:
+        if (rec.get("action") or "").upper().strip() != "SET_TRIMS":
+            continue
+        ticker = _rec_ticker(rec)
+        if not ticker:
+            continue
+        prior = sum(
+            1 for t in ledger.get("trades", [])
+            if t.get("action") == "SET_TRIMS" and t.get("ticker") == ticker
+        )
+        if prior + 1 >= TRIM_RESET_ALERT_COUNT:
+            alerts.append(
+                f"ALERT: SET_TRIMS {ticker} is re-set #{prior + 1} for this "
+                f"position - repeatedly rewriting a pre-committed exit is the "
+                f"appearance of discipline, not the fact of it; check the new "
+                f"level is tighter in cash terms, not just reachable"
+            )
+    return alerts
 
 
 def _pre_commit_trim_alerts(recs: list, ledger: dict, pre_val: dict) -> list[str]:
@@ -1272,6 +1383,8 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict,
         allowed.append(rec)
 
     # Advisory alerts — surfaced in the email, never blocking
+    guard_events.extend(_repeat_topup_alerts(recs, ledger, pre_val))
+    guard_events.extend(_trim_reset_alerts(recs, ledger))
     guard_events.extend(_pre_commit_trim_alerts(recs, ledger, pre_val))
     guard_events.extend(_forward_driver_alerts(recs, ledger))
     guard_events.extend(_played_out_trim_alerts(recs, ledger, pre_val))
@@ -1420,6 +1533,15 @@ def build_weekly_email_body(started: datetime, post_val: dict,
     attribution = sp.format_attribution_for_email(post_val)
     if attribution:
         perf_section += "\n\n" + attribution
+
+    # Kill criterion #5 as a standing metric rather than a monthly argument:
+    # strip the top contributor and show what the rest of the book earned.
+    # It triggered on 2026-09-10 (DELL was ~85% of all profit) and the deep
+    # review's own verdict was that surfacing it every run was the only one of
+    # its recommendations that addressed the finding.
+    ex_top = sp.format_ex_top_for_email(ledger, post_val) if ledger else ""
+    if ex_top:
+        perf_section += "\n\n" + ex_top
 
     # Currency decomposition: the GBP P&L above blends the business with
     # sterling, and nothing separated them until now.
@@ -1586,6 +1708,16 @@ def run_weekly(started: datetime) -> None:
         return
     sp.init_benchmark_start_price(ledger)
     t212_price_map = sync_shadow_with_t212(ledger, t212_cash, t212_positions)
+
+    # Step 3b: backfill entry FX rates on any position missing one, BEFORE the
+    # valuation and prompt are built. Idempotent — one history fetch on the
+    # first run and nothing after. Without this the currency decomposition can
+    # only score positions bought since the field existed: on 2026-09-10 that
+    # was NVDA alone, and the email reported "FX moved the book between +0.00
+    # and +0.00 pts", which reads as "no FX effect" — precisely what a missing
+    # rate must never be allowed to look like.
+    for e in sp.ensure_entry_fx(ledger):
+        logger.info("[FX] backfilled %s", e)
 
     # Step 4: Pre-trade valuation — passed into Claude prompt as portfolio context
     pre_val = sp.valuation(ledger, t212_price_map=t212_price_map)
