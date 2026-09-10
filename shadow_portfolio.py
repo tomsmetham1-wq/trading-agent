@@ -2243,6 +2243,38 @@ def format_watchlist_for_email(ledger: dict) -> str:
     return "\n".join(lines)
 
 
+def entry_thesis_provenance(pos: dict) -> tuple[str, str]:
+    """
+    Say whether a position's entry thesis was actually written at entry.
+
+    Three of the nine holdings predate the thesis field, and the difference
+    matters more than bookkeeping: a case reconstructed on 2026-07-03 for a
+    position bought on 2026-04-26 was written with ten weeks of price history
+    already visible. That is a justification produced with the outcome known,
+    which is the confirmation-seeking the Sep 2026 deep review flagged — and
+    it is exactly the reasoning the thesis-accountability loop exists to test.
+    A recorded entry thesis can be wrong; a reconstructed one cannot be
+    scored at all, because it was never a prediction.
+
+    Not grounds for a mechanical sell. Selling on a record-keeping defect
+    would be a trade forced by paperwork rather than by fundamentals — the
+    AVGO process error the same review called the worst artefact in the book.
+    It is grounds for having to re-underwrite the position.
+
+    Returns (kind, detail) where kind is one of "recorded", "backfilled",
+    "synced" or "missing".
+    """
+    thesis = (pos.get("thesis") or "").strip()
+    if not thesis or thesis == "(no thesis recorded)":
+        return "missing", "no thesis on record at all"
+    if thesis.startswith("(synced from T212)"):
+        return "synced", "placeholder written by T212 sync, never a stated case"
+    low = thesis[:80].lower()
+    if "backfilled" in low:
+        return "backfilled", "reconstructed after entry, with price history visible"
+    return "recorded", ""
+
+
 def build_thesis_review(ledger: dict, current_val: dict) -> str:
     """
     Build the thesis accountability section for the Claude weekly prompt.
@@ -2280,6 +2312,18 @@ def build_thesis_review(ledger: dict, current_val: dict) -> str:
                 + (f", theme: {theme}" if theme else "")
                 + f")\n    Entry thesis: {thesis}"
             )
+            kind, detail = entry_thesis_provenance(pos)
+            if kind != "recorded":
+                entry += (
+                    f"\n    *** ENTRY THESIS NOT RECORDED AT ENTRY ({kind}: "
+                    f"{detail}). This case was never a prediction, so its\n"
+                    f"        track record cannot be scored and re-confirming "
+                    f"it proves nothing. RE-UNDERWRITE {ticker} THIS RUN: state "
+                    f"the case you\n        would buy it on fresh today at this "
+                    f"weight, as a SET_DRIVER, or recycle the capital. If it "
+                    f"has also earned\n        nothing since entry, the "
+                    f"single-name dependency block applies to it directly. ***"
+                )
             entry += _format_forward_driver(
                 pos, bank_due=played_out_bank_due(ledger, ticker, pos))
             trims = pos.get("pre_commit_trims")

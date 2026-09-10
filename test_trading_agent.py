@@ -2689,3 +2689,58 @@ class TestTrimResetAlert:
             recs, led, {"total_value_gbp": 6333.0, "positions": {}})
         assert len(allowed) == 1
         assert any("re-set #4" in e for e in events)
+
+
+class TestEntryThesisProvenance:
+    """
+    A thesis reconstructed after entry was never a prediction, so confirming it
+    proves nothing — AMZN and GOOGL were both backfilled on 2026-07-03 for
+    positions bought 2026-04-26. Flagged for re-underwriting, never sold
+    mechanically: a trade forced by a record-keeping defect is the AVGO process
+    error, not risk management.
+    """
+
+    def test_recorded_thesis_is_not_flagged(self):
+        kind, _ = sp.entry_thesis_provenance(
+            {"thesis": "Cheapest stock in portfolio at 17x P/E vs 50x sector."})
+        assert kind == "recorded"
+
+    def test_backfilled_thesis_is_flagged(self):
+        kind, detail = sp.entry_thesis_provenance(
+            {"thesis": "[Backfilled 2026-07-03 - no thesis recorded at entry] "
+                       "AWS re-acceleration to 28% YoY growth."})
+        assert kind == "backfilled"
+        assert "price history" in detail
+
+    def test_sync_placeholder_is_flagged(self):
+        kind, _ = sp.entry_thesis_provenance({"thesis": "(synced from T212)"})
+        assert kind == "synced"
+
+    def test_absent_thesis_is_flagged(self):
+        assert sp.entry_thesis_provenance({})[0] == "missing"
+        assert sp.entry_thesis_provenance({"thesis": "  "})[0] == "missing"
+
+    def test_a_later_backfill_mention_does_not_false_positive(self):
+        # The marker is a prefix; the word appearing deep in a real thesis
+        # must not demote a properly recorded case.
+        kind, _ = sp.entry_thesis_provenance({"thesis": "A" * 200 + " backfilled"})
+        assert kind == "recorded"
+
+    def test_review_demands_re_underwriting_not_a_sell(self):
+        ledger = {"positions": {"AMZN": {
+            "thesis": "[Backfilled 2026-07-03] AWS re-acceleration.",
+            "first_bought": "2026-04-26", "theme": "AI infrastructure"}},
+            "trades": []}
+        review = sp.build_thesis_review(
+            ledger, {"positions": {"AMZN": {"pnl_pct": -4.92}}})
+        assert "ENTRY THESIS NOT RECORDED AT ENTRY" in review
+        assert "RE-UNDERWRITE AMZN THIS RUN" in review
+        assert "recycle the capital" in review
+
+    def test_review_stays_quiet_on_properly_recorded_positions(self):
+        ledger = {"positions": {"XOM": {
+            "thesis": "Permian-scale FCF machine at ~13x forward P/E.",
+            "first_bought": "2026-06-22"}}, "trades": []}
+        review = sp.build_thesis_review(
+            ledger, {"positions": {"XOM": {"pnl_pct": 19.19}}})
+        assert "ENTRY THESIS NOT RECORDED" not in review

@@ -544,6 +544,29 @@ the review's own §7(c) finding that the failure is idea generation and NOT
 deployment or constraints. Holding more cash does not produce a second good
 idea; it just adds drag against a fully-invested benchmark.
 
+Entry-thesis provenance (Sep 2026). `entry_thesis_provenance()` classifies each
+holding's thesis as recorded / backfilled / synced / missing, and
+`build_thesis_review()` flags anything but "recorded" as needing to be
+re-underwritten this run. As of 10 Sep 2026 no position is thesis-less, but
+AMZN and GOOGL (both bought 2026-04-26, both predating the field) carry cases
+backfilled on 2026-07-03.
+
+The distinction is not bookkeeping. A case reconstructed ten weeks after entry
+was written with the price history already visible, so it was never a
+prediction and re-confirming it proves nothing — it is the confirmation-seeking
+the Sep 2026 deep review flagged, in the two positions the same review named as
+"small losers held without a fresh thesis review". Between them they are ~18%
+of the book, have returned -GBP56.81 over 137 days against a benchmark that
+returned +7.12%, and have cost ~GBP144 relative to holding VUSA with the same
+capital.
+
+Deliberately NOT a mechanical sell, and do not make it one: exiting on a
+record-keeping defect is a trade forced by paperwork rather than by
+fundamentals, which is the AVGO process error the review called the worst
+artefact in the book. The flag forces the position to be argued fresh or
+recycled; which of those happens is a judgement made in the run, in front of
+the single-name dependency block.
+
 Watchlist recording (Aug 2026) — RECORDING ONLY, deliberately not a gate:
 `ledger["watchlist"]` tracks every name Claude flags in section 4, with the
 price at first mention and a weekly observation thereafter. Claude emits an
@@ -589,7 +612,7 @@ or requires a name to persist N weeks before it can be bought. Those were
 considered and rejected — they forfeit real upside to buy a filter the data
 doesn't yet justify. Revisit only once there are ~3 months of scores.
 
-Test suite: `test_trading_agent.py` (262 tests, no network). Run it after any
+Test suite: `test_trading_agent.py` (269 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the
