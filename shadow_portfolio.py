@@ -2609,6 +2609,204 @@ def format_fx_for_email(fx: dict) -> str:
     return "\n".join(lines)
 
 
+# =============================================================================
+# Last-session moves — the "tape" the prompt never carried
+# =============================================================================
+#
+# Every figure the prompt shows for a holding is measured from ENTRY. A
+# position at +146% from entry looks the same whether it is flat or down 6%
+# on the day, so a same-day shock is invisible in the numbers Claude gets.
+# On 14 Sep 2026 the AI industry's own CEOs called for slowing capability
+# development and DELL, MRVL and NVDA opened -6%, -7% and -3% -- 48% of the
+# book in one theme, its three purest names the three worst on the day -- and
+# the email said NVDA had "no material adverse news". The T212 prices in the
+# prompt already reflected the drop; nothing told Claude they had moved.
+#
+# The per-ticker search task compounds it: "NVDA news" returns earnings and
+# analyst notes, and a story that hit every name at once is crowded out.
+# This block hands over the day move per holding and per theme and names the
+# ones that must be explained, in the same spirit as the FX decomposition:
+# give the number so the claim can be checked.
+
+DAY_MOVE_ALERT_PCT       = 3.0   # a holding moving more than this must be explained
+DAY_MOVE_THEME_ALERT_PCT = 2.0   # a theme moving this much has a common driver
+
+_day_move_cache: dict = {}
+
+
+def _session_move(yf_ticker: str) -> Optional[dict]:
+    """
+    Last price vs prior close for one ticker, in its own currency.
+
+    Native currency on both sides, so FX cannot leak into it. Cached for the
+    run: the prompt, the email and the alert all read the same figures.
+    Returns {last, prev_close, pct} or None when either price is missing.
+    """
+    if yf_ticker in _day_move_cache:
+        return _day_move_cache[yf_ticker]
+    out = None
+    try:
+        info = yf.Ticker(yf_ticker).fast_info
+        last, prev = info.last_price, info.previous_close
+        if last and prev and prev > 0:
+            out = {"last": float(last), "prev_close": float(prev),
+                   "pct": (float(last) / float(prev) - 1) * 100}
+    except Exception as e:
+        logger.warning("session move fetch failed for %s: %s", yf_ticker, e)
+    _day_move_cache[yf_ticker] = out
+    return out
+
+
+def us_session_open_now() -> bool:
+    """True during US regular hours; False pre-open, after close, weekends."""
+    try:
+        from zoneinfo import ZoneInfo
+        ny = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        return True
+    if ny.weekday() >= 5:
+        return False
+    minutes = ny.hour * 60 + ny.minute
+    return 9 * 60 + 30 <= minutes < 16 * 60
+
+
+def day_moves(ledger: dict, valuation_result: dict) -> dict:
+    """
+    Last-session move for every priced holding, the benchmark, and each theme.
+
+    Returns {
+      "positions": {ticker: {pct, weight_pct, theme}},   # sorted worst first
+      "benchmark": {ticker, pct} or None,
+      "themes":    {theme: {pct, weight_pct}},           # value-weighted
+      "flagged":   [ticker, ...],   # |pct| > DAY_MOVE_ALERT_PCT
+      "flagged_themes": [theme, ...],
+      "us_session_open": bool,      # False => US moves are the PRIOR session
+    }
+    A holding with no price on either side is omitted, never shown as 0%.
+    """
+    positions = ledger.get("positions") or {}
+    total = float(valuation_result.get("total_value_gbp") or 0) or 1.0
+    out_pos: dict = {}
+    for ticker, pv in (valuation_result.get("positions") or {}).items():
+        value = pv.get("current_value_gbp")
+        if value is None:
+            continue
+        mv = _session_move(ticker)
+        if mv is None:
+            continue
+        out_pos[ticker] = {
+            "pct":        mv["pct"],
+            "weight_pct": value / total * 100,
+            "theme":      (positions.get(ticker) or {}).get("theme") or "",
+        }
+
+    themes: dict = {}
+    for ticker, d in out_pos.items():
+        if not d["theme"]:
+            continue
+        t = themes.setdefault(d["theme"], {"_wsum": 0.0, "weight_pct": 0.0,
+                                           "count": 0})
+        t["_wsum"] += d["pct"] * d["weight_pct"]
+        t["weight_pct"] += d["weight_pct"]
+        t["count"] += 1
+    for t in themes.values():
+        t["pct"] = t.pop("_wsum") / t["weight_pct"] if t["weight_pct"] else 0.0
+
+    bench = None
+    bm_ticker = ledger.get("benchmark_ticker")
+    if bm_ticker:
+        mv = _session_move(bm_ticker)
+        if mv:
+            bench = {"ticker": bm_ticker, "pct": mv["pct"]}
+
+    ordered = dict(sorted(out_pos.items(), key=lambda x: x[1]["pct"]))
+    return {
+        "positions": ordered,
+        "benchmark": bench,
+        "themes": dict(sorted(themes.items(), key=lambda x: x[1]["pct"])),
+        "flagged": [t for t, d in ordered.items()
+                    if abs(d["pct"]) > DAY_MOVE_ALERT_PCT],
+        # A theme flag means "a common driver moved several names at once", so
+        # a one-holding theme is judged on the holding's own bar, not this one.
+        "flagged_themes": [t for t, d in themes.items()
+                           if d["count"] >= 2
+                           and abs(d["pct"]) > DAY_MOVE_THEME_ALERT_PCT],
+        "us_session_open": us_session_open_now(),
+    }
+
+
+def build_tape_review(ledger: dict, valuation_result: dict) -> str:
+    """Last-session moves section for the weekly prompt."""
+    tape = day_moves(ledger, valuation_result)
+    if not tape["positions"]:
+        return ""
+    lines = ["=== Last session moves (vs prior close, in each holding's own currency) ==="]
+    if not tape["us_session_open"]:
+        lines.append(
+            "  (US market not open at run time: US figures are the PREVIOUS"
+            " session's move.)")
+    for ticker, d in tape["positions"].items():
+        theme = f", {d['theme']}" if d["theme"] else ""
+        flag = "  <-- MUST EXPLAIN" if ticker in tape["flagged"] else ""
+        lines.append(f"  {ticker:<6} {d['pct']:>+6.2f}%  "
+                     f"({d['weight_pct']:.1f}% of book{theme}){flag}")
+    if tape["benchmark"]:
+        lines.append(f"  Benchmark {tape['benchmark']['ticker']}: "
+                     f"{tape['benchmark']['pct']:+.2f}%")
+    if tape["themes"]:
+        lines.append("  By theme (value-weighted):")
+        for theme, d in tape["themes"].items():
+            flag = "  <-- MUST EXPLAIN" if theme in tape["flagged_themes"] else ""
+            lines.append(f"    {theme}: {d['pct']:+.2f}% "
+                         f"({d['weight_pct']:.1f}% of book){flag}")
+    if tape["flagged"] or tape["flagged_themes"]:
+        names = ", ".join(tape["flagged"]) or "none"
+        themes = ", ".join(tape["flagged_themes"]) or "none"
+        lines.append(
+            f"  RULE: every holding moving more than {DAY_MOVE_ALERT_PCT:.0f}% "
+            f"and every multi-holding theme moving more than "
+            f"{DAY_MOVE_THEME_ALERT_PCT:.0f}%\n"
+            f"  -- holdings: {names}; themes: {themes} --\n"
+            f"  MUST be explained in section 2 with a cause you found by "
+            f"searching. \"No material news\" is NOT a permitted answer\n"
+            f"  for a name on this list.\n"
+            f"  When several holdings in one theme moved together, the cause is "
+            f"almost never in any one company: search the THEME itself\n"
+            f"  (policy, regulation, the sector, the industry's own statements) "
+            f"- a per-ticker search returns analyst notes and misses the\n"
+            f"  story that hit everything at once. Then say, per position, "
+            f"whether it changes the thesis or the theme exposure. It may not;\n"
+            f"  but the question must be asked and answered, not skipped."
+        )
+    return "\n".join(lines) + "\n"
+
+
+def format_tape_for_email(tape: dict) -> str:
+    """Last-session moves for the weekly email, worst first."""
+    if not tape or not tape.get("positions"):
+        return ""
+    lines = ["Last session moves (vs prior close, own currency):"]
+    if not tape.get("us_session_open"):
+        lines.append("  (US market not open at run time - previous session shown)")
+    for ticker, d in tape["positions"].items():
+        mark = " !" if ticker in tape["flagged"] else "  "
+        theme = f"  {d['theme']}" if d["theme"] else ""
+        lines.append(f"  {ticker:<6}{mark}{d['pct']:>+6.2f}%  "
+                     f"({d['weight_pct']:4.1f}%){theme}")
+    if tape.get("benchmark"):
+        lines.append(f"  Benchmark {tape['benchmark']['ticker']}: "
+                     f"{tape['benchmark']['pct']:+.2f}%")
+    for theme, d in (tape.get("themes") or {}).items():
+        mark = " !" if theme in tape["flagged_themes"] else "  "
+        lines.append(f"  {theme}{mark}{d['pct']:+.2f}% weighted "
+                     f"({d['weight_pct']:.1f}% of book)")
+    if tape["flagged"] or tape["flagged_themes"]:
+        lines.append(f"  (! = moved more than {DAY_MOVE_ALERT_PCT:.0f}% / theme "
+                     f"{DAY_MOVE_THEME_ALERT_PCT:.0f}% - the analysis was "
+                     f"required to explain these)")
+    return "\n".join(lines)
+
+
 def format_valuation_for_email(val: dict) -> str:
     """
     Format the portfolio valuation as a plain-text summary for the email body.

@@ -480,6 +480,35 @@ context and never reached the weekly email. The prompt also now requires that a
 played-out position's next trim level be within ~15% of TODAY's price, tightened
 via SET_TRIMS alongside the SET_DRIVER if it isn't.
 
+Last-session moves (Sep 2026) — the "tape" the prompt never carried. Every
+figure the prompt shows for a holding is measured from ENTRY, so a same-day
+shock is invisible: on 14 Sep 2026 the AI industry's own CEOs called for
+slowing capability development, DELL/MRVL/NVDA opened -6%/-7%/-3% (48% of the
+book in one theme, its three purest names the three worst on the day), the
+T212 prices in the prompt already reflected it, and the email said NVDA had
+"no material adverse news" with rates as the only macro headwind. Two causes:
+the prompt carried no day-change data, and the search task was per-ticker
+only — "NVDA news" returns earnings and analyst notes and crowds out a story
+that hit every name at once (DELL's bullet was Friday's RBC $640 initiation
+while the stock was -6% on Monday).
+
+`sp.day_moves()` gives last price vs prior close per holding in its OWN
+currency (so FX can't leak in), the benchmark, and a value-weighted move per
+theme; `_session_move()` is cached per run so the prompt, email and alert all
+carry the same figures. `build_tape_review()` puts it in the prompt with
+"MUST EXPLAIN" against every holding over `DAY_MOVE_ALERT_PCT` (3%) and every
+MULTI-holding theme over `DAY_MOVE_THEME_ALERT_PCT` (2%) — a one-name theme
+is judged on the holding's bar, since a theme flag means "a common driver
+moved several names". The prompt forbids "no material news" for anything on
+that list and the search task now requires at least one search on the THEME
+itself for every theme above 25% of the book. `format_tape_for_email()` and
+`_day_move_alerts()` ("ALERT: LARGE MOVE today: ...") make it visible in the
+email from code, whatever the analysis says. Before the US open (the Task
+Scheduler run is Monday 10:00) US figures are the PREVIOUS session's and the
+block says so. Deliberately no trade rule: whether a sector-wide story breaks
+a thesis is the judgement the run exists to make; the defect was that it was
+never asked.
+
 Currency decomposition (Sep 2026). Every holding is priced in GBP, so its
 reported P&L blends what the business did with what sterling did, and the
 prompt carried NO FX data at all -- every price in it is GBP. So "that loss is
@@ -662,7 +691,7 @@ or requires a name to persist N weeks before it can be bought. Those were
 considered and rejected — they forfeit real upside to buy a filter the data
 doesn't yet justify. Revisit only once there are ~3 months of scores.
 
-Test suite: `test_trading_agent.py` (288 tests, no network). Run it after any
+Test suite: `test_trading_agent.py` (302 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the

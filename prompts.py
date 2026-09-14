@@ -163,7 +163,10 @@ Write a concise prose report in this structure:
 One short paragraph.
 
 **2. News & events affecting holdings**
-Bulleted, most material first. "Nothing significant" is a valid answer.
+Bulleted, most material first. "Nothing significant" is a valid answer —
+EXCEPT for any holding or theme marked MUST EXPLAIN in the last-session
+moves block, which needs a searched cause and a one-line verdict on whether
+it changes the thesis or the theme exposure.
 
 **3. Recommended actions this week**
 For each: BUY / SELL / HOLD / TRIM, ticker, % of portfolio or trim %, one-sentence
@@ -412,6 +415,7 @@ recommendation had been executed) ===
 === Thesis accountability ===
 {thesis_review}
 
+{tape_review}
 {fx_review}
 {ex_top_review}
 {watchlist_review}
@@ -419,6 +423,15 @@ Today: {today}
 
 Task — use web search to:
   1. Check for material news (last 7 days) affecting current shadow positions.
+  1b. For EVERY theme above 25% of the book, run at least one search on the
+     theme itself — policy, regulation, the sector, the industry's own
+     statements — not just on the tickers in it. A per-ticker search returns
+     that company's earnings and analyst notes; it misses the story that hits
+     every name in the theme at once. On 2026-09-14 the industry's own CEOs
+     called for slowing AI development, three AI holdings opened -3% to -7%,
+     and the report said "no material adverse news" because it had only
+     searched the tickers. Section 2 must say what, if anything, is moving
+     the theme, and whether it changes any thesis or the theme exposure.
   2. Ruthlessly reassess prior theses. If a thesis has broken down, say SELL.
      Do not feel committed to prior picks.
   3. Identify 1–3 candidate new positions with a clear fundamental thesis.
@@ -651,6 +664,7 @@ def build_prompt(shadow_val: dict, shadow_ledger: dict,
         trade_history=(json.dumps(recent_trades, indent=2, default=str)
                        if recent_trades else "(none yet)"),
         thesis_review=sp.build_thesis_review(shadow_ledger, shadow_val),
+        tape_review=sp.build_tape_review(shadow_ledger, shadow_val),
         fx_review=sp.build_fx_review(shadow_ledger, shadow_val),
         ex_top_review=sp.build_ex_top_review(shadow_ledger, shadow_val),
         watchlist_review=sp.build_watchlist_review(shadow_ledger),

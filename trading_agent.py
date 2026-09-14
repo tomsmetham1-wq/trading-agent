@@ -1170,6 +1170,28 @@ def _theme_cap_alerts(theme_exposure: dict, themes_rebalanced_this_run: set,
     return alerts
 
 
+def _day_move_alerts(tape: dict) -> list[str]:
+    """
+    Advisory alert (never blocking) for holdings or themes that moved hard in
+    the last session. Fires from code, so it reaches the email whether or not
+    the analysis mentioned it — on 2026-09-14 it did not. Takes the tape dict
+    from sp.day_moves() rather than fetching, so it never touches the network
+    itself and the figures match the prompt's exactly.
+    """
+    if not tape:
+        return []
+    parts = [f"{t} {tape['positions'][t]['pct']:+.1f}%"
+             for t in tape.get("flagged", [])]
+    parts += [f"'{th}' theme {tape['themes'][th]['pct']:+.1f}% weighted "
+              f"({tape['themes'][th]['weight_pct']:.0f}% of book)"
+              for th in tape.get("flagged_themes", [])]
+    if not parts:
+        return []
+    session = "today" if tape.get("us_session_open") else "last session"
+    return [f"ALERT: LARGE MOVE {session}: " + "; ".join(parts)
+            + " - check the analysis explains it"]
+
+
 def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict,
                             played_out: list = None) -> tuple[list, list]:
     """
@@ -1541,6 +1563,14 @@ def build_weekly_email_body(started: datetime, post_val: dict,
     if attribution:
         perf_section += "\n\n" + attribution
 
+    # What moved TODAY. Every other figure here is measured from entry or from
+    # last week's snapshot, so a bad Monday is invisible until the following
+    # Monday — on 2026-09-14 the AI names opened -3% to -7% on a sector-wide
+    # story and nothing in the email showed it.
+    tape = sp.format_tape_for_email(sp.day_moves(ledger, post_val)) if ledger else ""
+    if tape:
+        perf_section += "\n\n" + tape
+
     # Kill criterion #5 as a standing metric rather than a monthly argument:
     # strip the top contributor and show what the rest of the book earned.
     # It triggered on 2026-09-10 (DELL was ~85% of all profit) and the deep
@@ -1748,6 +1778,9 @@ def run_weekly(started: datetime) -> None:
     # Step 5b: mechanical strategy guards (flip-flop rule, 20% position cap)
     recs, guard_events = enforce_strategy_guards(
         recs, ledger, pre_val, played_out)
+    # Same figures the prompt carried (cached per run) — surfaced in the email
+    # so a sector-wide move is visible even when the analysis skips it.
+    guard_events.extend(_day_move_alerts(sp.day_moves(ledger, pre_val)))
     for e in guard_events:
         logger.warning("[GUARD] %s", e)
 

@@ -2974,3 +2974,168 @@ class TestEntryThesisProvenance:
         review = sp.build_thesis_review(
             ledger, {"positions": {"XOM": {"pnl_pct": 19.19}}})
         assert "ENTRY THESIS NOT RECORDED" not in review
+
+
+# =============================================================================
+# Last-session moves — the tape the prompt never carried
+# =============================================================================
+
+class TestDayMoves:
+    """
+    Every figure in the prompt is measured from entry, so a same-day shock is
+    invisible: on 2026-09-14 the AI names opened -3% to -7% on a sector-wide
+    story, the T212 prices in the prompt already reflected it, and the report
+    said "no material adverse news". This block hands over the day move per
+    holding and per theme and names what must be explained.
+    """
+    MOVES = {
+        "MRVL": -6.95, "DELL": -6.26, "NVDA": -3.09, "AMZN": -1.37,
+        "GOOGL": 2.08, "ABBV": 1.94, "XOM": 0.45, "VUSA.L": -0.63,
+    }
+
+    def _ledger(self):
+        return {
+            "benchmark_ticker": "VUSA.L",
+            "positions": {
+                "MRVL":  {"theme": "AI infrastructure"},
+                "DELL":  {"theme": "AI infrastructure"},
+                "NVDA":  {"theme": "AI infrastructure"},
+                "AMZN":  {"theme": "AI infrastructure"},
+                "GOOGL": {"theme": "AI infrastructure"},
+                "ABBV":  {"theme": "pharma"},
+                "XOM":   {"theme": "energy"},
+            },
+        }
+
+    def _val(self):
+        weights = {"MRVL": 366, "DELL": 539, "NVDA": 965, "AMZN": 432,
+                   "GOOGL": 369, "ABBV": 694, "XOM": 845}
+        return {"total_value_gbp": 6367.0,
+                "positions": {t: {"current_value_gbp": v} for t, v in weights.items()}}
+
+    @pytest.fixture(autouse=True)
+    def _no_network(self, monkeypatch):
+        monkeypatch.setattr(
+            sp, "_session_move",
+            lambda t: ({"pct": self.MOVES[t], "last": 1, "prev_close": 1}
+                       if t in self.MOVES else None))
+        monkeypatch.setattr(sp, "us_session_open_now", lambda: True)
+
+    def test_positions_sorted_worst_first_with_weights_and_themes(self):
+        tape = sp.day_moves(self._ledger(), self._val())
+        assert list(tape["positions"])[:3] == ["MRVL", "DELL", "NVDA"]
+        nvda = tape["positions"]["NVDA"]
+        assert nvda["pct"] == pytest.approx(-3.09)
+        assert nvda["weight_pct"] == pytest.approx(965 / 6367 * 100)
+        assert nvda["theme"] == "AI infrastructure"
+        assert tape["benchmark"] == {"ticker": "VUSA.L", "pct": -0.63}
+
+    def test_theme_move_is_value_weighted(self):
+        tape = sp.day_moves(self._ledger(), self._val())
+        ai = tape["themes"]["AI infrastructure"]
+        w = {"MRVL": 366, "DELL": 539, "NVDA": 965, "AMZN": 432, "GOOGL": 369}
+        expect = sum(self.MOVES[t] * v for t, v in w.items()) / sum(w.values())
+        assert ai["pct"] == pytest.approx(expect)
+        assert ai["weight_pct"] == pytest.approx(sum(w.values()) / 6367 * 100)
+        assert ai["count"] == 5
+
+    def test_flags_holdings_over_3pct_and_multi_name_themes_over_2pct(self):
+        tape = sp.day_moves(self._ledger(), self._val())
+        assert tape["flagged"] == ["MRVL", "DELL", "NVDA"]
+        assert tape["flagged_themes"] == ["AI infrastructure"]
+
+    def test_single_holding_theme_is_judged_on_the_holding_bar(self, monkeypatch):
+        # pharma is ABBV alone at +2.5%: below the 3% holding bar, and a
+        # "theme" of one name has no common driver to flag at 2%.
+        moves = dict(self.MOVES, ABBV=2.5)
+        monkeypatch.setattr(
+            sp, "_session_move",
+            lambda t: ({"pct": moves[t]} if t in moves else None))
+        tape = sp.day_moves(self._ledger(), self._val())
+        assert "pharma" not in tape["flagged_themes"]
+        assert "ABBV" not in tape["flagged"]
+
+    def test_unpriced_holding_is_omitted_not_shown_as_flat(self):
+        val = self._val()
+        val["positions"]["NVDA"]["current_value_gbp"] = None
+        tape = sp.day_moves(self._ledger(), val)
+        assert "NVDA" not in tape["positions"]
+        ledger = self._ledger()
+        ledger["positions"]["ZZZ"] = {"theme": "x"}
+        val["positions"]["ZZZ"] = {"current_value_gbp": 100.0}
+        tape = sp.day_moves(ledger, val)
+        assert "ZZZ" not in tape["positions"]      # no session move available
+
+    def test_review_marks_must_explain_and_states_the_rule(self):
+        review = sp.build_tape_review(self._ledger(), self._val())
+        assert "MRVL    -6.95%" in review
+        assert review.count("<-- MUST EXPLAIN") == 4   # 3 names + 1 theme
+        assert "holdings: MRVL, DELL, NVDA; themes: AI infrastructure" in review
+        assert "NOT a permitted answer" in review
+        assert "search the THEME itself" in review
+        assert "Benchmark VUSA.L: -0.63%" in review
+
+    def test_review_has_no_rule_when_nothing_moved(self, monkeypatch):
+        monkeypatch.setattr(sp, "_session_move", lambda t: {"pct": 0.4})
+        review = sp.build_tape_review(self._ledger(), self._val())
+        assert "MUST EXPLAIN" not in review
+        assert "RULE:" not in review
+        assert "MRVL" in review
+
+    def test_review_says_when_us_figures_are_the_prior_session(self, monkeypatch):
+        monkeypatch.setattr(sp, "us_session_open_now", lambda: False)
+        review = sp.build_tape_review(self._ledger(), self._val())
+        assert "PREVIOUS session" in review
+
+    def test_review_empty_without_positions(self):
+        assert sp.build_tape_review({"positions": {}}, {"positions": {}}) == ""
+
+    def test_prompt_template_carries_the_block_and_the_theme_search_task(self):
+        assert "{tape_review}" in prompts.ANALYSIS_USER_TEMPLATE
+        assert "search on the\n     theme itself" in prompts.ANALYSIS_USER_TEMPLATE
+        assert "MUST EXPLAIN" in prompts.ANALYSIS_SYSTEM
+
+    def test_email_block_marks_flagged_names(self):
+        tape = sp.day_moves(self._ledger(), self._val())
+        text = sp.format_tape_for_email(tape)
+        assert "MRVL   ! -6.95%" in text
+        assert "XOM      +0.45%" in text
+        assert "AI infrastructure !" in text
+        assert "pharma  +1.94%" in text
+        assert sp.format_tape_for_email({}) == ""
+
+    def test_alert_fires_from_the_tape_not_the_analysis(self):
+        tape = sp.day_moves(self._ledger(), self._val())
+        alerts = ta._day_move_alerts(tape)
+        assert len(alerts) == 1
+        a = alerts[0]
+        assert a.startswith("ALERT: LARGE MOVE today: MRVL -7.0%; DELL -6.3%; NVDA -3.1%")
+        assert "'AI infrastructure' theme -3." in a
+        assert "check the analysis explains it" in a
+
+    def test_alert_silent_when_nothing_flagged(self, monkeypatch):
+        monkeypatch.setattr(sp, "_session_move", lambda t: {"pct": 0.4})
+        assert ta._day_move_alerts(sp.day_moves(self._ledger(), self._val())) == []
+        assert ta._day_move_alerts({}) == []
+
+    def test_session_move_is_cached_per_run(self, monkeypatch):
+        calls = []
+
+        class _Info:
+            last_price = 101.0
+            previous_close = 100.0
+
+        class _Tkr:
+            def __init__(self, t):
+                calls.append(t)
+                self.fast_info = _Info()
+
+        monkeypatch.undo()   # restore the real _session_move for this test
+        sp._day_move_cache.clear()
+        monkeypatch.setattr(sp.yf, "Ticker", _Tkr)
+        a = sp._session_move("CACHE_TEST")
+        b = sp._session_move("CACHE_TEST")
+        assert a["pct"] == pytest.approx(1.0)
+        assert a is b
+        assert calls == ["CACHE_TEST"]
+        sp._day_move_cache.clear()
