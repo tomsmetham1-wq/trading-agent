@@ -903,6 +903,31 @@ def _apply_set_thesis(ledger: dict, rec: dict, ticker: str, run_date: str) -> st
     return f"SET_THESIS {ticker}: {text}"
 
 
+def _apply_set_size(ledger: dict, rec: dict, ticker: str, run_date: str) -> str:
+    """
+    Record the argument for a position's ACCUMULATED size (ledger-only).
+
+    Clears the SIZE NEVER ARGUED flag until the next top-up of that position:
+    an argument for today's size does not cover a later buy. Moves no money,
+    places no order, touches nothing else on the position.
+    """
+    text = (rec.get("size_argument") or rec.get("thesis_oneline") or "").strip()
+    pos = ledger.get("positions", {}).get(ticker)
+    if pos is None:
+        return f"SKIP SET_SIZE {ticker}: no such position in shadow ledger"
+    if not text:
+        return f"SKIP SET_SIZE {ticker}: no size_argument text provided"
+    pos["size_argument"]  = text
+    pos["size_argued_on"] = run_date
+    ledger.setdefault("trades", []).append({
+        "date":          run_date,
+        "action":        "SET_SIZE",
+        "ticker":        ticker,
+        "size_argument": text,
+    })
+    return f"SET_SIZE {ticker}: {text}"
+
+
 def apply_recommendations(ledger: dict, recs: list, run_date: str) -> list[str]:
     """
     Apply a list of trade recommendations to the shadow portfolio ledger.
@@ -931,7 +956,7 @@ def apply_recommendations(ledger: dict, recs: list, run_date: str) -> list[str]:
         action = rec.get("action", "").upper().strip()
         ticker = rec.get("yfinance_ticker") or rec.get("ticker")
         if not ticker or action not in ("BUY", "SELL", "TRIM", "SET_TRIMS",
-                                        "SET_DRIVER", "SET_THESIS"):
+                                        "SET_DRIVER", "SET_THESIS", "SET_SIZE"):
             continue
 
         # Metadata-only actions never need a price — handle them before the
@@ -944,6 +969,9 @@ def apply_recommendations(ledger: dict, recs: list, run_date: str) -> list[str]:
             continue
         if action == "SET_THESIS":
             events.append(_apply_set_thesis(ledger, rec, ticker, run_date))
+            continue
+        if action == "SET_SIZE":
+            events.append(_apply_set_size(ledger, rec, ticker, run_date))
             continue
 
         # For BUY: use T212 actual fill price if available (most accurate cost basis).
@@ -1952,6 +1980,135 @@ def update_played_out_peaks(ledger: dict, valuation: dict, run_date: str) -> lis
     return events
 
 
+# =============================================================================
+# Accumulated size that was never argued for (Sep 2026)
+# =============================================================================
+#
+# Every dead-zone top-up is individually legal and individually small, so a
+# position can become the largest in the book without anyone ever deciding it
+# should be. NVDA: opened at £500 (~8%) on 13 May 2026, topped up £246 on
+# 1 Sep and £259 on 10 Sep -- 11.6% to 15.9% of the book in nine days, the
+# biggest holding, with each buy argued on "thesis confirmed" and "most upside
+# to the first trim level" (which is measured from entry and so always picks
+# the name that has gone up least). Neither top-up argued for a 15% position;
+# the accumulation was never the thing being decided.
+#
+# This does not block anything. It puts the accumulated size in front of the
+# agent every run until it is either argued for on the record (SET_SIZE) or
+# trimmed back toward the size that was argued for. Same lesson as SET_DRIVER:
+# an argument made in prose is forgotten by the next run, so it has to be a
+# ledger action to count.
+
+SIZE_ARGUED_MIN_WEIGHT_PCT = 12.0   # below this, size is a non-issue
+SIZE_ARGUED_TOPUP_SHARE    = 0.30   # of cost basis that came from top-ups
+
+
+def topup_composition(ledger: dict, ticker: str) -> dict:
+    """
+    Split a held position's cost between its opening buy and later top-ups.
+
+    Replays BUY / SYNC_ADD records for the ticker from the start of the
+    CURRENT lot: a SYNC_REMOVE (order rejected), a SYNC_RESET, or a
+    closed_position sell ends a lot, and the next buy opens a new one. The
+    first buy of the lot is the opening; every later one is a top-up.
+    Returns {opening_gbp, topup_gbp, total_gbp, topup_share, topups: [dates]}.
+    """
+    opening = 0.0
+    topups: list[tuple[str, float]] = []
+    open_lot = False
+    for t in ledger.get("trades", []) or []:
+        action = t.get("action")
+        if action == "SYNC_RESET":
+            opening, topups, open_lot = 0.0, [], False
+            continue
+        if t.get("ticker") != ticker:
+            continue
+        if action == "SYNC_REMOVE":
+            opening, topups, open_lot = 0.0, [], False
+        elif action in ("SELL", "TRIM") and t.get("closed_position"):
+            opening, topups, open_lot = 0.0, [], False
+        elif action == "BUY" or action == "SYNC_ADD":
+            if action == "BUY":
+                amount = float(t.get("amount_gbp") or 0)
+            else:
+                amount = float(t.get("shares") or 0) * float(t.get("avg_cost_gbp") or 0)
+            if amount <= 0:
+                continue
+            if not open_lot:
+                opening, topups, open_lot = amount, [], True
+            else:
+                topups.append((t.get("date") or "?", amount))
+    topup_gbp = sum(a for _, a in topups)
+    total = opening + topup_gbp
+    return {
+        "opening_gbp": round(opening, 2),
+        "topup_gbp":   round(topup_gbp, 2),
+        "total_gbp":   round(total, 2),
+        "topup_share": (topup_gbp / total) if total > 0 else 0.0,
+        "topups":      [d for d, _ in topups],
+    }
+
+
+def size_never_argued(ledger: dict, ticker: str, pos: dict,
+                      current_val: dict) -> Optional[dict]:
+    """
+    Say whether a position's current size was reached by top-ups and never
+    argued for. Returns None when there is nothing to flag, else a dict with
+    the numbers the review and the email alert both render.
+
+    Flags when the position is at least SIZE_ARGUED_MIN_WEIGHT_PCT of the
+    book, at least SIZE_ARGUED_TOPUP_SHARE of its cost came from top-ups, and
+    either no size argument is on record or a top-up has been made SINCE it
+    was recorded (an argument for 12% does not cover a later buy to 16%).
+    """
+    total = float(current_val.get("total_value_gbp") or 0)
+    value = ((current_val.get("positions") or {}).get(ticker) or {}).get("current_value_gbp")
+    if not total or value is None:
+        return None
+    weight = float(value) / total * 100
+    if weight < SIZE_ARGUED_MIN_WEIGHT_PCT:
+        return None
+    comp = topup_composition(ledger, ticker)
+    if comp["topup_share"] < SIZE_ARGUED_TOPUP_SHARE:
+        return None
+    argued_on = pos.get("size_argued_on")
+    topups_since = [d for d in comp["topups"] if argued_on and d > argued_on]
+    if argued_on and not topups_since:
+        return None
+    return {
+        "weight_pct":    weight,
+        "topup_share":   comp["topup_share"],
+        "opening_gbp":   comp["opening_gbp"],
+        "topup_gbp":     comp["topup_gbp"],
+        "topups":        comp["topups"],
+        "argued_on":     argued_on,
+        "topups_since":  topups_since,
+    }
+
+
+def _format_size_flag(ticker: str, flag: dict) -> str:
+    """The SIZE NEVER ARGUED block for one position in the thesis review."""
+    if flag["argued_on"]:
+        why = (f"its size was argued on {flag['argued_on']} but it has been "
+               f"topped up since ({', '.join(flag['topups_since'])}), so that "
+               f"argument does not cover today's size")
+    else:
+        why = "its size has never been argued for"
+    return (
+        f"\n    *** SIZE NEVER ARGUED: {ticker} is {flag['weight_pct']:.1f}% of "
+        f"the book and {flag['topup_share'] * 100:.0f}% of its cost came from "
+        f"top-ups\n        (opened at GBP {flag['opening_gbp']:.0f}, topped up "
+        f"GBP {flag['topup_gbp']:.0f} on {', '.join(flag['topups'])}) -- {why}."
+        f"\n        Each top-up was legal on its own; the accumulated position "
+        f"was never the thing being decided. THIS RUN, do one of:\n"
+        f"        (a) SET_SIZE: argue on fundamentals why {ticker} deserves "
+        f"{flag['weight_pct']:.0f}% of the book -- as a fresh sizing decision, "
+        f"not \"thesis confirmed\" -- and record it; or\n"
+        f"        (b) TRIM toward the size that was argued for at entry. "
+        f"\"Most upside to the trim level\" is not a size argument. ***"
+    )
+
+
 def _format_forward_driver(pos: dict, bank_due: bool = False) -> str:
     """
     Render the played-out / forward-driver block for one position in the thesis
@@ -2455,6 +2612,14 @@ def build_thesis_review(ledger: dict, current_val: dict) -> str:
                 entry += f"\n    (Thesis {detail}.)"
             entry += _format_forward_driver(
                 pos, bank_due=played_out_bank_due(ledger, ticker, pos))
+            size_flag = size_never_argued(ledger, ticker, pos, current_val)
+            if size_flag:
+                entry += _format_size_flag(ticker, size_flag)
+            elif pos.get("size_argued_on"):
+                entry += (
+                    f"\n    Size argued {pos['size_argued_on']}: "
+                    f"{pos.get('size_argument', '')}"
+                )
             trims = pos.get("pre_commit_trims")
             if trims:
                 entry += (

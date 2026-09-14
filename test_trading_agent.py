@@ -3139,3 +3139,176 @@ class TestDayMoves:
         assert a is b
         assert calls == ["CACHE_TEST"]
         sp._day_move_cache.clear()
+
+
+# =============================================================================
+# SIZE NEVER ARGUED — accumulated top-ups with no sizing decision
+# =============================================================================
+
+class TestSizeNeverArgued:
+    """
+    NVDA went from 11.6% to 15.9% of the book in nine days via two dead-zone
+    top-ups, each legal and each argued on "thesis confirmed"; nobody ever
+    argued for a 15% position. The flag puts the accumulated size in front of
+    the agent until it is argued on the record (SET_SIZE) or trimmed.
+    """
+
+    def _ledger(self, topups=("2026-09-01", "2026-09-10"), extra_trades=()):
+        ledger = make_ledger()
+        ledger["positions"] = {
+            "NVDA": {"shares": 6.2, "avg_cost_gbp": 162.0,
+                     "first_bought": "2026-05-13", "thesis": "cheap peer"},
+            "XOM": {"shares": 6.7, "avg_cost_gbp": 104.0,
+                    "first_bought": "2026-06-22", "thesis": "FCF"},
+        }
+        ledger["trades"] = [
+            {"date": "2026-05-10", "action": "BUY", "ticker": "NVDA",
+             "shares": 3.2, "amount_gbp": 500.0},
+            {"date": "2026-05-10", "action": "SYNC_REMOVE", "ticker": "NVDA"},
+            {"date": "2026-05-13", "action": "BUY", "ticker": "NVDA",
+             "shares": 3.06, "amount_gbp": 500.0},
+            {"date": "2026-06-22", "action": "BUY", "ticker": "XOM",
+             "shares": 6.7, "amount_gbp": 700.0},
+        ] + [
+            {"date": d, "action": "BUY", "ticker": "NVDA",
+             "shares": 1.5, "amount_gbp": 250.0}
+            for d in topups
+        ] + list(extra_trades)
+        return ledger
+
+    def _val(self, nvda=965.0, total=6300.0):
+        return {"total_value_gbp": total,
+                "positions": {"NVDA": {"current_value_gbp": nvda, "pnl_pct": -4.0},
+                              "XOM": {"current_value_gbp": 845.0, "pnl_pct": 20.0}}}
+
+    def test_composition_starts_the_lot_after_a_rejected_order(self):
+        comp = sp.topup_composition(self._ledger(), "NVDA")
+        assert comp["opening_gbp"] == 500.0          # the 10 May phantom is dropped
+        assert comp["topup_gbp"] == 500.0
+        assert comp["topup_share"] == pytest.approx(0.5)
+        assert comp["topups"] == ["2026-09-01", "2026-09-10"]
+
+    def test_composition_restarts_after_a_full_exit(self):
+        ledger = self._ledger(extra_trades=[
+            {"date": "2026-09-20", "action": "SELL", "ticker": "NVDA",
+             "shares": 6.2, "amount_gbp": 900.0, "closed_position": True},
+            {"date": "2026-10-05", "action": "BUY", "ticker": "NVDA",
+             "shares": 3.0, "amount_gbp": 480.0},
+        ])
+        comp = sp.topup_composition(ledger, "NVDA")
+        assert comp["opening_gbp"] == 480.0
+        assert comp["topups"] == []
+
+    def test_flags_large_position_built_by_topups(self):
+        ledger = self._ledger()
+        flag = sp.size_never_argued(ledger, "NVDA", ledger["positions"]["NVDA"], self._val())
+        assert flag is not None
+        assert flag["weight_pct"] == pytest.approx(965 / 6300 * 100)
+        assert flag["topup_share"] == pytest.approx(0.5)
+        assert flag["argued_on"] is None
+
+    def test_no_flag_below_weight_or_topup_thresholds(self):
+        ledger = self._ledger()
+        pos = ledger["positions"]["NVDA"]
+        assert sp.size_never_argued(ledger, "NVDA", pos, self._val(nvda=700.0)) is None   # 11.1%
+        ledger = self._ledger(topups=("2026-09-01",))   # 250 of 750 = 33% -> still flagged
+        assert sp.size_never_argued(ledger, "NVDA", ledger["positions"]["NVDA"], self._val())
+        ledger["trades"][-1]["amount_gbp"] = 150.0       # 150 of 650 = 23% -> not
+        assert sp.size_never_argued(ledger, "NVDA", ledger["positions"]["NVDA"], self._val()) is None
+        assert sp.size_never_argued(ledger, "XOM", ledger["positions"]["XOM"], self._val()) is None
+
+    def test_set_size_clears_the_flag_until_the_next_topup(self):
+        ledger = self._ledger()
+        events = sp.apply_recommendations(
+            ledger,
+            [{"action": "SET_SIZE", "yfinance_ticker": "NVDA",
+              "size_argument": "15% is deliberate: highest-conviction expression."}],
+            "2026-09-21")
+        assert events == ["SET_SIZE NVDA: 15% is deliberate: highest-conviction expression."]
+        pos = ledger["positions"]["NVDA"]
+        assert pos["size_argued_on"] == "2026-09-21"
+        assert ledger["trades"][-1]["action"] == "SET_SIZE"
+        assert ledger["cash_gbp"] == 1000.0
+        assert sp.size_never_argued(ledger, "NVDA", pos, self._val()) is None
+        # a later top-up re-opens the question
+        ledger["trades"].append({"date": "2026-11-09", "action": "BUY", "ticker": "NVDA",
+                                 "shares": 1.5, "amount_gbp": 250.0})
+        flag = sp.size_never_argued(ledger, "NVDA", pos, self._val())
+        assert flag and flag["topups_since"] == ["2026-11-09"]
+
+    def test_set_size_skips_unknown_ticker_and_empty_text(self):
+        ledger = self._ledger()
+        events = sp.apply_recommendations(
+            ledger,
+            [{"action": "SET_SIZE", "yfinance_ticker": "NOPE", "size_argument": "x"},
+             {"action": "SET_SIZE", "yfinance_ticker": "NVDA", "size_argument": " "}],
+            "2026-09-21")
+        assert "SKIP SET_SIZE NOPE" in events[0]
+        assert "SKIP SET_SIZE NVDA" in events[1]
+        assert "size_argued_on" not in ledger["positions"]["NVDA"]
+
+    def test_review_demands_a_sizing_decision(self):
+        ledger = self._ledger()
+        review = sp.build_thesis_review(ledger, self._val())
+        assert "SIZE NEVER ARGUED: NVDA is 15.3% of the book" in review
+        assert "50% of its cost came from top-ups" in review
+        assert "(a) SET_SIZE" in review
+        assert "(b) TRIM toward the size that was argued for at entry" in review
+        assert review.count("SIZE NEVER ARGUED") == 1   # XOM is not flagged
+
+    def test_review_shows_the_argument_once_recorded(self):
+        ledger = self._ledger()
+        sp.apply_recommendations(
+            ledger, [{"action": "SET_SIZE", "yfinance_ticker": "NVDA",
+                      "size_argument": "Deliberate 15%."}], "2026-09-21")
+        review = sp.build_thesis_review(ledger, self._val())
+        assert "SIZE NEVER ARGUED" not in review
+        assert "Size argued 2026-09-21: Deliberate 15%." in review
+
+    def test_review_reflags_when_topped_up_after_the_argument(self):
+        ledger = self._ledger(topups=("2026-09-01",))
+        ledger["positions"]["NVDA"].update(
+            {"size_argued_on": "2026-09-05", "size_argument": "Deliberate."})
+        ledger["trades"].append({"date": "2026-09-10", "action": "BUY", "ticker": "NVDA",
+                                 "shares": 1.5, "amount_gbp": 250.0})
+        review = sp.build_thesis_review(ledger, self._val())
+        assert "argued on 2026-09-05 but it has been topped up since (2026-09-10)" in review
+
+    def test_alert_fires_unless_the_run_answers_it(self):
+        ledger = self._ledger()
+        alerts = ta._size_argued_alerts([], ledger, self._val())
+        assert len(alerts) == 1
+        assert alerts[0].startswith("ALERT: NVDA is 15.3% of the book with 50% of its cost from top-ups")
+        for rec in (
+            {"action": "SET_SIZE", "yfinance_ticker": "NVDA", "size_argument": "x"},
+            {"action": "TRIM", "yfinance_ticker": "NVDA", "trim_pct": 25},
+            {"action": "SELL", "yfinance_ticker": "NVDA"},
+        ):
+            assert ta._size_argued_alerts([rec], ledger, self._val()) == []
+
+    def test_alert_reaches_guard_events_and_set_size_passes_guards(self):
+        ledger = self._ledger()
+        pre_val = dict(self._val(), cash_gbp=300.0)
+        allowed, events = ta.enforce_strategy_guards([], ledger, pre_val)
+        assert any("size was never argued for" in e for e in events)
+        rec = {"action": "SET_SIZE", "yfinance_ticker": "NVDA", "size_argument": "x"}
+        allowed, events = ta.enforce_strategy_guards([rec], ledger, pre_val)
+        assert allowed == [rec]
+        assert not any("never argued" in e for e in events)
+
+    def test_executor_confirms_set_size_without_placing_order(self, monkeypatch):
+        monkeypatch.setattr(t212ex, "T212_DEMO_EXECUTE", True)
+        monkeypatch.setattr(t212ex, "T212_ENV", "demo")
+        monkeypatch.setattr(t212ex, "_load_instruments", lambda: INSTRUMENTS)
+        monkeypatch.setattr(t212ex, "get_t212_positions_map", lambda: {})
+        monkeypatch.setattr(
+            t212ex, "_place_market_order",
+            lambda *a, **k: pytest.fail("SET_SIZE must not place a T212 order"))
+        rec = {"action": "SET_SIZE", "yfinance_ticker": "NVDA", "size_argument": "x"}
+        events, confirmed = t212ex.execute_recommendations([rec])
+        assert confirmed == [rec]
+        assert any("SET_SIZE NVDA" in e for e in events)
+
+    def test_prompt_documents_set_size(self):
+        assert '"action": "SET_SIZE"' in prompts.ANALYSIS_SYSTEM
+        assert "SET_SIZE records the argument for a position's ACCUMULATED size" in prompts.ANALYSIS_SYSTEM

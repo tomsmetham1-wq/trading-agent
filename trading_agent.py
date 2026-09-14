@@ -1170,6 +1170,34 @@ def _theme_cap_alerts(theme_exposure: dict, themes_rebalanced_this_run: set,
     return alerts
 
 
+def _size_argued_alerts(recs: list, ledger: dict, pre_val: dict) -> list[str]:
+    """
+    Advisory alert (never blocking) for a position whose size was reached by
+    top-ups and never argued for — see sp.size_never_argued(). Skipped when
+    this run's recs already answer it (a SET_SIZE for the name, or a TRIM /
+    SELL of it), so the alert means the review demanded a decision and got
+    neither.
+    """
+    answered = {
+        _rec_ticker(r) for r in recs
+        if (r.get("action") or "").upper().strip() in ("SET_SIZE", "TRIM", "SELL")
+    }
+    alerts: list[str] = []
+    for ticker, pos in (ledger.get("positions") or {}).items():
+        if ticker in answered:
+            continue
+        flag = sp.size_never_argued(ledger, ticker, pos, pre_val)
+        if not flag:
+            continue
+        alerts.append(
+            f"ALERT: {ticker} is {flag['weight_pct']:.1f}% of the book with "
+            f"{flag['topup_share'] * 100:.0f}% of its cost from top-ups "
+            f"({', '.join(flag['topups'])}) and its size was never argued for "
+            f"- no SET_SIZE or TRIM this run"
+        )
+    return alerts
+
+
 def _day_move_alerts(tape: dict) -> list[str]:
     """
     Advisory alert (never blocking) for holdings or themes that moved hard in
@@ -1413,6 +1441,7 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict,
 
     # Advisory alerts — surfaced in the email, never blocking
     guard_events.extend(_repeat_topup_alerts(recs, ledger, pre_val))
+    guard_events.extend(_size_argued_alerts(recs, ledger, pre_val))
     guard_events.extend(_trim_reset_alerts(recs, ledger))
     guard_events.extend(_pre_commit_trim_alerts(recs, ledger, pre_val))
     guard_events.extend(_forward_driver_alerts(recs, ledger))

@@ -131,8 +131,11 @@ investor who runs an experimental portfolio on Trading 212.
   risk/reward. Distance to a trim level is not evidence about the business.
   If the best forward risk/reward genuinely is a name topped up inside that
   window, say so explicitly and justify the ACCUMULATED position size on
-  fundamentals, not just this one buy. The alternative is not a worse name: it
-  is holding the slice for a week, which the rules permit.
+  fundamentals, not just this one buy — and record that argument with a
+  SET_SIZE action, because any position that reaches 12%+ of the book with
+  30%+ of its cost from top-ups is flagged SIZE NEVER ARGUED every run until
+  it is. The alternative is not a worse name: it is holding the slice for a
+  week, which the rules permit.
 - Deploy as many positions as needed to get under the 15% cash threshold. On a fresh or
   newly-liquidated portfolio this will naturally be several positions at once; when there
   is only a small excess above 15% it may be just one. Do not drip-feed one small buy
@@ -259,8 +262,8 @@ habit: a name you still rate should reappear.
 What you don't know. What could invalidate the thesis. Where you're speculating.
 
 Then, on a new line, output a JSON code block with ONLY the actionable items
-(BUY, SELL, TRIM, plus the ledger-only SET_TRIMS, SET_DRIVER and SET_THESIS —
-skip HOLD).
+(BUY, SELL, TRIM, plus the ledger-only SET_TRIMS, SET_DRIVER, SET_THESIS and
+SET_SIZE — skip HOLD).
 Use this exact schema:
 
 ```json
@@ -305,6 +308,12 @@ Use this exact schema:
       "ticker": "AMZN",
       "yfinance_ticker": "AMZN",
       "thesis": "AWS growth re-accelerating to 37% with 39% operating margin and $364bn contracted backlog; at ~30x forward earnings I would buy this fresh today at this weight."
+    },
+    {
+      "action": "SET_SIZE",
+      "ticker": "NVDA",
+      "yfinance_ticker": "NVDA",
+      "size_argument": "15% is deliberate: data-centre revenue growing 90%+ on 80-90% share makes it the single highest-conviction expression of the AI infrastructure theme, and at ~25x forward the downside from a multiple reset is bounded relative to the peer group."
     }
   ],
   "played_out": [
@@ -356,6 +365,16 @@ mechanically. On 2026-09-14 that trimmed AMZN at -3.6% and GOOGL at +0.16% —
 a third of two flat positions sold because the paperwork used the wrong verb.
 A thesis that was never scoreable has not played out; a thesis that has played
 out needs a driver, not a rewrite.
+
+SET_SIZE records the argument for a position's ACCUMULATED size, for a holding
+the thesis review marks "SIZE NEVER ARGUED" — one that reached 12%+ of the
+book with 30%+ of its cost from top-ups. Each top-up was legal; nobody ever
+decided the position should be that big. The argument must be a fresh sizing
+decision on fundamentals ("why does this deserve N% of the book"), not a
+restatement of the thesis or "most upside to the trim level". It is cleared by
+the next top-up of the same name — an argument for 12% does not cover a later
+buy to 16%. If you cannot make the argument, the alternative is a TRIM toward
+the size that was argued for at entry. Ledger-only; no order, no cash.
 
 yfinance_ticker rules — use the exact format Yahoo Finance uses:
   US (NYSE/NASDAQ):  bare symbol         e.g. AAPL, MSFT, NVDA

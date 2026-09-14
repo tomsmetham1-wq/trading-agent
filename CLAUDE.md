@@ -480,6 +480,28 @@ context and never reached the weekly email. The prompt also now requires that a
 played-out position's next trim level be within ~15% of TODAY's price, tightened
 via SET_TRIMS alongside the SET_DRIVER if it isn't.
 
+Size never argued (Sep 2026). Every dead-zone top-up is individually legal
+and individually small, so a position can become the largest in the book
+without anyone deciding it should be: NVDA opened at £500 (~8%) on 13 May,
+was topped up £246 on 1 Sep and £259 on 10 Sep — 11.6% to 15.9% in nine
+days, the biggest holding — with each buy argued on "thesis confirmed" and
+"most upside to the first trim level". Neither argued for a 15% position.
+`sp.topup_composition()` replays the current lot (a SYNC_REMOVE, SYNC_RESET
+or closed_position sell starts a new one; first BUY/SYNC_ADD is the opening,
+later ones are top-ups) and `sp.size_never_argued()` flags a holding at
+`SIZE_ARGUED_MIN_WEIGHT_PCT` (12%) or more of the book with
+`SIZE_ARGUED_TOPUP_SHARE` (30%) or more of its cost from top-ups.
+`build_thesis_review()` renders it as "SIZE NEVER ARGUED" demanding (a) a
+SET_SIZE — the fourth ledger-only action, records `size_argument` and
+`size_argued_on` on the position — or (b) a TRIM toward the size argued at
+entry. A SET_SIZE clears the flag only until the next top-up of that name (an
+argument for 12% does not cover a buy to 16%). `_size_argued_alerts()` puts
+it in the weekly email unless the run's recs already answer it (SET_SIZE,
+TRIM or SELL of the name). Advisory, not a block: the size may well be right,
+but it has to be decided rather than accumulated. Positions whose opening buy
+predates the April 2026 SYNC_RESETs (AMZN, GOOGL) have no replayable
+composition and cannot be flagged.
+
 Last-session moves (Sep 2026) — the "tape" the prompt never carried. Every
 figure the prompt shows for a holding is measured from ENTRY, so a same-day
 shock is invisible: on 14 Sep 2026 the AI industry's own CEOs called for
@@ -691,7 +713,7 @@ or requires a name to persist N weeks before it can be bought. Those were
 considered and rejected — they forfeit real upside to buy a filter the data
 doesn't yet justify. Revisit only once there are ~3 months of scores.
 
-Test suite: `test_trading_agent.py` (302 tests, no network). Run it after any
+Test suite: `test_trading_agent.py` (315 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the
