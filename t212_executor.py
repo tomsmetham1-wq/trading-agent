@@ -62,7 +62,7 @@ INSTRUMENTS_CACHE_PATH = Path(
 # Recommendation actions that only write metadata to the shadow ledger. They
 # place no order and move no cash, so execute_recommendations() confirms them
 # straight through rather than sending anything to T212.
-LEDGER_ONLY_ACTIONS = ("SET_TRIMS", "SET_DRIVER")
+LEDGER_ONLY_ACTIONS = ("SET_TRIMS", "SET_DRIVER", "SET_THESIS")
 
 
 # =============================================================================

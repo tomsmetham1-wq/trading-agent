@@ -89,19 +89,35 @@ def save_ledger(ledger: dict) -> None:
 # Shadow ↔ T212 bidirectional sync
 # =============================================================================
 
+# A held position whose shadow cost differs from T212's actual GBP cost by
+# more than this fraction is re-based to T212 on sync. 0.1% is well above
+# float rounding and well below the smallest real discrepancy seen (XOM at
+# 0.13%, a fill-slippage-plus-FX-fee gap that is itself worth correcting).
+COST_REBASE_TOLERANCE = 0.001
+
+
 def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
                    t212_to_yf_fn, bidirectional: bool = True,
                    pending_yf_tickers: set = None) -> bool:
     """
     Reconcile the shadow ledger against T212 (source of truth when T212_DEMO_EXECUTE=true).
 
-    Three things happen in bidirectional mode:
+    Four things happen in bidirectional mode:
       1. ADD positions T212 holds that shadow is missing (e.g. after a ledger reset,
          or manual trades placed directly in the T212 app).
       2. REMOVE positions shadow holds that T212 doesn't — these are execution failures:
          T212 rejected the order (bad ticker, insufficient funds, etc.) but the old
          shadow-first design had already written the position to the ledger.
-      3. SYNC cash to T212's actual available balance.
+      3. RE-BASE the cost of positions both sides hold to T212's actual GBP cost
+         (walletImpact.totalCost / quantity). Shadow books a BUY at the price it
+         saw at run time; T212 fills at market, often the next open, hours later.
+         Nothing reconciled the two afterwards, so by Sep 2026 MRVL was carried
+         at £145.67 against a real fill of £154.53 (-5.7%) and every "+N% from
+         entry" mechanism — pre-committed trim triggers, played-out declarations,
+         the giveback peak, the FX split — was measuring from the wrong line.
+         Only the wallet figure is trusted for this; the native-price fallback
+         needs an FX conversion and would re-base on noise.
+      4. SYNC cash to T212's actual available balance.
 
     In shadow-only mode (bidirectional=False), only step 1 runs — shadow is
     authoritative so phantom positions are never removed.
@@ -197,10 +213,29 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
     )
     cash_changed = bidirectional and abs(t212_available - ledger["cash_gbp"]) > 1.0
 
+    # Held on both sides but carried at a different cost. Tolerance is
+    # relative so a £400 lot and a £1,000 lot are judged alike; T212's
+    # totalCost is stable between trades, so once re-based a position stays
+    # silent until the next fill moves it.
+    rebase: dict[str, tuple[float, float]] = {}   # ticker -> (old, new)
+    if bidirectional:
+        for yf_ticker in shadow_tickers & t212_tickers:
+            new_cost = t212_by_yf[yf_ticker].get("avg_cost_gbp")
+            old_cost = ledger["positions"][yf_ticker].get("avg_cost_gbp")
+            try:
+                old_cost = float(old_cost)
+            except (TypeError, ValueError):
+                old_cost = 0.0
+            if not new_cost or new_cost <= 0:
+                continue
+            if old_cost <= 0 or abs(new_cost / old_cost - 1) > COST_REBASE_TOLERANCE:
+                rebase[yf_ticker] = (old_cost, new_cost)
+
     needs_work = (
         missing_in_shadow
         or (bidirectional and extra_in_shadow)
         or cash_changed
+        or rebase
     )
     if not needs_work:
         return False
@@ -295,7 +330,30 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
             removed = sorted(to_remove)
             changed = True
 
-    # Step 3: Sync cash to T212's actual balance — bidirectional only
+    # Step 3: Re-base cost of positions held on both sides to T212's fill.
+    # Per-ticker SYNC_COST records so compute_realized_pnl() re-prices the
+    # open lots too — otherwise the replay keeps scoring later sells against
+    # the price shadow guessed, not the one that was paid.
+    rebased: list[str] = []
+    for yf_ticker, (old_cost, new_cost) in sorted(rebase.items()):
+        pos = ledger["positions"][yf_ticker]
+        pos["avg_cost_gbp"] = new_cost
+        sync_records.append({
+            "date":         today,
+            "action":       "SYNC_COST",
+            "ticker":       yf_ticker,
+            "shares":       pos.get("shares"),
+            "avg_cost_gbp": new_cost,
+            "was_avg_cost_gbp": old_cost,
+            "note": (f"cost re-based to T212 fill: £{old_cost:.4f} -> "
+                     f"£{new_cost:.4f}/share"),
+        })
+        logger.info("Sync: %s cost re-based GBP %.4f -> %.4f",
+                    yf_ticker, old_cost, new_cost)
+        rebased.append(yf_ticker)
+        changed = True
+
+    # Step 4: Sync cash to T212's actual balance — bidirectional only
     if bidirectional and (cash_changed or changed):
         ledger["cash_gbp"] = t212_available
         changed = True
@@ -309,6 +367,7 @@ def sync_from_t212(ledger: dict, t212_cash: dict, t212_positions: list,
             "note": (
                 f"Bidirectional sync: added {sorted(added)}, "
                 f"removed {removed}, "
+                f"cost re-based {rebased}, "
                 f"cash set to £{t212_available:.2f}"
             ),
         })
@@ -799,6 +858,51 @@ def _apply_set_driver(ledger: dict, rec: dict, ticker: str, run_date: str) -> st
     return f"SET_DRIVER {ticker}: {driver}"
 
 
+def _apply_set_thesis(ledger: dict, rec: dict, ticker: str, run_date: str) -> str:
+    """
+    Re-underwrite a position's entry thesis in place (ledger-only).
+
+    This is the action for a thesis that was never a prediction — one that
+    entry_thesis_provenance() reports as backfilled, synced or missing — and
+    for nothing else. It replaces `thesis` with a case written today, prefixed
+    "[Re-underwritten <date>]" so every later replay (the accountability
+    review, the entry_thesis copied onto exits) says which day the prediction
+    was actually made, and keeps the text it replaced on the trade record.
+
+    It does NOT touch thesis_played_out, forward_driver or anything else in
+    the played-out machinery. That is the whole reason it exists: on
+    2026-09-14 the prompt told Claude to re-underwrite AMZN and GOOGL "as a
+    SET_DRIVER", and SET_DRIVER means "the original thesis has played out" —
+    so both were marked played out and the bank injection trimmed a third of
+    each, AMZN at -3.6% and GOOGL at +0.16%, "to convert paper alpha into
+    realised alpha" on positions with none. A trade forced by paperwork, which
+    is precisely what the provenance flag was documented never to cause.
+    A re-underwrite says the position never had a scoreable thesis; a
+    forward driver says the thesis it had has been realised. Different claims,
+    different actions.
+    """
+    text = (rec.get("thesis") or rec.get("thesis_oneline") or "").strip()
+    pos = ledger.get("positions", {}).get(ticker)
+    if pos is None:
+        return f"SKIP SET_THESIS {ticker}: no such position in shadow ledger"
+    if not text:
+        return f"SKIP SET_THESIS {ticker}: no thesis text provided"
+
+    previous = (pos.get("thesis") or "").strip()
+    stamped = f"[Re-underwritten {run_date}] {text}"
+    pos["thesis"] = stamped
+    pos["thesis_reunderwritten"] = run_date
+
+    ledger.setdefault("trades", []).append({
+        "date":            run_date,
+        "action":          "SET_THESIS",
+        "ticker":          ticker,
+        "thesis":          stamped,
+        "replaces_thesis": previous,
+    })
+    return f"SET_THESIS {ticker}: {text}"
+
+
 def apply_recommendations(ledger: dict, recs: list, run_date: str) -> list[str]:
     """
     Apply a list of trade recommendations to the shadow portfolio ledger.
@@ -807,10 +911,11 @@ def apply_recommendations(ledger: dict, recs: list, run_date: str) -> list[str]:
     then delegates to _apply_buy() or _apply_sell_or_trim() depending on action type.
     Returns a log of what happened to each recommendation for email reporting.
 
-    Only BUY, SELL, TRIM, SET_TRIMS and SET_DRIVER actions are processed; HOLD
-    is ignored. SET_TRIMS (pre-committed trim levels) and SET_DRIVER (the
-    forward driver carrying a played-out position) are ledger-only metadata —
-    no price fetch, no cash movement.
+    Only BUY, SELL, TRIM, SET_TRIMS, SET_DRIVER and SET_THESIS actions are
+    processed; HOLD is ignored. SET_TRIMS (pre-committed trim levels),
+    SET_DRIVER (the forward driver carrying a played-out position) and
+    SET_THESIS (re-underwriting a thesis that was never recorded at entry)
+    are ledger-only metadata — no price fetch, no cash movement.
 
     Args:
         ledger:   Shadow portfolio ledger dict. Mutated in-place.
@@ -826,7 +931,7 @@ def apply_recommendations(ledger: dict, recs: list, run_date: str) -> list[str]:
         action = rec.get("action", "").upper().strip()
         ticker = rec.get("yfinance_ticker") or rec.get("ticker")
         if not ticker or action not in ("BUY", "SELL", "TRIM", "SET_TRIMS",
-                                        "SET_DRIVER"):
+                                        "SET_DRIVER", "SET_THESIS"):
             continue
 
         # Metadata-only actions never need a price — handle them before the
@@ -836,6 +941,9 @@ def apply_recommendations(ledger: dict, recs: list, run_date: str) -> list[str]:
             continue
         if action == "SET_DRIVER":
             events.append(_apply_set_driver(ledger, rec, ticker, run_date))
+            continue
+        if action == "SET_THESIS":
+            events.append(_apply_set_thesis(ledger, rec, ticker, run_date))
             continue
 
         # For BUY: use T212 actual fill price if available (most accurate cost basis).
@@ -1151,6 +1259,10 @@ def compute_realized_pnl(ledger: dict) -> dict:
       SYNC_RESET   the ledger was rebuilt wholesale from T212 (the April 2026
                    bootstrap runs) — every lot before it was replaced, so the
                    replay starts over and pre-reset basis is not recoverable.
+      SYNC_COST    the open lots were re-based to T212's actual fill cost —
+                   the shares stay, their total cost becomes shares × that
+                   figure. It comes from T212's wallet, so it makes a basis
+                   MORE exact, never estimated.
 
     Shares sold with no recorded basis fall back to the position's current
     avg_cost_gbp and the ticker is reported under "tickers_with_estimated_basis".
@@ -1218,6 +1330,13 @@ def compute_realized_pnl(ledger: dict) -> dict:
 
         if action == "SYNC_REMOVE":
             holdings.pop(ticker, None)
+
+        elif action == "SYNC_COST":
+            cost = float(t.get("avg_cost_gbp") or 0)
+            h = holdings.get(ticker)
+            if h and h[0] > 0 and cost > 0:
+                h[1] = h[0] * cost
+                _bump_peak(ticker)
 
         elif action == "SYNC_ADD":
             cost = float(t.get("avg_cost_gbp") or 0)
@@ -2262,7 +2381,9 @@ def entry_thesis_provenance(pos: dict) -> tuple[str, str]:
     It is grounds for having to re-underwrite the position.
 
     Returns (kind, detail) where kind is one of "recorded", "backfilled",
-    "synced" or "missing".
+    "synced" or "missing". A thesis replaced via SET_THESIS is "recorded" —
+    it is a live prediction from the day it was written — with a detail
+    naming that day so the review scores it from there, not from entry.
     """
     thesis = (pos.get("thesis") or "").strip()
     if not thesis or thesis == "(no thesis recorded)":
@@ -2270,6 +2391,10 @@ def entry_thesis_provenance(pos: dict) -> tuple[str, str]:
     if thesis.startswith("(synced from T212)"):
         return "synced", "placeholder written by T212 sync, never a stated case"
     low = thesis[:80].lower()
+    if low.startswith("[re-underwritten"):
+        when = pos.get("thesis_reunderwritten") or thesis[16:27].strip(" ]")
+        return "recorded", (f"re-underwritten {when}; a prediction from "
+                            f"that date, not from entry")
     if "backfilled" in low:
         return "backfilled", "reconstructed after entry, with price history visible"
     return "recorded", ""
@@ -2320,10 +2445,14 @@ def build_thesis_review(ledger: dict, current_val: dict) -> str:
                     f"        track record cannot be scored and re-confirming "
                     f"it proves nothing. RE-UNDERWRITE {ticker} THIS RUN: state "
                     f"the case you\n        would buy it on fresh today at this "
-                    f"weight, as a SET_DRIVER, or recycle the capital. If it "
-                    f"has also earned\n        nothing since entry, the "
-                    f"single-name dependency block applies to it directly. ***"
+                    f"weight, as a SET_THESIS action (NOT SET_DRIVER - that "
+                    f"declares the\n        thesis played out and forces a "
+                    f"33% bank), or recycle the capital. If it has also "
+                    f"earned\n        nothing since entry, the single-name "
+                    f"dependency block applies to it directly. ***"
                 )
+            elif detail:
+                entry += f"\n    (Thesis {detail}.)"
             entry += _format_forward_driver(
                 pos, bank_due=played_out_bank_due(ledger, ticker, pos))
             trims = pos.get("pre_commit_trims")

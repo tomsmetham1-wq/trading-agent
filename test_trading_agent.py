@@ -558,6 +558,141 @@ class TestSetTrims:
 
 
 # =============================================================================
+# SET_THESIS — re-underwriting a thesis that was never a prediction
+# =============================================================================
+
+class TestSetThesis:
+    """
+    On 2026-09-14 the prompt asked for a backfilled thesis to be re-underwritten
+    "as a SET_DRIVER". SET_DRIVER declares the thesis played out, so the bank
+    injection trimmed a third of AMZN at -3.6% and of GOOGL at +0.16%. This is
+    the action that should have existed: replaces the thesis, touches nothing
+    in the played-out machinery.
+    """
+    CASE = "AWS re-accelerating to 37% with 39% margins; would buy fresh today."
+
+    def _rec(self, ticker="TEST", text=CASE, key="thesis"):
+        return {"action": "SET_THESIS", "yfinance_ticker": ticker, key: text}
+
+    def _held(self):
+        ledger = make_ledger()
+        sp.apply_recommendations(ledger, [gbp_buy_rec("TEST", 200)], "2026-04-26")
+        ledger["positions"]["TEST"]["thesis"] = (
+            "[Backfilled 2026-07-03 - no thesis recorded at entry] Old case.")
+        return ledger
+
+    def test_replaces_thesis_without_price_fetch_or_cash_movement(self, monkeypatch):
+        monkeypatch.setattr(
+            sp, "fetch_price_gbp",
+            lambda *a, **k: pytest.fail("SET_THESIS must not fetch a price"))
+        ledger = self._held()
+        events = sp.apply_recommendations(ledger, [self._rec()], "2026-09-14")
+        assert events == [f"SET_THESIS TEST: {self.CASE}"]
+        pos = ledger["positions"]["TEST"]
+        assert pos["thesis"] == f"[Re-underwritten 2026-09-14] {self.CASE}"
+        assert pos["thesis_reunderwritten"] == "2026-09-14"
+        assert ledger["cash_gbp"] == pytest.approx(800.0)
+        assert ledger["positions"]["TEST"]["shares"] == pytest.approx(20.0)
+
+    def test_does_not_touch_the_played_out_machinery(self):
+        ledger = self._held()
+        sp.apply_recommendations(ledger, [self._rec()], "2026-09-14")
+        pos = ledger["positions"]["TEST"]
+        for key in ("thesis_played_out", "forward_driver", "forward_driver_set",
+                    "forward_driver_history", "driver_failed_on"):
+            assert key not in pos
+
+    def test_trade_record_keeps_the_replaced_text(self):
+        ledger = self._held()
+        sp.apply_recommendations(ledger, [self._rec()], "2026-09-14")
+        t = ledger["trades"][-1]
+        assert t["action"] == "SET_THESIS"
+        assert t["ticker"] == "TEST"
+        assert t["replaces_thesis"].startswith("[Backfilled 2026-07-03")
+        assert t["thesis"].startswith("[Re-underwritten 2026-09-14]")
+
+    def test_falls_back_to_thesis_oneline(self):
+        ledger = self._held()
+        sp.apply_recommendations(
+            ledger, [self._rec(text="Fallback case.", key="thesis_oneline")],
+            "2026-09-14")
+        assert ledger["positions"]["TEST"]["thesis"].endswith("Fallback case.")
+
+    def test_unknown_ticker_and_empty_text_are_skipped(self):
+        ledger = self._held()
+        events = sp.apply_recommendations(
+            ledger, [self._rec(ticker="NOPE"), self._rec(text="  ")], "2026-09-14")
+        assert "SKIP SET_THESIS NOPE" in events[0]
+        assert "SKIP SET_THESIS TEST" in events[1]
+        assert ledger["positions"]["TEST"]["thesis"].startswith("[Backfilled")
+        assert not any(t["action"] == "SET_THESIS" for t in ledger["trades"])
+
+    def test_provenance_becomes_recorded_dated_from_the_rewrite(self):
+        ledger = self._held()
+        sp.apply_recommendations(ledger, [self._rec()], "2026-09-14")
+        kind, detail = sp.entry_thesis_provenance(ledger["positions"]["TEST"])
+        assert kind == "recorded"
+        assert "re-underwritten 2026-09-14" in detail
+
+    def test_provenance_reads_the_date_off_the_prefix_if_field_missing(self):
+        kind, detail = sp.entry_thesis_provenance(
+            {"thesis": "[Re-underwritten 2026-09-14] Fresh case."})
+        assert kind == "recorded"
+        assert "2026-09-14" in detail
+
+    def test_review_no_longer_flags_it_but_notes_the_date(self):
+        ledger = self._held()
+        sp.apply_recommendations(ledger, [self._rec()], "2026-09-14")
+        review = sp.build_thesis_review(
+            ledger, {"positions": {"TEST": {"pnl_pct": -3.6}}})
+        assert "ENTRY THESIS NOT RECORDED" not in review
+        assert "re-underwritten 2026-09-14" in review
+
+    def test_review_asks_for_set_thesis_not_set_driver(self):
+        review = sp.build_thesis_review(
+            self._held(), {"positions": {"TEST": {"pnl_pct": -3.6}}})
+        assert "as a SET_THESIS action" in review
+        assert "NOT SET_DRIVER" in review
+
+    def test_passes_strategy_guards_untouched(self):
+        rec = self._rec()
+        pre_val = {"total_value_gbp": 1000.0, "cash_gbp": 100.0, "positions": {}}
+        allowed, events = ta.enforce_strategy_guards([rec], make_ledger(), pre_val)
+        assert allowed == [rec]
+        assert not any("SET_THESIS" in e for e in events)
+
+    def test_does_not_trigger_the_played_out_bank(self):
+        # The 2026-09-14 failure mode, end to end: a re-underwrite of a
+        # position with no gain must not have a 33% trim injected after it.
+        ledger = self._held()
+        pre_val = {"total_value_gbp": 1000.0, "cash_gbp": 800.0,
+                   "positions": {"TEST": {"current_value_gbp": 193.0,
+                                          "pnl_pct": -3.6}}}
+        allowed, events = ta.enforce_strategy_guards([self._rec()], ledger, pre_val)
+        assert [r["action"] for r in allowed] == ["SET_THESIS"]
+        assert not any("FORCED TRIM" in e for e in events)
+
+    def test_executor_confirms_without_placing_order(self, monkeypatch):
+        monkeypatch.setattr(t212ex, "T212_DEMO_EXECUTE", True)
+        monkeypatch.setattr(t212ex, "T212_ENV", "demo")
+        monkeypatch.setattr(t212ex, "_load_instruments", lambda: INSTRUMENTS)
+        monkeypatch.setattr(t212ex, "get_t212_positions_map", lambda: {})
+        monkeypatch.setattr(
+            t212ex, "_place_market_order",
+            lambda *a, **k: pytest.fail("SET_THESIS must not place a T212 order"))
+        rec = self._rec()
+        events, confirmed = t212ex.execute_recommendations([rec])
+        assert confirmed == [rec]
+        assert any("SET_THESIS TEST" in e for e in events)
+
+    def test_realized_pnl_and_reconciliation_ignore_it(self):
+        ledger = self._held()
+        sp.apply_recommendations(ledger, [self._rec()], "2026-09-14")
+        assert sp.compute_realized_pnl(ledger)["total_gbp"] == pytest.approx(0.0)
+        assert sp.reconcile_trade_log(ledger)["clean"]
+
+
+# =============================================================================
 # SET_DRIVER — the forward driver carrying a played-out position
 # =============================================================================
 
@@ -2086,6 +2221,101 @@ class TestSync:
             _t212_to_yf, bidirectional=True)
         assert changed
         assert ledger["cash_gbp"] == 750.0
+
+
+class TestSyncCostRebase:
+    """
+    Shadow books a BUY at the price it saw; T212 fills at market, often the
+    next open. By Sep 2026 MRVL was carried at 145.67 against a 154.53 fill
+    (-5.7%), so every "+N% from entry" mechanism measured from the wrong line.
+    Held positions are now re-based to T212's walletImpact cost on sync.
+    """
+
+    def _ledger(self, avg=145.67, thesis="MRVL case"):
+        ledger = make_ledger(cash_gbp=500.0)
+        ledger["positions"] = {
+            "AAPL": {"shares": 2.0, "avg_cost_gbp": avg, "first_bought": "2026-05-26",
+                     "thesis": thesis, "pre_commit_trims": "Trim 1/3 at +45%."},
+        }
+        ledger["trades"].append({
+            "date": "2026-05-26", "action": "BUY", "ticker": "AAPL",
+            "shares": 2.0, "price_gbp": avg, "amount_gbp": 2 * avg,
+        })
+        return ledger
+
+    def test_rebases_to_t212_wallet_cost_and_logs_it(self):
+        ledger = self._ledger()
+        changed = sp.sync_from_t212(
+            ledger, {"free": 500.0}, [t212_pos("AAPL_US_EQ", 2.0, 309.06)],
+            _t212_to_yf, bidirectional=True)
+        assert changed
+        pos = ledger["positions"]["AAPL"]
+        assert pos["avg_cost_gbp"] == pytest.approx(154.53)
+        # everything else on the position survives
+        assert pos["thesis"] == "MRVL case"
+        assert pos["pre_commit_trims"] == "Trim 1/3 at +45%."
+        assert pos["first_bought"] == "2026-05-26"
+        rec = [t for t in ledger["trades"] if t["action"] == "SYNC_COST"]
+        assert len(rec) == 1
+        assert rec[0]["ticker"] == "AAPL"
+        assert rec[0]["avg_cost_gbp"] == pytest.approx(154.53)
+        assert rec[0]["was_avg_cost_gbp"] == pytest.approx(145.67)
+        summary = ledger["trades"][-1]
+        assert summary["action"] == "SYNC_FROM_T212"
+        assert "cost re-based ['AAPL']" in summary["note"]
+
+    def test_within_tolerance_is_left_alone(self):
+        ledger = self._ledger(avg=100.0)
+        changed = sp.sync_from_t212(
+            ledger, {"free": 500.0}, [t212_pos("AAPL_US_EQ", 2.0, 200.1)],
+            _t212_to_yf, bidirectional=True)
+        assert not changed
+        assert ledger["positions"]["AAPL"]["avg_cost_gbp"] == 100.0
+        assert not any(t["action"] == "SYNC_COST" for t in ledger["trades"])
+
+    def test_shadow_only_mode_never_rebases(self):
+        ledger = self._ledger()
+        changed = sp.sync_from_t212(
+            ledger, {"free": 500.0}, [t212_pos("AAPL_US_EQ", 2.0, 309.06)],
+            _t212_to_yf, bidirectional=False)
+        assert not changed
+        assert ledger["positions"]["AAPL"]["avg_cost_gbp"] == 145.67
+
+    def test_no_wallet_cost_means_no_rebase(self):
+        # averagePricePaid alone needs an FX conversion; not trusted for this.
+        ledger = self._ledger()
+        t212 = {"ticker": "AAPL_US_EQ", "quantity": 2.0,
+                "averagePricePaid": 200.0, "walletImpact": {}}
+        changed = sp.sync_from_t212(
+            ledger, {"free": 500.0}, [t212], _t212_to_yf, bidirectional=True)
+        assert not changed
+        assert ledger["positions"]["AAPL"]["avg_cost_gbp"] == 145.67
+
+    def test_realized_pnl_replay_honours_the_rebase(self):
+        ledger = self._ledger()
+        sp.sync_from_t212(
+            ledger, {"free": 500.0}, [t212_pos("AAPL_US_EQ", 2.0, 309.06)],
+            _t212_to_yf, bidirectional=True)
+        ledger["trades"].append({
+            "date": "2026-10-01", "action": "TRIM", "ticker": "AAPL",
+            "shares": 1.0, "price_gbp": 200.0, "amount_gbp": 200.0,
+        })
+        ledger["positions"]["AAPL"]["shares"] = 1.0
+        out = sp.compute_realized_pnl(ledger)
+        # 200 proceeds against the REAL 154.53 basis, not the 145.67 guess
+        assert out["by_ticker"]["AAPL"] == pytest.approx(200.0 - 154.53, abs=0.01)
+        assert "AAPL" not in out["tickers_with_estimated_basis"]
+        assert sp.reconcile_trade_log(ledger)["clean"]
+
+    def test_p_and_l_pct_follows_the_new_basis(self, monkeypatch):
+        ledger = self._ledger()
+        sp.sync_from_t212(
+            ledger, {"free": 500.0}, [t212_pos("AAPL_US_EQ", 2.0, 309.06)],
+            _t212_to_yf, bidirectional=True)
+        monkeypatch.setattr(sp, "fetch_price_gbp", lambda *a, **k: 100.0)
+        val = sp.valuation(
+            ledger, {"AAPL": {"price_native": 163.61, "currency": "GBP"}})
+        assert val["positions"]["AAPL"]["pnl_pct"] == pytest.approx(5.88, abs=0.01)
 
 
 # =============================================================================

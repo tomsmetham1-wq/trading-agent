@@ -112,6 +112,18 @@ When `T212_DEMO_EXECUTE=true`:
 - Adds positions T212 holds that shadow is missing
 - **Removes positions shadow holds that T212 doesn't** — this was added to
   handle execution failures (e.g. insufficient funds, ticker not found)
+- **Re-bases the cost of positions both sides hold** to T212's actual GBP
+  fill (`walletImpact.totalCost / quantity`, Sep 2026) when it differs by
+  more than `COST_REBASE_TOLERANCE` (0.1%). Shadow books a BUY at the price
+  it saw at run time; T212 fills at market, often the next open. Nothing
+  reconciled the two, so on 14 Sep 2026 MRVL was carried at £145.67 against
+  a £154.53 fill (-5.7%), AMZN/GOOGL/DELL were 2-3% off, and every "+N% from
+  entry" mechanism (trim triggers, played-out declarations, giveback peak,
+  FX split) measured from the wrong line. The total was never wrong — cash
+  is synced, so the error hid inside the per-position P&L. Logged per ticker
+  as `SYNC_COST` (old and new cost); `compute_realized_pnl()` re-prices the
+  open lots on it, and it makes a basis MORE exact, never estimated. Only the
+  wallet figure is trusted; the native-price fallback needs an FX conversion.
 - Cash is always set to T212's `availableToTrade` balance
 
 When `T212_DEMO_EXECUTE=false`:
@@ -579,6 +591,32 @@ artefact in the book. The flag forces the position to be argued fresh or
 recycled; which of those happens is a judgement made in the run, in front of
 the single-name dependency block.
 
+Re-underwriting is its own action: SET_THESIS (Sep 2026). The third
+ledger-only rec (`LEDGER_ONLY_ACTIONS`), `_apply_set_thesis()`: replaces
+`thesis` with the case written today, prefixed `[Re-underwritten <date>]`,
+sets `thesis_reunderwritten`, logs a `SET_THESIS` trade carrying the text it
+replaced, and touches NOTHING in the played-out machinery.
+`entry_thesis_provenance()` reads the prefix as "recorded" with the date, so
+the review scores the case from that day rather than flagging it again.
+
+Why it had to be separate — the 14 Sep 2026 run: the provenance flag shipped
+telling Claude to re-underwrite "as a SET_DRIVER". SET_DRIVER means "the
+original thesis has PLAYED OUT": `_apply_set_driver` sets
+`thesis_played_out`, and `_inject_played_out_banks()` saw "declared this run,
+nothing banked" and trimmed a third of AMZN at -3.6% and a third of GOOGL at
++0.16% "to convert paper alpha into realised alpha". Two flat positions sold
+down because the paperwork used the wrong verb — the trade-forced-by-paperwork
+outcome the flag was explicitly documented never to cause. A re-underwrite
+says the position never had a scoreable thesis; a driver says the thesis it
+had has been realised. Different claims, so different actions, and the prompt
+now says which is which. `fix_reunderwrite_records.py` (one-off, idempotent)
+repaired the ledger: both positions un-flagged with the driver moved into
+`thesis`, the two SET_DRIVER trades rewritten as SET_THESIS, and the two TRIMs
+annotated `process_defect: true` with an `exit_thesis` that says so (original
+kept under `exit_thesis_original`) so the recent-exits replay does not present
+them as a judgement. The T212 trims stand — the flip-flop guard rightly stops
+a same-week rebuy, and re-buying would be churn.
+
 Watchlist recording (Aug 2026) — RECORDING ONLY, deliberately not a gate:
 `ledger["watchlist"]` tracks every name Claude flags in section 4, with the
 price at first mention and a weekly observation thereafter. Claude emits an
@@ -624,7 +662,7 @@ or requires a name to persist N weeks before it can be bought. Those were
 considered and rejected — they forfeit real upside to buy a filter the data
 doesn't yet justify. Revisit only once there are ~3 months of scores.
 
-Test suite: `test_trading_agent.py` (269 tests, no network). Run it after any
+Test suite: `test_trading_agent.py` (288 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the

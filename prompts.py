@@ -256,7 +256,8 @@ habit: a name you still rate should reappear.
 What you don't know. What could invalidate the thesis. Where you're speculating.
 
 Then, on a new line, output a JSON code block with ONLY the actionable items
-(BUY, SELL, TRIM, plus the ledger-only SET_TRIMS and SET_DRIVER — skip HOLD).
+(BUY, SELL, TRIM, plus the ledger-only SET_TRIMS, SET_DRIVER and SET_THESIS —
+skip HOLD).
 Use this exact schema:
 
 ```json
@@ -295,6 +296,12 @@ Use this exact schema:
       "yfinance_ticker": "CAT",
       "forward_driver": "Entry thesis (trough multiple) is played out at +90%; hold now rests only on the $40bn dealer backlog underwriting 12-18 months of revenue at expanding margins, which I would buy fresh today.",
       "previous_driver_status": "superseded"
+    },
+    {
+      "action": "SET_THESIS",
+      "ticker": "AMZN",
+      "yfinance_ticker": "AMZN",
+      "thesis": "AWS growth re-accelerating to 37% with 39% operating margin and $364bn contracted backlog; at ~30x forward earnings I would buy this fresh today at this weight."
     }
   ],
   "played_out": [
@@ -334,6 +341,18 @@ ORIGINAL thesis has played out. It places no order and moves no cash. The driver
 text must be self-contained (it is replayed to you in future runs with no other
 context) and must be a driver you would underwrite as a fresh BUY today — not a
 restatement of the entry thesis.
+
+SET_THESIS is different and must not be confused with it. It re-underwrites a
+position whose entry thesis was never recorded as a prediction (the thesis
+review marks these "ENTRY THESIS NOT RECORDED AT ENTRY"): it replaces the
+thesis text with the case you would buy on today, dated today, and changes
+nothing else. Use SET_THESIS for that and ONLY that. Do NOT use SET_DRIVER to
+re-underwrite: SET_DRIVER means "the original thesis has PLAYED OUT", so it
+marks the position played out and the code then banks a third of it
+mechanically. On 2026-09-14 that trimmed AMZN at -3.6% and GOOGL at +0.16% —
+a third of two flat positions sold because the paperwork used the wrong verb.
+A thesis that was never scoreable has not played out; a thesis that has played
+out needs a driver, not a rewrite.
 
 yfinance_ticker rules — use the exact format Yahoo Finance uses:
   US (NYSE/NASDAQ):  bare symbol         e.g. AAPL, MSFT, NVDA
