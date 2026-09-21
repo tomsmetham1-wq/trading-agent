@@ -7,4 +7,4 @@ __pycache__
 t212_instruments.json
 os_ca_bundle.pem
 *.__pyc
-shadow_portfolio.json.bak_*
+shadow_portfolio.json.bak[-_]*
