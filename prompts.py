@@ -475,6 +475,13 @@ the biggest losses coming from?
 Break down realised P&L (closed trades) separately from unrealised P&L (open
 positions). If the headline return is almost entirely unrealised, say so plainly
 and explain the risk — one bad week can erase it.
+Score the pick apart from its management, using the capture block in the
+context: a single pick is n=1 and cannot be told from luck, but what was done
+with it — the sizing, the trims (which of them the code forced and which were
+chosen), and whether the remainder was kept or exited once the thesis played
+out — is a series of decisions with a measurable outcome. Say what each
+contributed in pounds. Do not credit the pick with the whole outcome and the
+holding of it with nothing, and do not do the reverse.
 
 **2. Strategy adherence**
 Has the agent stuck to the stated rules (5–10 positions, no position >20%,
@@ -557,6 +564,8 @@ figures for section 1 rather than re-deriving them) ===
 
 === Single-name dependency (kill criterion #5, computed in code) ===
 {top_contributor}
+
+{capture_review}
 
 === Watchlist tracking — ideas flagged but NOT bought ===
 Scored against the benchmark over each name's own window. This is the
@@ -776,6 +785,8 @@ def build_deep_review_prompt(ledger: dict, valuation: dict) -> tuple[str, str]:
         valuation_json=json.dumps(valuation, indent=2, default=str),
         realized_pnl=json.dumps(realized_summary, indent=2, default=str),
         top_contributor=top_contributor,
+        capture_review=(sp.build_capture_review(ledger, valuation)
+                        or "(no capture data - no priced positions)"),
         watchlist_review=(sp.build_watchlist_review(ledger)
                           or "(no watchlist names tracked yet)"),
         today=datetime.now().strftime("%A, %d %B %Y"),

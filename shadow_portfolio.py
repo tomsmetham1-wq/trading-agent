@@ -744,6 +744,10 @@ def _apply_sell_or_trim(ledger: dict, rec: dict, ticker: str,
     }
     if closes_position:
         trade["closed_position"] = True
+    if rec.get("guard_generated"):
+        # A bank or exit the guards injected, not a judgement Claude made —
+        # position_capture() splits management outcomes on this.
+        trade["guard_generated"] = True
     ledger["trades"].append(trade)
 
     # Remove dust positions left after a partial trim
@@ -1978,6 +1982,292 @@ def update_played_out_peaks(ledger: dict, valuation: dict, run_date: str) -> lis
                     f"(was {peak:+.1f}%)"
                 )
     return events
+
+
+# =============================================================================
+# Capture: the pick scored apart from its management (Sep 2026)
+# =============================================================================
+#
+# Kill criterion #5 asks whether the picks OTHER than the top one make money.
+# It says nothing about a different skill the reviews have never scored: what
+# the agent did with the pick once it had it. DELL was sold down six times
+# between May and September 2026, four of them position-cap trims that nobody
+# decided, and the one discretionary call - keeping the remainder after
+# declaring the thesis played out on 27 Jul at +98% - went on to earn more
+# than the entire ex-DELL book. "DELL vs everything else" cannot see that: it
+# credits the pick with the whole outcome and the management with none of it.
+# None of this produces a second idea, so it changes nothing about the
+# 30 Nov test; it changes how honestly section 1 can answer "luck or skill".
+
+def record_played_out_prices(ledger: dict, valuation: dict, run_date: str) -> list[str]:
+    """
+    Record the price a position was trading at the day it was declared played out.
+
+    Runs AFTER execution with the post-trade valuation. position_capture()
+    needs it to score the one discretionary decision in a realized winner's
+    history - keeping the remainder rather than exiting at "played out" -
+    and nothing else in the ledger holds that price: SET_DRIVER is
+    ledger-only, so no fill price reaches the trade log, and the weekly
+    snapshot stores only ticker names. Recorded once; a legacy declaration
+    with no price is left alone and reported as unscoreable rather than seeded
+    from today, which would erase whatever has happened since.
+    """
+    events: list[str] = []
+    positions_val = (valuation or {}).get("positions", {}) or {}
+    for ticker, pos in (ledger.get("positions") or {}).items():
+        if pos.get("played_out_price_gbp") is not None:
+            continue
+        if played_out_declared_date(pos) != run_date:
+            continue
+        price = (positions_val.get(ticker) or {}).get("current_price_gbp")
+        if price is None:
+            continue
+        pos["played_out_price_gbp"] = round(float(price), 4)
+        pos["played_out_price_basis"] = "actual"
+        events.append(f"{ticker}: played-out declaration price recorded at "
+                      f"GBP {price:.2f}")
+    return events
+
+
+def position_capture(ledger: dict, valuation_result: dict) -> dict:
+    """
+    How much of each held name's buy-and-hold outcome the agent actually kept.
+
+    For every held position this replays the CURRENT lot (same boundaries as
+    topup_composition) and reports, at today's price:
+
+      buy_hold_gain_gbp   every share ever bought in the lot, held to today
+      actual_gain_gbp     what was actually earned: proceeds + open value - cost
+      capture             actual / buy_hold, when buy_hold > 0
+      management_gbp      actual - buy_hold; negative means the sells cost
+                          money against holding, positive means they saved it
+      sells               each sell with the gain it gave up against today
+                          (forgone_gbp = shares * (price_now - price_sold)) and
+                          whether a guard injected it, a process defect
+                          produced it, or Claude chose it
+      played_out_hold     for a played-out position with a recorded
+                          declaration price: the value of the shares held at
+                          the end of the declaration day against what those
+                          shares have turned into (proceeds since + open value)
+                          - the counterfactual for "should have exited when
+                          the thesis played out". Benchmark over the same
+                          window from the weekly snapshots where one exists.
+
+    Shares that reach the lot with no recorded buy (a rebuild, a sync) are
+    priced at the position's current avg_cost_gbp and the ticker is marked
+    basis_estimated - the same convention as compute_realized_pnl(). A
+    position with no live price is omitted; a missing price must never read
+    as zero capture.
+    """
+    out: dict[str, dict] = {}
+    positions = ledger.get("positions", {}) or {}
+    positions_val = (valuation_result or {}).get("positions", {}) or {}
+    trades = ledger.get("trades", []) or []
+    snapshots = ledger.get("weekly_snapshots", []) or []
+    bench_now = (valuation_result or {}).get("benchmark_return_pct")
+
+    for ticker, pos in positions.items():
+        price_now = (positions_val.get(ticker) or {}).get("current_price_gbp")
+        if price_now is None:
+            continue
+        held = float(pos.get("shares") or 0)
+        avg_cost = float(pos.get("avg_cost_gbp") or 0)
+        if held <= 0 or avg_cost <= 0:
+            continue
+
+        bought_shares = bought_cost = 0.0
+        sells: list[dict] = []
+        for t in trades:
+            action = t.get("action")
+            if action == "SYNC_RESET":
+                bought_shares = bought_cost = 0.0
+                sells = []
+                continue
+            if t.get("ticker") != ticker:
+                continue
+            if action == "SYNC_REMOVE":
+                bought_shares = bought_cost = 0.0
+                sells = []
+            elif action in ("BUY", "SYNC_ADD"):
+                shares = float(t.get("shares") or 0)
+                if action == "BUY":
+                    amount = float(t.get("amount_gbp") or 0)
+                else:
+                    amount = shares * float(t.get("avg_cost_gbp") or 0)
+                if shares <= 0 or amount <= 0:
+                    continue
+                bought_shares += shares
+                bought_cost += amount
+            elif action == "SYNC_COST":
+                cost = float(t.get("avg_cost_gbp") or 0)
+                if bought_shares > 0 and cost > 0:
+                    # Re-base the recorded lot exactly as the ledger was.
+                    bought_cost = bought_shares * cost
+            elif action in ("SELL", "TRIM"):
+                shares = float(t.get("shares") or 0)
+                proceeds = float(t.get("amount_gbp") or 0)
+                if shares <= 0:
+                    continue
+                price = float(t.get("price_gbp") or 0) or proceeds / shares
+                if t.get("guard_generated"):
+                    who = "guard"
+                elif t.get("process_defect"):
+                    who = "defect"
+                else:
+                    who = "claude"
+                sells.append({
+                    "date":         t.get("date") or "?",
+                    "shares":       round(shares, 6),
+                    "price_gbp":    round(price, 4),
+                    "proceeds_gbp": round(proceeds, 2),
+                    "gain_pct":     round((price / avg_cost - 1) * 100, 1),
+                    "forgone_gbp":  round(shares * (price_now - price), 2),
+                    "by":           who,
+                    "reason":       (t.get("exit_thesis") or "")[:70],
+                })
+                if t.get("closed_position"):
+                    bought_shares = bought_cost = 0.0
+                    sells = []
+
+        sold_shares = sum(s["shares"] for s in sells)
+        proceeds = sum(s["proceeds_gbp"] for s in sells)
+        # The lot must account for what is held plus what was sold. Anything
+        # short of that reached the lot unrecorded and is priced at avg cost.
+        unrecorded = max(0.0, held + sold_shares - bought_shares)
+        shares_ever = max(bought_shares, held + sold_shares)
+        cost_ever = bought_cost + unrecorded * avg_cost
+        estimated = unrecorded > 1e-6
+        if shares_ever <= 0 or cost_ever <= 0:
+            continue
+
+        buy_hold_gain = shares_ever * price_now - cost_ever
+        actual_gain = proceeds + held * price_now - cost_ever
+        entry = {
+            "shares_ever":       round(shares_ever, 6),
+            "cost_ever_gbp":     round(cost_ever, 2),
+            "basis_estimated":   estimated,
+            "price_now_gbp":     round(price_now, 4),
+            "buy_hold_gain_gbp": round(buy_hold_gain, 2),
+            "actual_gain_gbp":   round(actual_gain, 2),
+            "realised_gbp":      round(proceeds - sold_shares * avg_cost, 2),
+            "unrealised_gbp":    round(held * (price_now - avg_cost), 2),
+            "capture":           (actual_gain / buy_hold_gain
+                                  if buy_hold_gain > 0 else None),
+            "management_gbp":    round(actual_gain - buy_hold_gain, 2),
+            "sells":             sells,
+            "played_out_hold":   None,
+            "played_out_unscored": False,
+        }
+
+        declared = played_out_declared_date(pos)
+        price_d = pos.get("played_out_price_gbp")
+        if declared and price_d:
+            price_d = float(price_d)
+            after = [s for s in sells if s["date"] > declared]
+            shares_d = held + sum(s["shares"] for s in after)
+            value_d = shares_d * price_d
+            value_now = sum(s["proceeds_gbp"] for s in after) + held * price_now
+            hold = {
+                "declared":       declared,
+                "price_gbp":      round(price_d, 4),
+                "price_basis":    pos.get("played_out_price_basis") or "actual",
+                "shares":         round(shares_d, 6),
+                "value_then_gbp": round(value_d, 2),
+                "value_now_gbp":  round(value_now, 2),
+                "added_gbp":      round(value_now - value_d, 2),
+                "added_pct":      (round((value_now / value_d - 1) * 100, 1)
+                                   if value_d > 0 else None),
+                "benchmark_pct":  None,
+            }
+            # Benchmark over the same window: latest snapshot on/before the
+            # declaration against today, both inception-relative, so the
+            # window return is their ratio (see watchlist_performance).
+            bench_then = None
+            for s in snapshots:
+                if ((s.get("date") or "") <= declared
+                        and s.get("benchmark_return_pct") is not None):
+                    bench_then = s["benchmark_return_pct"]
+            if bench_then is not None and bench_now is not None:
+                hold["benchmark_pct"] = round(
+                    ((1 + bench_now / 100) / (1 + bench_then / 100) - 1) * 100, 2)
+            entry["played_out_hold"] = hold
+        elif declared:
+            entry["played_out_unscored"] = True
+
+        out[ticker] = entry
+    return out
+
+
+def build_capture_review(ledger: dict, valuation_result: dict) -> str:
+    """
+    Capture block for the deep review: the pick scored apart from its management.
+
+    Section 1 asks "luck or skill" and has only ever had one number to answer
+    with - each name's total P&L - which credits the pick with everything and
+    the holding of it with nothing. This gives the review three things it can
+    score separately: what the shares ever bought would have made if simply
+    held, what was actually kept, and (for a played-out winner) what keeping
+    the remainder rather than exiting at the declaration has earned since.
+    """
+    cap = position_capture(ledger, valuation_result)
+    if not cap:
+        return ""
+    lines = [
+        "=== Capture: what the agent kept of each pick (computed in code) ===",
+        "  buy-and-hold = every share bought in the current lot held to today;",
+        "  actual = proceeds + open value - cost. Selection, sizing and",
+        "  management are different skills - score them apart. A sell's",
+        "  'forgone' is against today's price, so it is hindsight: it says",
+        "  what the sells cost, not whether they were wrong. [guard] = a bank",
+        "  the code injected, [defect] = a process error, [claude] = chosen.",
+        "  Approximate where the basis is estimated.",
+    ]
+    ranked = sorted(cap.items(), key=lambda kv: -abs(kv[1]["buy_hold_gain_gbp"]))
+    for ticker, c in ranked:
+        est = " (basis ESTIMATED)" if c["basis_estimated"] else ""
+        if c["capture"] is not None:
+            verdict = f"capture {c['capture'] * 100:.0f}%"
+        else:
+            verdict = "capture n/a (buy-and-hold is not a gain)"
+        line = (
+            f"  {ticker}: bought {c['shares_ever']:.2f} sh for "
+            f"GBP {c['cost_ever_gbp']:,.0f}{est} | buy-and-hold to today "
+            f"GBP {c['buy_hold_gain_gbp']:+,.0f} | actual GBP "
+            f"{c['actual_gain_gbp']:+,.0f} (realised {c['realised_gbp']:+,.0f}, "
+            f"open {c['unrealised_gbp']:+,.0f}) | {verdict}"
+        )
+        if c["sells"]:
+            mgmt = c["management_gbp"]
+            line += (f" | sells {'cost' if mgmt < 0 else 'saved'} "
+                     f"GBP {abs(mgmt):,.0f} vs holding")
+        lines.append(line)
+        for s in c["sells"]:
+            lines.append(
+                f"      {s['date']} sold {s['shares']:.2f} sh @ GBP "
+                f"{s['price_gbp']:.0f} ({s['gain_pct']:+.0f}% from entry) "
+                f"forgone GBP {s['forgone_gbp']:+,.0f} [{s['by']}] {s['reason']}"
+            )
+        h = c["played_out_hold"]
+        if h:
+            bench = (f" vs benchmark {h['benchmark_pct']:+.1f}% over the window"
+                     if h["benchmark_pct"] is not None else "")
+            basis = (" (declaration price backfilled)"
+                     if h["price_basis"] != "actual" else "")
+            lines.append(
+                f"      HELD AFTER PLAYED OUT {h['declared']}{basis}: "
+                f"{h['shares']:.2f} sh @ GBP {h['price_gbp']:.0f} = GBP "
+                f"{h['value_then_gbp']:,.0f} then -> GBP "
+                f"{h['value_now_gbp']:,.0f} now (proceeds since + open), "
+                f"{h['added_gbp']:+,.0f} ({h['added_pct']:+.1f}%){bench}. "
+                f"The one discretionary hold decision in a realized winner - "
+                f"score it as management, not as the pick."
+            )
+        elif c["played_out_unscored"]:
+            lines.append(
+                "      played out, but no declaration price on record - the "
+                "hold since then cannot be scored."
+            )
+    return "\n".join(lines) + "\n"
 
 
 # =============================================================================

@@ -3312,3 +3312,184 @@ class TestSizeNeverArgued:
     def test_prompt_documents_set_size(self):
         assert '"action": "SET_SIZE"' in prompts.ANALYSIS_SYSTEM
         assert "SET_SIZE records the argument for a position's ACCUMULATED size" in prompts.ANALYSIS_SYSTEM
+
+
+# =============================================================================
+# Capture: the pick scored apart from its management (Sep 2026)
+# =============================================================================
+
+class TestPositionCapture:
+    """position_capture() replays the current lot and scores what was kept."""
+
+    def _ledger(self, **pos_extra):
+        ledger = make_ledger()
+        pos = {"shares": 4.0, "avg_cost_gbp": 100.0, "first_bought": "2026-04-26",
+               "thesis": "t", "theme": "AI"}
+        pos.update(pos_extra)
+        ledger["positions"] = {"D": pos}
+        ledger["trades"] = [
+            {"date": "2026-04-26", "action": "BUY",  "ticker": "D", "shares": 10,
+             "amount_gbp": 1000.0},
+            {"date": "2026-05-10", "action": "TRIM", "ticker": "D", "shares": 4,
+             "price_gbp": 120.0, "amount_gbp": 480.0, "exit_thesis": "cap breach"},
+            {"date": "2026-08-10", "action": "TRIM", "ticker": "D", "shares": 2,
+             "price_gbp": 200.0, "amount_gbp": 400.0, "exit_thesis": "level hit",
+             "guard_generated": True},
+        ]
+        return ledger
+
+    @staticmethod
+    def _val(price=250.0, bench=10.0):
+        return {"benchmark_return_pct": bench,
+                "positions": {"D": {"current_price_gbp": price}}}
+
+    def test_capture_ratio_and_forgone(self):
+        cap = sp.position_capture(self._ledger(), self._val())["D"]
+        # buy-and-hold: 10 sh * 250 - 1000 = 1500
+        # actual: 480 + 400 + 4*250 - 1000 = 880
+        assert cap["buy_hold_gain_gbp"] == pytest.approx(1500.0)
+        assert cap["actual_gain_gbp"] == pytest.approx(880.0)
+        assert cap["capture"] == pytest.approx(880 / 1500)
+        assert cap["management_gbp"] == pytest.approx(-620.0)
+        assert cap["realised_gbp"] == pytest.approx(480 - 400 + 400 - 200)
+        assert cap["unrealised_gbp"] == pytest.approx(600.0)
+        assert not cap["basis_estimated"]
+        forgone = [s["forgone_gbp"] for s in cap["sells"]]
+        assert forgone == pytest.approx([4 * 130, 2 * 50])
+        # the sells' forgone total IS the management gap
+        assert sum(forgone) == pytest.approx(-cap["management_gbp"])
+        assert [s["by"] for s in cap["sells"]] == ["claude", "guard"]
+
+    def test_unrecorded_shares_priced_at_avg_cost_and_flagged(self):
+        # Shares held plus shares sold exceed what the log bought - a rebuild
+        # seeded them. They are costed at avg_cost like compute_realized_pnl.
+        ledger = self._ledger(shares=6.0)     # 6 held + 6 sold > 10 bought
+        cap = sp.position_capture(ledger, self._val())["D"]
+        assert cap["basis_estimated"]
+        assert cap["shares_ever"] == pytest.approx(12.0)
+        assert cap["cost_ever_gbp"] == pytest.approx(1000 + 2 * 100)
+
+    def test_lot_restarts_after_close_or_reset(self):
+        ledger = self._ledger()
+        ledger["trades"] = [
+            {"date": "2026-04-01", "action": "BUY", "ticker": "D", "shares": 50,
+             "amount_gbp": 5000.0},
+            {"date": "2026-04-02", "action": "SELL", "ticker": "D", "shares": 50,
+             "price_gbp": 90.0, "amount_gbp": 4500.0, "closed_position": True},
+        ] + ledger["trades"]
+        cap = sp.position_capture(ledger, self._val())["D"]
+        assert cap["shares_ever"] == pytest.approx(10.0)
+        assert len(cap["sells"]) == 2
+        ledger["trades"].insert(2, {"date": "2026-04-03", "action": "SYNC_RESET"})
+        cap = sp.position_capture(ledger, self._val())["D"]
+        assert cap["shares_ever"] == pytest.approx(10.0)
+
+    def test_losing_position_has_no_ratio(self):
+        cap = sp.position_capture(self._ledger(), self._val(price=80.0))["D"]
+        assert cap["capture"] is None
+        assert cap["buy_hold_gain_gbp"] < 0
+        # trims at 120 and 200 saved money against holding to 80
+        assert cap["management_gbp"] > 0
+
+    def test_no_price_means_omitted_not_zero(self):
+        val = {"positions": {"D": {"current_price_gbp": None}}}
+        assert sp.position_capture(self._ledger(), val) == {}
+
+    def test_played_out_hold_scored_from_declaration_price(self):
+        ledger = self._ledger(
+            thesis_played_out=True,
+            forward_driver_history=[{"date": "2026-07-27", "driver": "x"}],
+            played_out_price_gbp=160.0, played_out_price_basis="backfilled",
+        )
+        ledger["weekly_snapshots"] = [
+            {"date": "2026-07-20", "benchmark_return_pct": 5.0},
+            {"date": "2026-07-27", "benchmark_return_pct": 6.0},
+            {"date": "2026-08-03", "benchmark_return_pct": 7.0},
+        ]
+        cap = sp.position_capture(ledger, self._val(price=250.0, bench=10.0))["D"]
+        h = cap["played_out_hold"]
+        # held 4 now + 2 sold after 27 Jul = 6 sh @ 160 = 960 then;
+        # 400 proceeds since + 4*250 = 1400 now
+        assert h["shares"] == pytest.approx(6.0)
+        assert h["value_then_gbp"] == pytest.approx(960.0)
+        assert h["value_now_gbp"] == pytest.approx(1400.0)
+        assert h["added_gbp"] == pytest.approx(440.0)
+        assert h["price_basis"] == "backfilled"
+        # benchmark window uses the snapshot ON the declaration date: 1.10/1.06
+        assert h["benchmark_pct"] == pytest.approx((1.10 / 1.06 - 1) * 100, abs=0.01)
+
+    def test_played_out_without_price_is_unscored(self):
+        ledger = self._ledger(
+            thesis_played_out=True,
+            forward_driver_history=[{"date": "2026-07-27", "driver": "x"}],
+        )
+        cap = sp.position_capture(ledger, self._val())["D"]
+        assert cap["played_out_hold"] is None
+        assert cap["played_out_unscored"]
+        assert "cannot be scored" in sp.build_capture_review(ledger, self._val())
+
+    def test_review_renders_the_three_figures(self):
+        ledger = self._ledger(
+            thesis_played_out=True,
+            forward_driver_history=[{"date": "2026-07-27", "driver": "x"}],
+            played_out_price_gbp=160.0,
+        )
+        text = sp.build_capture_review(ledger, self._val())
+        assert "D: bought 10.00 sh for GBP 1,000" in text
+        assert "buy-and-hold to today GBP +1,500" in text
+        assert "actual GBP +880" in text
+        assert "capture 59%" in text
+        assert "sells cost GBP 620 vs holding" in text
+        assert "[guard] level hit" in text
+        assert "HELD AFTER PLAYED OUT 2026-07-27" in text
+
+    def test_deep_review_prompt_carries_capture_block(self):
+        ledger = self._ledger()
+        val = dict(self._val(), total_value_gbp=2000.0, total_return_pct=0.0)
+        val["positions"]["D"].update({"current_value_gbp": 1000.0, "pnl_gbp": 600.0})
+        system, user = prompts.build_deep_review_prompt(ledger, val)
+        assert "=== Capture: what the agent kept of each pick" in user
+        assert "capture 59%" in user
+        assert "Score the pick apart from its management" in system
+
+
+class TestRecordPlayedOutPrices:
+    def _ledger(self, declared):
+        ledger = make_ledger()
+        ledger["positions"] = {"D": {
+            "shares": 1.0, "avg_cost_gbp": 100.0, "first_bought": "2026-04-26",
+            "thesis": "t", "thesis_played_out": True,
+            "forward_driver_history": [{"date": declared, "driver": "x"}],
+        }}
+        return ledger
+
+    def test_records_price_the_run_it_is_declared(self):
+        ledger = self._ledger("2026-09-21")
+        val = {"positions": {"D": {"current_price_gbp": 123.4567}}}
+        events = sp.record_played_out_prices(ledger, val, "2026-09-21")
+        assert ledger["positions"]["D"]["played_out_price_gbp"] == pytest.approx(123.4567)
+        assert ledger["positions"]["D"]["played_out_price_basis"] == "actual"
+        assert len(events) == 1
+        # idempotent - never overwritten by a later run's price
+        val["positions"]["D"]["current_price_gbp"] = 200.0
+        assert sp.record_played_out_prices(ledger, val, "2026-09-21") == []
+        assert ledger["positions"]["D"]["played_out_price_gbp"] == pytest.approx(123.4567)
+
+    def test_legacy_declaration_is_not_seeded_from_today(self):
+        ledger = self._ledger("2026-07-27")
+        val = {"positions": {"D": {"current_price_gbp": 200.0}}}
+        assert sp.record_played_out_prices(ledger, val, "2026-09-21") == []
+        assert "played_out_price_gbp" not in ledger["positions"]["D"]
+
+    def test_guard_generated_flag_reaches_the_trade_record(self):
+        ledger = make_ledger()
+        ledger["positions"] = {"D": {"shares": 3.0, "avg_cost_gbp": 100.0,
+                                     "first_bought": "2026-04-26", "thesis": "t"}}
+        rec = {"action": "TRIM", "yfinance_ticker": "D", "trim_pct": 33,
+               "thesis_oneline": "Mechanical bank", "guard_generated": True}
+        sp._apply_sell_or_trim(ledger, rec, "D", "TRIM", 150.0, "2026-09-21")
+        assert ledger["trades"][-1]["guard_generated"] is True
+        rec = {"action": "TRIM", "yfinance_ticker": "D", "trim_pct": 33,
+               "thesis_oneline": "chosen"}
+        sp._apply_sell_or_trim(ledger, rec, "D", "TRIM", 150.0, "2026-09-21")
+        assert "guard_generated" not in ledger["trades"][-1]

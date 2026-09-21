@@ -611,6 +611,35 @@ benchmark OR one non-top position has earned `EX_TOP_SECOND_IDEA_GBP` (£150) in
 its own right. As of 10 Sep the second leg is live and close — XOM at £134.32.
 If neither is true by the date, the strategy is funding variance, not skill.
 
+Capture — the pick scored apart from its management (Sep 2026). Kill
+criterion #5 asks whether the OTHER picks make money; nothing scored what the
+agent did with the pick it had. DELL was sold down six times May–Sep 2026,
+four of them cap trims nobody decided, and the one discretionary call —
+keeping the remainder after declaring the thesis played out on 27 Jul at
++98% — earned ~£175 (+18%) against +1.6% for VUSA over the window, more than
+the entire ex-DELL book. "DELL vs everything else" credits the pick with all
+of it. `sp.position_capture()` replays the current lot (same boundaries as
+`topup_composition`) and reports per held name: buy-and-hold of every share
+ever bought vs actual (proceeds + open value − cost), the capture ratio,
+each sell's forgone gain against today tagged [guard]/[defect]/[claude]
+(`guard_generated` now persists on the trade record), and for a played-out
+position the value of the shares held at declaration vs what they became.
+Rendered by `build_capture_review()` into the DEEP REVIEW ONLY (section 1 is
+told to score selection, sizing and management apart); deliberately not in
+the weekly email — nothing acts on it weekly. On the 21 Sep book DELL is
+59% capture: £1,118 kept of a £1,910 buy-and-hold, £793 of the gap from the
+four cap trims (£412 from the first, at +20%).
+
+The declaration price comes from `record_played_out_prices()` (run_weekly
+step 7c, post-trade so a same-run injected bank is already out of the share
+count), stored once as `played_out_price_gbp` / `played_out_price_basis:
+"actual"`. A legacy declaration is left unscored rather than seeded from
+today. DELL's was backfilled by `fix_dell_played_out_price.py` from the
++97.6% in the 27 Jul report (basis "backfilled", labelled in every
+rendering). The forgone figures are hindsight — they say what the sells cost,
+not that they were wrong — and none of this produces a second idea, so the
+30 Nov test is unchanged.
+
 Deliberately NOT implemented from the same review: raising the cash floor to
 8–10%. It contradicts the Aug 2026 dead-zone rule (an 8% floor would have made
 this run's £259 slice a £69 slice, below the 3% top-up minimum — nothing
@@ -713,7 +742,7 @@ or requires a name to persist N weeks before it can be bought. Those were
 considered and rejected — they forfeit real upside to buy a filter the data
 doesn't yet justify. Revisit only once there are ~3 months of scores.
 
-Test suite: `test_trading_agent.py` (315 tests, no network). Run it after any
+Test suite: `test_trading_agent.py` (327 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the

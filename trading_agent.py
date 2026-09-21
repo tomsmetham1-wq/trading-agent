@@ -1838,6 +1838,12 @@ def run_weekly(started: datetime) -> None:
     except Exception as e:
         # Never let idea-tracking break a run that has already placed orders.
         logger.error("Watchlist recording failed (trades unaffected): %s", e)
+    # Step 7c: a position declared played out THIS run gets its declaration
+    # price recorded, so the deep review can score the decision to keep the
+    # remainder rather than exit (position_capture). Post-trade so a bank
+    # injected in the same run is already out of the share count.
+    for e in sp.record_played_out_prices(ledger, post_val, run_date):
+        logger.info("[PLAYED-OUT] %s", e)
     sp.snapshot(ledger, post_val, run_date, t212_total_gbp=t212_total)
     ledger["last_run_date"] = run_date
     sp.save_ledger(ledger)
