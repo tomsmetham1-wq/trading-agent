@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -685,6 +685,16 @@ def _apply_buy(ledger: dict, rec: dict, ticker: str,
         trade["theme"] = theme
     if pre_commit_trims:
         trade["pre_commit_trims"] = pre_commit_trims
+    # Dead-zone top-up provenance, stamped by the guards: whether this buy was
+    # a top-up at all, whether it went to the worst-performing eligible
+    # holding, and the structured case it carried. The laggard count in
+    # later alerts is built from these.
+    if rec.get("topup"):
+        trade["topup"] = True
+    if rec.get("laggard_topup"):
+        trade["laggard_topup"] = True
+    if isinstance(rec.get("topup_case"), dict) and rec["topup_case"]:
+        trade["topup_case"] = rec["topup_case"]
     ledger["trades"].append(trade)
     return f"BOUGHT £{amount_gbp:.2f} of {ticker} @ £{price:.4f}"
 
@@ -744,6 +754,13 @@ def _apply_sell_or_trim(ledger: dict, rec: dict, ticker: str,
     }
     if closes_position:
         trade["closed_position"] = True
+        # The position record is deleted below, and it was the only place the
+        # realised-P&L replay could read a basis for shares the log never saw
+        # bought (the pre-April-2026 rebuild lots). Carry the cost the position
+        # closed at so the replay keeps pricing them after the exit — DELL's
+        # realised gain read £1,183 the week before it closed and £90 the week
+        # after, which flipped kill criterion #5 to PASSING on paperwork.
+        trade["avg_cost_gbp"] = round(pos["avg_cost_gbp"], 4)
     if rec.get("guard_generated"):
         # A bank or exit the guards injected, not a judgement Claude made —
         # position_capture() splits management outcomes on this.
@@ -1297,11 +1314,17 @@ def compute_realized_pnl(ledger: dict) -> dict:
                    MORE exact, never estimated.
 
     Shares sold with no recorded basis fall back to the position's current
-    avg_cost_gbp and the ticker is reported under "tickers_with_estimated_basis".
-    Skipping them instead understates realised P&L badly — DELL's five trims
-    banked ~£650 against shares mostly seeded by a rebuild, and reporting that
-    as +£90 misleads exactly the kill-criteria decomposition the deep review
-    exists to make. Tickers with no basis available at all stay under
+    avg_cost_gbp — or, once the position has closed, to the latest trade record
+    for the ticker carrying one (a closing SELL/TRIM, SYNC_COST or SYNC_ADD) —
+    and the ticker is reported under "tickers_with_estimated_basis". Skipping
+    them instead understates realised P&L badly — DELL's five trims banked
+    ~£650 against shares mostly seeded by a rebuild, and reporting that as
+    +£90 misleads exactly the kill-criteria decomposition the deep review
+    exists to make. The closed-position fallback matters for the same name:
+    the day DELL was sold in full (21 Sep 2026) its position record went with
+    it, the replay fell back to nothing, £2,008 of proceeds went unpriced and
+    the weekly email named MRVL top contributor with criterion #5 PASSING.
+    Tickers with no basis available at all stay under
     "tickers_with_incomplete_basis".
 
     Args:
@@ -1333,14 +1356,32 @@ def compute_realized_pnl(ledger: dict) -> dict:
         if held:
             peak_cost[tk] = max(peak_cost.get(tk, 0.0), held[1])
 
-    def _fallback_basis(tk: str):
-        """Per-share cost for shares with no recorded BUY, or None."""
-        cost = (positions.get(tk) or {}).get("avg_cost_gbp")
+    def _positive(v) -> bool:
         try:
-            cost = float(cost)
+            return float(v) > 0
         except (TypeError, ValueError):
-            return None
-        return cost if cost > 0 else None
+            return False
+
+    def _fallback_basis(tk: str):
+        """
+        Per-share cost for shares with no recorded BUY, or None.
+
+        A held position's current avg_cost_gbp is the best estimate. Once the
+        position has closed that record is gone, so fall back to the latest
+        trade for the ticker that carries an avg_cost_gbp — a closing
+        SELL/TRIM (written by _apply_sell_or_trim), a SYNC_COST re-base or a
+        SYNC_ADD. Without this the basis vanished the moment a winner was
+        sold in full and its whole realised gain dropped out of the
+        single-name dependency ranking.
+        """
+        cost = (positions.get(tk) or {}).get("avg_cost_gbp")
+        if not _positive(cost):
+            cost = None
+            for t in reversed(ledger.get("trades", [])):
+                if t.get("ticker") == tk and _positive(t.get("avg_cost_gbp")):
+                    cost = t["avg_cost_gbp"]
+                    break
+        return float(cost) if cost is not None else None
 
     for t in ledger.get("trades", []):
         action = t.get("action")
@@ -2397,6 +2438,168 @@ def _format_size_flag(ticker: str, flag: dict) -> str:
         f"        (b) TRIM toward the size that was argued for at entry. "
         f"\"Most upside to the trim level\" is not a size argument. ***"
     )
+
+
+# =============================================================================
+# The deployable slice must age before it is topped up (Sep 2026)
+# =============================================================================
+#
+# The Aug 2026 dead-zone rule closed the idle-cash trap: a slice too small to
+# open a position at the 8% minimum may be deployed as a 3-8% top-up of one
+# holding. It was reached for immediately, every time it existed. Three
+# top-ups in three weeks -- NVDA GBP 246 on 1 Sep, NVDA GBP 259 on 10 Sep,
+# AMZN GBP 430 on 21 Sep -- all to the flattest names in the book, GBP 935
+# deployed for ~GBP 20, every one inside the 41-48% AI-infrastructure theme.
+# On 21 Sep the slice was MANUFACTURED: after the DELL sale ~GBP 960 was
+# deployable, LLY was opened at exactly the GBP 524 minimum, and the GBP 454
+# remainder was then declared a dead zone and topped up in the same run. The
+# escape hatch had become the default.
+#
+# The trap the rule closed costs almost nothing: a GBP 450 slice idle against
+# a benchmark doing ~9% over five months forgoes about GBP 6 a month, while a
+# top-up into a 41% theme is a real concentration decision. So the top-up is
+# now the backstop. The slice must have sat in the 3-8% band, measured at run
+# start, for TOPUP_SLICE_MIN_AGE_WEEKS before a dead-zone top-up is
+# permitted. If a trim or sale lands in the meantime the slice combines with
+# the proceeds and funds a proper new position -- which is what "wait for a
+# bigger or a new idea" means in practice, and is exactly what 21 Sep would
+# have been had the cash not been split. This one IS a block, unlike the
+# repeat-top-up and size-never-argued alerts: the only mechanism it removes is
+# "deploy now", and waiting is the mechanism.
+#
+# The clock lives on the ledger because weekly snapshots do not carry cash.
+# It is measured at run START (after sync, before the prompt) so a same-run
+# sale cannot start it, and it clears whenever the slice leaves the band in
+# either direction: below 3% there is nothing to deploy, at 8%+ a new
+# position is fundable and the slice is not stuck.
+
+CASH_RESERVE_FLOOR        = 0.05   # cash below this is the reserve, never deployable
+MIN_NEW_POSITION_PCT      = 0.08   # a new position is at least this share of the book
+MIN_TOPUP_PCT             = 0.03   # a dead-zone top-up is at least this share
+TOPUP_SLICE_MIN_AGE_WEEKS = 4      # the slice sits this long before a top-up
+
+
+def deployable_slice(valuation: dict) -> Optional[dict]:
+    """Cash above the reserve floor as {"gbp", "pct"}, or None when unknown."""
+    total = valuation.get("total_value_gbp")
+    cash = valuation.get("cash_gbp")
+    if not total or cash is None:
+        return None
+    gbp = float(cash) - CASH_RESERVE_FLOOR * float(total)
+    return {"gbp": gbp, "pct": gbp / float(total) * 100}
+
+
+def slice_in_band(pct: float) -> bool:
+    """True when a slice this size can fund a top-up but not a new position."""
+    return MIN_TOPUP_PCT * 100 <= pct < MIN_NEW_POSITION_PCT * 100
+
+
+def topup_permitted_from(ledger: dict) -> Optional[str]:
+    """The first date a dead-zone top-up is allowed, or None if no slice is waiting."""
+    since = (ledger.get("deployable_slice") or {}).get("in_band_since")
+    if not since:
+        return None
+    try:
+        start = datetime.strptime(since, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+    return (start + timedelta(weeks=TOPUP_SLICE_MIN_AGE_WEEKS)).isoformat()
+
+
+def topup_permitted(ledger: dict, today: str) -> bool:
+    """Whether the waiting slice has aged enough for a dead-zone top-up today."""
+    permitted_from = topup_permitted_from(ledger)
+    return bool(permitted_from) and today >= permitted_from
+
+
+def update_deployable_slice(ledger: dict, valuation: dict, run_date: str) -> list[str]:
+    """
+    Measure the deployable slice at run start and keep the in-band clock.
+
+    ledger["deployable_slice"] = {in_band_since, gbp, pct, measured}. The
+    clock starts the first run the slice is measured inside the band and is
+    cleared the first run it is measured outside it. Unknown cash leaves the
+    state untouched -- a missing figure is not evidence the slice moved.
+    Returns log lines describing any change.
+    """
+    events: list[str] = []
+    s = deployable_slice(valuation)
+    if s is None:
+        return events
+    prev = (ledger.get("deployable_slice") or {}).get("in_band_since")
+    if slice_in_band(s["pct"]):
+        since = prev or run_date
+    else:
+        since = None
+    ledger["deployable_slice"] = {
+        "in_band_since": since,
+        "gbp":           round(s["gbp"], 2),
+        "pct":           round(s["pct"], 2),
+        "measured":      run_date,
+    }
+    if since and not prev:
+        events.append(
+            f"deployable slice GBP {s['gbp']:.2f} ({s['pct']:.1f}%) entered the "
+            f"{MIN_TOPUP_PCT * 100:.0f}-{MIN_NEW_POSITION_PCT * 100:.0f}% band; "
+            f"a dead-zone top-up is permitted from {topup_permitted_from(ledger)}"
+        )
+    elif prev and not since:
+        events.append(
+            f"deployable slice GBP {s['gbp']:.2f} ({s['pct']:.1f}%) left the band "
+            f"(in band since {prev}); top-up clock cleared"
+        )
+    return events
+
+
+def build_deployment_review(ledger: dict, valuation: dict) -> str:
+    """
+    The cash-deployment block for the weekly prompt: where the deployable
+    slice stands against the bands, and -- when it is in the dead zone --
+    whether it has aged enough for a top-up or must keep waiting.
+    """
+    s = deployable_slice(valuation)
+    if s is None:
+        return ""
+    total = float(valuation["total_value_gbp"])
+    lines = [
+        "=== Cash deployment ===",
+        f"  Deployable slice (cash above the {CASH_RESERVE_FLOOR * 100:.0f}% "
+        f"reserve): GBP {s['gbp']:.2f} ({s['pct']:.1f}% of the book)",
+        f"  New position minimum ({MIN_NEW_POSITION_PCT * 100:.0f}%): "
+        f"GBP {MIN_NEW_POSITION_PCT * total:.2f}   dead-zone top-up minimum "
+        f"({MIN_TOPUP_PCT * 100:.0f}%): GBP {MIN_TOPUP_PCT * total:.2f}",
+    ]
+    state = ledger.get("deployable_slice") or {}
+    since = state.get("in_band_since")
+    measured = state.get("measured") or ""
+    if s["pct"] >= MIN_NEW_POSITION_PCT * 100:
+        lines.append(
+            "  The slice can fund a NEW position. A sub-8% BUY of an existing "
+            "holding is NOT a dead-zone top-up here and will be BLOCKED. Do not "
+            "open a new position at the minimum and call the remainder a dead "
+            "zone: size the idea for the cash, or hold the remainder."
+        )
+    elif s["pct"] < MIN_TOPUP_PCT * 100:
+        lines.append("  The slice is below the top-up minimum: nothing to deploy. Hold it.")
+    elif since and topup_permitted(ledger, measured):
+        lines.append(
+            f"  DEAD ZONE, AGED: in band since {since} "
+            f"({TOPUP_SLICE_MIN_AGE_WEEKS}+ weeks, no trim or sale has combined "
+            f"with it). A dead-zone top-up of ONE holding is permitted this run "
+            f"if -- and only if -- a holding meets the top-up test (accelerating "
+            f"metric since entry AND valuation upside, with a topup_case). "
+            f"Holding the slice remains permitted."
+        )
+    else:
+        lines.append(
+            f"  DEAD ZONE, WAITING: in band since {since or measured}; a "
+            f"dead-zone top-up is BLOCKED until {topup_permitted_from(ledger) or '(next run)'} "
+            f"({TOPUP_SLICE_MIN_AGE_WEEKS} weeks). Do not propose one. If a trim "
+            f"or sale adds to the slice in the meantime it funds a NEW position "
+            f"instead. The cost of waiting is ~GBP {s['gbp'] * 0.09 / 12:.0f} a "
+            f"month at benchmark returns."
+        )
+    return "\n".join(lines) + "\n"
 
 
 def _format_forward_driver(pos: dict, bank_due: bool = False) -> str:

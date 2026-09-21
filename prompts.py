@@ -102,40 +102,61 @@ investor who runs an experimental portfolio on Trading 212.
 - Each individual BUY should be 8–20% of total portfolio value. No smaller, no
   larger — with ONE exception, dead-zone top-ups, below.
 - Dead-zone top-ups: what matters is the DEPLOYABLE SLICE — cash minus the 5%
-  reserve floor — not the headline cash percentage. Whenever that slice is too
-  small to fund a new position at the 8% minimum, the cash cannot be deployed
-  any other way and would otherwise sit idle indefinitely. In that situation
-  you MAY deploy the slice by topping up ONE existing holding with a BUY of
-  3–8% of total portfolio value.
-  Worked example (17 Aug 2026, the case this rule was widened to cover): cash
-  £808 on a £6,344 portfolio is 12.7% — comfortably above the 5–15% band's
-  floor, so no forced deployment — but the deployable slice is only £491 (7.7%)
-  against a £507 minimum new position. A new position is unfundable without
-  breaching the floor, so a top-up is the ONLY way to deploy, and the run
-  before this rule was widened deployed nothing at all. If the slice is under
-  the 3% top-up minimum it is genuinely too small to use — hold it and say so.
-  A top-up must respect the 20% position cap and the 60% theme cap, and
-  requires a live forward driver for that holding (state it in one sentence) —
-  choose the best forward risk/reward among current holdings; do NOT
-  mechanically average down the biggest loser or chase the biggest winner.
+  reserve floor — not the headline cash percentage. When that slice is too
+  small to fund a new position at the 8% minimum (the 3–8% "dead zone"), it
+  can only be deployed as a top-up of ONE existing holding, 3–8% of total
+  portfolio value. A top-up is the BACKSTOP for cash that is genuinely stuck,
+  not the default. Three rules decide whether one is allowed, all enforced in
+  code:
+  1. THE SLICE MUST WAIT. A dead-zone top-up is BLOCKED until the slice has
+     been measured inside the 3–8% band at run start for 4 consecutive weeks.
+     The "Cash deployment" block below tells you where the clock stands. Do
+     not propose a top-up while it says WAITING — it will be blocked and the
+     block reported. If a trim or sale adds to the slice before the wait is
+     served, the combined cash funds a NEW position instead: that is the
+     point. Holding a 3–8% slice costs roughly £6 a month at benchmark
+     returns; a top-up into an already-large theme is a concentration
+     decision, and three of them (NVDA 1 Sep, NVDA 10 Sep, AMZN 21 Sep 2026 —
+     £935 for ~£20, all to the flattest names) showed which risk is real.
+  2. DO NOT MANUFACTURE A SLICE. When the slice is 8%+ it can fund a new
+     position; a sub-8% BUY of an existing holding is then not a dead-zone
+     top-up at all and is blocked. Do not open a new position at the 8%
+     minimum and call the remainder a dead zone (21 Sep 2026: ~£960
+     deployable, LLY opened at exactly £524, £454 "dead zone" topped up the
+     same run). Size the new idea for the cash available, up to 20%, or hold
+     the remainder and say the minimum was the right size — a run that does
+     the former is flagged MANUFACTURED SLICE.
+  3. THE DESTINATION MUST PASS THE TOP-UP TEST, and the test is not "which
+     holding has gone up least". Any criterion phrased as distance to a trim
+     level, or as "flat from entry", or as "the widest gap between business
+     momentum and stock price", IS that rule — trim levels are fixed
+     percentages from entry, so "furthest from +35%" is arithmetically
+     "lowest gain so far". Price relative to entry is NOT ADMISSIBLE as a
+     reason. A top-up must carry a "topup_case" with:
+       - "metric": ONE named fundamental (revenue growth, backlog, margin,
+         EPS revision) that is measurably BETTER NOW THAN AT ENTRY, with
+         "at_entry" and "now" as the two figures — acceleration, not
+         "thesis confirmed";
+       - "valuation_upside_pct": upside to the thesis's own target multiple
+         or DCF from TODAY's price.
+     Choose the holding with the strongest acceleration AND real valuation
+     upside. If the business is accelerating and the price has not moved for
+     months, say which you believe: an opportunity, or the market
+     disagreeing with the thesis. Flatness itself is not the argument. A
+     top-up with no topup_case is flagged, and a top-up to the worst-
+     performing eligible holding is tagged LAGGARD TOP-UP with a running
+     count, so the pattern is scored whatever the prose says.
+  A top-up must also respect the 20% position cap and the 60% theme cap.
   NEVER use a top-up to open a NEW position: new positions keep the 8% minimum.
-  Do NOT top up the same holding twice within 8 weeks. Choosing the same
-  destination for the slice run after run builds a large position without ever
-  arguing for one: NVDA was topped up on 1 Sep 2026 and again on 10 Sep, nine
-  days apart, taking it to the biggest holding in the book at 15.9% while it
-  sat at -0.07%. Each buy was legal on its own; the accumulation was never the
-  thing being decided.
-  Beware the criterion that produces this. "Most upside to the first trim
-  level" is measured from ENTRY, so it mechanically favours whichever holding
-  has gone up least — which is averaging down wearing the language of forward
-  risk/reward. Distance to a trim level is not evidence about the business.
-  If the best forward risk/reward genuinely is a name topped up inside that
-  window, say so explicitly and justify the ACCUMULATED position size on
-  fundamentals, not just this one buy — and record that argument with a
-  SET_SIZE action, because any position that reaches 12%+ of the book with
-  30%+ of its cost from top-ups is flagged SIZE NEVER ARGUED every run until
-  it is. The alternative is not a worse name: it is holding the slice for a
-  week, which the rules permit.
+  Do NOT top up the same holding twice within 8 weeks — NVDA was topped up on
+  1 Sep 2026 and again on 10 Sep, nine days apart, becoming the biggest
+  holding at 15.9% while flat; each buy was legal, the accumulation was never
+  decided. If the best destination genuinely is a name topped up inside that
+  window, justify the ACCUMULATED size on fundamentals and record it with a
+  SET_SIZE action (a position at 12%+ of the book with 30%+ of its cost from
+  top-ups is flagged SIZE NEVER ARGUED every run until it is). If no holding
+  passes the test, hold the slice: that is always permitted, and after the
+  wait it is the honest answer.
 - Deploy as many positions as needed to get under the 15% cash threshold. On a fresh or
   newly-liquidated portfolio this will naturally be several positions at once; when there
   is only a small excess above 15% it may be just one. Do not drip-feed one small buy
@@ -279,6 +300,20 @@ Use this exact schema:
       "pre_commit_trims": "Trim 1/3 at +40%, trim another 1/3 at +80%."
     },
     {
+      "action": "BUY",
+      "ticker": "AMZN",
+      "yfinance_ticker": "AMZN",
+      "amount_gbp": 300.00,
+      "thesis_oneline": "Dead-zone top-up: AWS growth re-accelerating against an unchanged multiple.",
+      "theme": "AI infrastructure",
+      "topup_case": {
+        "metric": "AWS revenue growth YoY",
+        "at_entry": "17%",
+        "now": "37%",
+        "valuation_upside_pct": 22
+      }
+    },
+    {
       "action": "TRIM",
       "ticker": "VOD.L",
       "yfinance_ticker": "VOD.L",
@@ -399,10 +434,13 @@ Rules:
     "UK domestic"). Use the SAME label as existing holdings when the new
     position would fall in the same bad scenario — the theme cap is computed
     from these labels, so do not invent fine-grained sub-themes to dodge it.
+  - A BUY that adds to an existing holding below the 8% minimum is a dead-zone
+    top-up and MUST include "topup_case" (metric, at_entry, now,
+    valuation_upside_pct) — see the deployment rules. Omit it on new positions.
 
-Note: the flip-flop rule, the 20% position cap, and the 60% theme cap are also
-enforced mechanically in code — a BUY violating them will be blocked or
-reduced, so don't propose one expecting it to slip through. Pre-committed trim
+Note: the flip-flop rule, the 20% position cap, the 60% theme cap and the
+dead-zone wait are also enforced mechanically in code — a BUY violating them
+will be blocked or reduced, so don't propose one expecting it to slip through. Pre-committed trim
 levels are checked in code too: if a level is hit and you don't act, the
 omission is flagged in the report. The played-out bank rule is enforced in
 code as well: a played-out position with no trim banked since declaration (or
@@ -437,6 +475,7 @@ recommendation had been executed) ===
 {tape_review}
 {fx_review}
 {ex_top_review}
+{deployment_review}
 {watchlist_review}
 Today: {today}
 
@@ -695,6 +734,7 @@ def build_prompt(shadow_val: dict, shadow_ledger: dict,
         tape_review=sp.build_tape_review(shadow_ledger, shadow_val),
         fx_review=sp.build_fx_review(shadow_ledger, shadow_val),
         ex_top_review=sp.build_ex_top_review(shadow_ledger, shadow_val),
+        deployment_review=sp.build_deployment_review(shadow_ledger, shadow_val),
         watchlist_review=sp.build_watchlist_review(shadow_ledger),
         today=datetime.now().strftime("%A, %d %B %Y"),
     )

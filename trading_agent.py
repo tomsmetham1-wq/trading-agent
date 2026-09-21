@@ -488,10 +488,13 @@ CASH_FLOOR_ALERT = 0.04       # warn when planned buys leave cash below ~5% rese
 
 # Cash deployment bands, as fractions of total portfolio value. The deployable
 # slice is cash minus the reserve floor; when that slice can't fund a new
-# position at the minimum, only a dead-zone top-up can put it to work.
-CASH_RESERVE_FLOOR   = 0.05
-MIN_NEW_POSITION_PCT = 0.08
-MIN_TOPUP_PCT        = 0.03
+# position at the minimum, only a dead-zone top-up can put it to work -- and
+# only once it has waited (Sep 2026). They live in shadow_portfolio because
+# build_deployment_review() quotes them into the prompt; aliased here.
+CASH_RESERVE_FLOOR        = sp.CASH_RESERVE_FLOOR
+MIN_NEW_POSITION_PCT      = sp.MIN_NEW_POSITION_PCT
+MIN_TOPUP_PCT             = sp.MIN_TOPUP_PCT
+TOPUP_SLICE_MIN_AGE_WEEKS = sp.TOPUP_SLICE_MIN_AGE_WEEKS
 
 # A position whose thesis has played out should have a mechanical trim within
 # this % move of TODAY's price. Trim levels are stored as gains from entry, so
@@ -667,6 +670,158 @@ def _repeat_topup_alerts(recs: list, ledger: dict, pre_val: dict) -> list[str]:
             f"window{weight_txt}) - averaging into one name across runs is a "
             f"concentration decision, not a fresh idea"
         )
+    return alerts
+
+
+def _is_topup(rec: dict, ledger: dict, total: float) -> bool:
+    """A BUY of a holding already in the book, under the new-position minimum."""
+    if (rec.get("action") or "").upper().strip() != "BUY":
+        return False
+    ticker = _rec_ticker(rec)
+    if not ticker or ticker not in (ledger.get("positions") or {}):
+        return False
+    if not total:
+        return False
+    return float(rec.get("amount_gbp") or 0) < MIN_NEW_POSITION_PCT * total
+
+
+def _manufactured_slice_alerts(allowed: list, ledger: dict, pre_val: dict) -> list[str]:
+    """
+    Flag a run that opens a new position at (or near) the minimum and leaves a
+    top-up-sized slice behind it.
+
+    21 Sep 2026: after the DELL sale ~GBP 960 was deployable. LLY was opened at
+    exactly the GBP 524 minimum and the GBP 454 remainder was declared a dead
+    zone and topped up into AMZN the same run. The dead zone did not happen to
+    the portfolio; the sizing choice created it. A single GBP 978 LLY position
+    (15%) was inside the 8-20% band, and so was LLY at the minimum with the
+    remainder held.
+
+    Advisory: the minimum may be the right size for the idea, but then the
+    remainder now waits TOPUP_SLICE_MIN_AGE_WEEKS, and that trade-off should
+    be made in the open. Top-ups are left out of the cash arithmetic so the
+    alert fires whether the remainder was left idle or spent the same run.
+    """
+    total = pre_val.get("total_value_gbp") or 0
+    cash = pre_val.get("cash_gbp")
+    if cash is None or not total:
+        return []
+    positions = ledger.get("positions") or {}
+    positions_val = pre_val.get("positions", {}) or {}
+
+    def _pos_value(ticker: str) -> float:
+        return (positions_val.get(ticker, {}) or {}).get("current_value_gbp") or 0.0
+
+    new_buys: list[tuple[str, float]] = []
+    cash_after = float(cash)
+    for r in allowed:
+        a = (r.get("action") or "").upper().strip()
+        t = _rec_ticker(r)
+        if a == "BUY" and t:
+            amt = float(r.get("amount_gbp") or 0)
+            if t not in positions:
+                new_buys.append((t, amt))
+                cash_after -= amt
+            elif not _is_topup(r, ledger, total):
+                cash_after -= amt        # a full-size add; a top-up is left in
+        elif a == "SELL" and t:
+            cash_after += _pos_value(t)
+        elif a == "TRIM" and t:
+            cash_after += _pos_value(t) * min(float(r.get("trim_pct") or 50), 100) / 100
+    if not new_buys:
+        return []
+    remainder = cash_after - CASH_RESERVE_FLOOR * total
+    if remainder < MIN_TOPUP_PCT * total:
+        return []
+    ticker, amt = min(new_buys, key=lambda x: x[1])
+    combined = amt + remainder
+    if combined <= POSITION_HARD_CAP * total + 0.01:
+        sizing = (f"a single GBP {combined:.0f} position ({combined / total * 100:.1f}%) "
+                  f"was within the 8-20% band")
+    else:
+        sizing = (f"it could have been sized up to the 20% cap "
+                  f"(GBP {POSITION_HARD_CAP * total:.0f})")
+    return [
+        f"ALERT: MANUFACTURED SLICE: this run opens {ticker} at GBP {amt:.0f} "
+        f"({amt / total * 100:.1f}%) and leaves GBP {remainder:.0f} "
+        f"({remainder / total * 100:.1f}%) deployable above the reserve - "
+        f"{sizing}. If the minimum was the right size for {ticker}, say so: "
+        f"the remainder now waits {TOPUP_SLICE_MIN_AGE_WEEKS} weeks before a "
+        f"top-up is permitted"
+    ]
+
+
+TOPUP_CASE_FIELDS = ("metric", "at_entry", "now", "valuation_upside_pct")
+
+
+def _topup_case_alerts(allowed: list, ledger: dict, pre_val: dict) -> list[str]:
+    """
+    Check every permitted top-up carries its case, and say when it went to
+    the laggard.
+
+    The prompt has named the bias since Sep 2026 -- "most upside to the first
+    trim level" is measured from entry and so always picks the holding that
+    has gone up least -- and the 21 Sep run reproduced it in new words ("the
+    widest gap between business momentum and stock price"). So the criterion
+    is now structured: a top-up must carry a topup_case naming a fundamental
+    metric that is better NOW than AT ENTRY, and a valuation upside (multiple
+    or DCF against the thesis target), because price-from-entry is not
+    admissible as a reason. Missing fields are flagged, not blocked: the wait
+    rule has already decided whether a top-up may happen at all.
+
+    The laggard tag records whether the destination was the worst-performing
+    eligible holding from entry (eligible: held, priced, outside the repeat
+    window). Stamped on the rec so _apply_buy persists it and the running
+    count is built from the trade log -- after a few months the count says
+    whether the criterion is broken whatever the prose argues.
+    """
+    total = pre_val.get("total_value_gbp") or 0
+    positions = ledger.get("positions") or {}
+    positions_val = pre_val.get("positions", {}) or {}
+    today = datetime.now().date()
+    alerts: list[str] = []
+
+    eligible: dict[str, float] = {}
+    for ticker in positions:
+        pnl = (positions_val.get(ticker, {}) or {}).get("pnl_pct")
+        if pnl is None:
+            continue
+        last = _last_buy_date(ledger, ticker)
+        try:
+            recent = last and (today - datetime.strptime(last, "%Y-%m-%d").date()).days \
+                <= TOPUP_REPEAT_MIN_WEEKS * 7
+        except (TypeError, ValueError):
+            recent = False
+        if not recent:
+            eligible[ticker] = float(pnl)
+
+    past = [t for t in ledger.get("trades", []) if t.get("topup")]
+    past_laggard = sum(1 for t in past if t.get("laggard_topup"))
+
+    for rec in allowed:
+        if not rec.get("topup"):
+            continue
+        ticker = _rec_ticker(rec)
+        case = rec.get("topup_case")
+        missing = [f for f in TOPUP_CASE_FIELDS
+                   if not isinstance(case, dict) or case.get(f) in (None, "")]
+        if missing:
+            alerts.append(
+                f"ALERT: TOP-UP WITHOUT A CASE: BUY {ticker} carries no "
+                f"topup_case ({', '.join(missing)} missing) - a top-up needs a "
+                f"metric that is better now than at entry and a valuation "
+                f"upside; distance from entry price is not a reason"
+            )
+        if ticker in eligible and len(eligible) > 1 \
+                and eligible[ticker] <= min(eligible.values()):
+            rec["laggard_topup"] = True
+            n = past_laggard + 1
+            m = len(past) + 1
+            alerts.append(
+                f"ALERT: LAGGARD TOP-UP: {ticker} ({eligible[ticker]:+.1f}% from "
+                f"entry) is the worst-performing eligible holding - {n} of the "
+                f"last {m} tracked top-up(s) went to the laggard"
+            )
     return alerts
 
 
@@ -1252,6 +1407,14 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict,
          INJECTED into the rec list and executes like any other trade — the
          forward driver may carry the remainder of a realized winner, never
          the whole position (see _inject_played_out_banks).
+      5. The slice must age (Sep 2026): a BUY of an existing holding under the
+         8% new-position minimum is a dead-zone top-up, and is BLOCKED unless
+         the deployable slice was measured inside the 3-8% band at run start
+         and has sat there for TOPUP_SLICE_MIN_AGE_WEEKS (sp.topup_permitted).
+         Three top-ups in three weeks, all to the flattest names, and a slice
+         manufactured on 21 Sep by opening LLY at the minimum — the escape
+         hatch had become the default. Waiting is the mechanism, so this one
+         blocks.
 
     Advisory alerts (returned in guard_events but never blocking):
       - a pre-committed trim level was hit but no TRIM was recommended;
@@ -1263,8 +1426,14 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict,
       - the planned buys would leave cash below the 5% reserve floor;
       - the deployable slice (cash above the 5% floor) is too small to open a
         position at the 8% minimum but large enough for a dead-zone top-up,
-        and no BUY was proposed — the trap that idled cash for eight weeks
-        from June 2026;
+        it has AGED past the wait, and no BUY was proposed — the trap that
+        idled cash for eight weeks from June 2026 (while it is still waiting
+        an INFO line shows the clock instead);
+      - a run opens a new position at the minimum and leaves a top-up-sized
+        slice behind (MANUFACTURED SLICE, see _manufactured_slice_alerts);
+      - a permitted top-up carries no topup_case, or went to the
+        worst-performing eligible holding (LAGGARD TOP-UP, with a running
+        count from the trade log — see _topup_case_alerts);
       - a theme is STILL over the 60% cap after this run's recs are applied
         (the BUY-side theme guard only stops new breaches — it has nothing
         to act on when a theme is already overweight and no new buy is
@@ -1363,6 +1532,34 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict,
 
             amount = float(rec.get("amount_gbp") or 0)
 
+            # Rule 5: a sub-minimum add to an existing holding is a dead-zone
+            # top-up, permitted only once the slice has waited its turn.
+            if _is_topup(rec, ledger, total):
+                state = ledger.get("deployable_slice") or {}
+                if not state.get("in_band_since"):
+                    where = (f"the deployable slice at run start was "
+                             f"{state['pct']:.1f}% of the book"
+                             if state.get("pct") is not None else
+                             "no deployable slice has been measured")
+                    guard_events.append(
+                        f"BLOCKED BUY {ticker}: dead-zone top-up but {where} - "
+                        f"outside the {MIN_TOPUP_PCT * 100:.0f}-"
+                        f"{MIN_NEW_POSITION_PCT * 100:.0f}% band, so nothing is "
+                        f"stuck; sub-{MIN_NEW_POSITION_PCT * 100:.0f}% buys are "
+                        f"only permitted as dead-zone top-ups"
+                    )
+                    continue
+                if not sp.topup_permitted(ledger, today.isoformat()):
+                    guard_events.append(
+                        f"BLOCKED BUY {ticker}: dead-zone top-up - the slice "
+                        f"has been in band since {state['in_band_since']}; a "
+                        f"top-up is permitted from {sp.topup_permitted_from(ledger)} "
+                        f"({TOPUP_SLICE_MIN_AGE_WEEKS} weeks). A trim or sale "
+                        f"before then combines with it to fund a new position"
+                    )
+                    continue
+                rec = {**rec, "topup": True}
+
             # Rule 2: position cap — reduce or block buys that breach 20%,
             # counting earlier buys of the same ticker in this run.
             if total > 0:
@@ -1441,6 +1638,8 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict,
 
     # Advisory alerts — surfaced in the email, never blocking
     guard_events.extend(_repeat_topup_alerts(recs, ledger, pre_val))
+    guard_events.extend(_topup_case_alerts(allowed, ledger, pre_val))
+    guard_events.extend(_manufactured_slice_alerts(allowed, ledger, pre_val))
     guard_events.extend(_size_argued_alerts(recs, ledger, pre_val))
     guard_events.extend(_trim_reset_alerts(recs, ledger))
     guard_events.extend(_pre_commit_trim_alerts(recs, ledger, pre_val))
@@ -1475,17 +1674,32 @@ def enforce_strategy_guards(recs: list, ledger: dict, pre_val: dict,
         # the rules used to fire here (cash above the old 5-8% dead-zone band,
         # below what a new position needs) and the agent deployed nothing for
         # eight weeks - 17 Aug 2026 was cash 12.7%, slice £491 vs a £507
-        # minimum. The prompt rule now covers it, so this alert means a
-        # fundable top-up was available and wasn't taken.
+        # minimum. Since Sep 2026 the slice must AGE before a top-up is
+        # permitted, so this alert only means "a permitted top-up was
+        # available and wasn't taken"; while the slice is still waiting the
+        # clock is shown instead, so the wait is visible in the email.
         if planned_buys == 0:
             deployable = cash_after - CASH_RESERVE_FLOOR * total
             if MIN_TOPUP_PCT * total <= deployable < MIN_NEW_POSITION_PCT * total:
-                guard_events.append(
-                    f"ALERT: £{deployable:.2f} deployable above the 5% reserve "
-                    f"({deployable / total * 100:.1f}% of portfolio) - too little "
-                    f"for a new position at the 8% minimum but enough for a "
-                    f"dead-zone top-up, and no BUY was proposed"
-                )
+                state = ledger.get("deployable_slice") or {}
+                if state.get("in_band_since") and sp.topup_permitted(
+                        ledger, today.isoformat()):
+                    guard_events.append(
+                        f"ALERT: £{deployable:.2f} deployable above the 5% reserve "
+                        f"({deployable / total * 100:.1f}% of portfolio) - too little "
+                        f"for a new position at the 8% minimum but enough for a "
+                        f"dead-zone top-up (in band since "
+                        f"{state['in_band_since']}, wait served), and no BUY was "
+                        f"proposed"
+                    )
+                elif state.get("in_band_since"):
+                    guard_events.append(
+                        f"INFO: £{deployable:.2f} deployable slice "
+                        f"({deployable / total * 100:.1f}%) waiting since "
+                        f"{state['in_band_since']}; dead-zone top-up permitted "
+                        f"from {sp.topup_permitted_from(ledger)} unless a trim "
+                        f"or sale lifts it to a new position first"
+                    )
 
     return allowed, guard_events
 
@@ -1799,6 +2013,12 @@ def run_weekly(started: datetime) -> None:
     # against the same peak.
     for e in sp.update_played_out_peaks(ledger, pre_val, run_date):
         logger.info("[PEAK] %s", e)
+
+    # Step 4c: measure the deployable slice at run start and keep its clock.
+    # Before the prompt so Claude sees whether a top-up is permitted, and
+    # before any trade so a same-run sale cannot start the clock.
+    for e in sp.update_deployable_slice(ledger, pre_val, run_date):
+        logger.info("[SLICE] %s", e)
 
     # Step 5: Claude analysis
     response, recs, watchlist, played_out = get_claude_recommendations(

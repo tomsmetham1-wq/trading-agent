@@ -375,7 +375,10 @@ class TestIdleCashTrapAlert:
     new position at the 8% minimum. No rule fired, so nothing was deployed
     for eight weeks. Reproduces the real 17 Aug numbers.
     """
-    LEDGER = {"trades": [], "positions": {}}
+    # Since Sep 2026 the slice must have waited its turn before the alert
+    # fires; an aged clock reproduces the original behaviour.
+    LEDGER = {"trades": [], "positions": {},
+              "deployable_slice": {"in_band_since": "2026-01-01"}}
 
     def _pre_val(self, cash, total=6344.43, positions=None):
         return {"total_value_gbp": total, "cash_gbp": cash,
@@ -385,7 +388,20 @@ class TestIdleCashTrapAlert:
         # cash 12.7%; slice = 808.35 - 317.22 = 491.13 vs a 507.55 minimum
         _, events = ta.enforce_strategy_guards([], self.LEDGER,
                                                 self._pre_val(808.35))
-        assert any("dead-zone top-up" in e for e in events)
+        assert any("dead-zone top-up" in e and e.startswith("ALERT") for e in events)
+
+    def test_shows_the_clock_instead_while_the_slice_is_waiting(self):
+        led = {"trades": [], "positions": {},
+               "deployable_slice": {"in_band_since": "2099-01-01"}}
+        _, events = ta.enforce_strategy_guards([], led, self._pre_val(808.35))
+        assert not any(e.startswith("ALERT") for e in events)
+        assert any(e.startswith("INFO") and "waiting since 2099-01-01" in e
+                   for e in events)
+
+    def test_silent_when_no_clock_is_running(self):
+        _, events = ta.enforce_strategy_guards(
+            [], {"trades": [], "positions": {}}, self._pre_val(808.35))
+        assert not any("dead-zone" in e for e in events)
 
     def test_no_alert_when_a_buy_is_proposed(self):
         _, events = ta.enforce_strategy_guards(
@@ -1539,6 +1555,56 @@ class TestRealizedPnl:
         result = sp.compute_realized_pnl(ledger)
         assert "Y" in result["tickers_with_incomplete_basis"]
         assert result["total_gbp"] == 0.0
+
+    def test_closed_position_keeps_its_basis_via_the_closing_trade(self):
+        # 21 Sep 2026: the day DELL was sold in full its position record was
+        # deleted, the fallback basis went with it, £2,008 of proceeds became
+        # unpriced and realised DELL fell from £1,183 to £90 — enough to name
+        # MRVL top contributor and flip kill criterion #5 to PASSING.
+        ledger = {"positions": {}, "trades": [
+            {"action": "BUY",  "ticker": "D", "shares": 2, "amount_gbp": 200},
+            # 5 more shares came from a pre-log rebuild: no BUY for them.
+            {"action": "TRIM", "ticker": "D", "shares": 4, "amount_gbp": 800},
+            {"action": "SELL", "ticker": "D", "shares": 3, "amount_gbp": 900,
+             "closed_position": True, "avg_cost_gbp": 100.0},
+        ]}
+        out = sp.compute_realized_pnl(ledger)
+        # TRIM at £200/sh: 2 matched at £100 (+200) + 2 unmatched at the
+        # closing trade's £100 (+200); SELL at £300/sh: 3 unmatched (+600).
+        assert out["by_ticker"]["D"] == pytest.approx(1000.0)
+        assert "D" in out["tickers_with_estimated_basis"]
+        assert "D" not in out["tickers_with_incomplete_basis"]
+        assert out["unpriced_proceeds_gbp"] == {}
+
+    def test_closed_position_falls_back_to_a_sync_cost_record(self):
+        # The DELL ledger as it stood after the 21 Sep run: no basis on the
+        # closing SELL (written before the fix), but a SYNC_COST the same day.
+        ledger = {"positions": {}, "trades": [
+            {"action": "BUY",       "ticker": "D", "shares": 2, "amount_gbp": 200},
+            {"action": "SYNC_COST", "ticker": "D", "shares": 7, "avg_cost_gbp": 100.0},
+            {"action": "SELL",      "ticker": "D", "shares": 7, "amount_gbp": 2100,
+             "closed_position": True},
+        ]}
+        out = sp.compute_realized_pnl(ledger)
+        assert out["by_ticker"]["D"] == pytest.approx(2100 - 700)
+        assert "D" not in out["tickers_with_incomplete_basis"]
+
+    def test_closing_sell_records_the_basis_it_closed_at(self, monkeypatch):
+        ledger = make_ledger()
+        sp.apply_recommendations(ledger, [gbp_buy_rec("TEST", 200)], "2026-06-10")
+        monkeypatch.setattr(sp, "fetch_price_gbp", lambda t: 12.0)
+        sp.apply_recommendations(
+            ledger, [{"action": "SELL", "yfinance_ticker": "TEST"}], "2026-06-12")
+        closing = ledger["trades"][-1]
+        assert closing["closed_position"] is True
+        assert closing["avg_cost_gbp"] == pytest.approx(10.0)
+        # A partial trim leaves the position to carry its own basis.
+        ledger = make_ledger()
+        sp.apply_recommendations(ledger, [gbp_buy_rec("TEST", 200)], "2026-06-10")
+        sp.apply_recommendations(
+            ledger, [{"action": "TRIM", "yfinance_ticker": "TEST", "trim_pct": 50}],
+            "2026-06-12")
+        assert "avg_cost_gbp" not in ledger["trades"][-1]
 
     def test_sync_entries_ignored(self):
         ledger = {"trades": [
@@ -2819,6 +2885,24 @@ class TestExTopContributor:
         assert ex["beats_benchmark"] is True
         assert ex["passing"] is True
 
+    def test_top_contributor_survives_being_sold_in_full(self):
+        # Selling the top name does not make its gains go away. Before the
+        # fix the deleted position record took the basis with it and the
+        # ranking silently promoted the second name.
+        led = self._ledger()
+        del led["positions"]["DELL"]
+        led["trades"].append({
+            "action": "SELL", "ticker": "DELL", "shares": 2, "amount_gbp": 800,
+            "closed_position": True, "avg_cost_gbp": 100.0})
+        val = self._val(dell_unrealised=0.0)
+        val["positions"].pop("DELL")
+        val["total_return_gbp"] = round(804.0 + 600.0 + 134.32, 2)
+        ex = sp.ex_top_contributor_performance(led, val)
+        assert ex["top_ticker"] == "DELL"
+        assert ex["top_pnl_gbp"] == pytest.approx(1404.0, abs=1.0)
+        assert ex["second_ticker"] == "XOM"
+        assert ex["passing"] is False
+
     def test_peak_cost_is_the_most_basis_ever_open_not_what_is_left(self):
         peaks = sp.compute_realized_pnl(self._ledger())["peak_cost_gbp"]
         assert peaks["DELL"] == pytest.approx(400.0)   # not the £200 residual
@@ -2888,11 +2972,313 @@ class TestRepeatTopUpAlert:
         recs = [{"action": "BUY", "ticker": "NVDA", "amount_gbp": 259,
                  "theme": "AI infrastructure"}]
         led = self._ledger("2026-09-01")
+        led["deployable_slice"] = {"in_band_since": "2026-01-01"}   # wait served
         pre_val = {"total_value_gbp": 6333.0, "cash_gbp": 575.0,
                    "positions": {"NVDA": {"current_value_gbp": 1009.25}}}
         allowed, events = ta.enforce_strategy_guards(recs, led, pre_val)
         assert [r["ticker"] for r in allowed] == ["NVDA"]
         assert any("repeat" in e for e in events)
+
+
+class TestDeployableSliceClock:
+    """
+    The slice is measured at run start and its time in the 3-8% band is
+    kept on the ledger, because snapshots do not carry cash.
+    """
+
+    def _val(self, cash, total=6541.27):
+        return {"total_value_gbp": total, "cash_gbp": cash}
+
+    def test_clock_starts_when_the_slice_enters_the_band(self):
+        led = {}
+        # 21 Sep 2026 at run start: cash £706 -> slice £379 = 5.8%
+        events = sp.update_deployable_slice(led, self._val(706.0), "2026-09-21")
+        assert led["deployable_slice"]["in_band_since"] == "2026-09-21"
+        assert led["deployable_slice"]["pct"] == pytest.approx(5.8, abs=0.05)
+        assert sp.topup_permitted_from(led) == "2026-10-19"
+        assert not sp.topup_permitted(led, "2026-09-21")
+        assert not sp.topup_permitted(led, "2026-10-18")
+        assert sp.topup_permitted(led, "2026-10-19")
+        assert events and "entered" in events[0]
+
+    def test_clock_is_kept_not_restarted_on_later_runs(self):
+        led = {}
+        sp.update_deployable_slice(led, self._val(706.0), "2026-09-21")
+        events = sp.update_deployable_slice(led, self._val(720.0), "2026-09-28")
+        assert led["deployable_slice"]["in_band_since"] == "2026-09-21"
+        assert led["deployable_slice"]["measured"] == "2026-09-28"
+        assert events == []
+
+    def test_clock_clears_when_a_new_position_becomes_fundable(self):
+        led = {}
+        sp.update_deployable_slice(led, self._val(706.0), "2026-09-21")
+        # a sale lands: cash 19.7%, slice 14.7% -> new position fundable
+        events = sp.update_deployable_slice(led, self._val(1290.0), "2026-09-28")
+        assert led["deployable_slice"]["in_band_since"] is None
+        assert sp.topup_permitted_from(led) is None
+        assert events and "left the band" in events[0]
+
+    def test_clock_clears_when_the_slice_drops_below_the_minimum(self):
+        led = {}
+        sp.update_deployable_slice(led, self._val(706.0), "2026-09-21")
+        sp.update_deployable_slice(led, self._val(400.0), "2026-09-28")
+        assert led["deployable_slice"]["in_band_since"] is None
+
+    def test_unknown_cash_leaves_the_state_alone(self):
+        led = {"deployable_slice": {"in_band_since": "2026-09-21"}}
+        assert sp.update_deployable_slice(led, {"total_value_gbp": 6000}, "2026-09-28") == []
+        assert led["deployable_slice"]["in_band_since"] == "2026-09-21"
+
+    def test_prompt_block_says_waiting_then_aged(self):
+        led = {}
+        val = self._val(706.0)
+        sp.update_deployable_slice(led, val, "2026-09-21")
+        block = sp.build_deployment_review(led, val)
+        assert "DEAD ZONE, WAITING" in block and "2026-10-19" in block
+        led["deployable_slice"]["measured"] = "2026-10-19"
+        block = sp.build_deployment_review(led, val)
+        assert "DEAD ZONE, AGED" in block
+
+    def test_prompt_block_warns_against_manufacturing_when_fundable(self):
+        led = {}
+        val = self._val(1290.0)
+        sp.update_deployable_slice(led, val, "2026-09-21")
+        block = sp.build_deployment_review(led, val)
+        assert "can fund a NEW position" in block and "BLOCKED" in block
+
+    def test_weekly_prompt_carries_the_block(self, monkeypatch):
+        monkeypatch.setattr(sp, "fetch_price_gbp", lambda *a, **k: 100.0)
+        ledger = make_ledger()
+        ledger["cash_gbp"] = 706.0
+        ledger["deployable_slice"] = {"in_band_since": "2026-09-21",
+                                      "measured": "2026-09-21"}
+        val = {"total_value_gbp": 6541.27, "cash_gbp": 706.0,
+               "total_return_pct": 30.8, "benchmark_return_pct": 9.18,
+               "vs_benchmark_pct": 21.6, "positions": {}}
+        _, user = prompts.build_prompt(val, ledger, {"free": 706.0}, [])
+        assert "=== Cash deployment ===" in user
+        assert "DEAD ZONE, WAITING" in user
+
+
+class TestTopUpMustWaitGuard:
+    """
+    Rule 5: a sub-minimum add to an existing holding is a dead-zone top-up,
+    blocked until the slice has sat in the band for four weeks. Reproduces
+    21 Sep 2026: slice in band at run start (5.8%), DELL sold the same run,
+    LLY opened at the minimum, AMZN topped up with the remainder.
+    """
+
+    def _ledger(self, since):
+        led = {"positions": {"AMZN": {"theme": "AI infrastructure"},
+                             "DELL": {"theme": "AI infrastructure"}},
+               "trades": [{"action": "BUY", "ticker": "AMZN", "date": "2026-04-26",
+                           "shares": 2.3, "amount_gbp": 436}]}
+        if since is not None:
+            led["deployable_slice"] = {"in_band_since": since, "pct": 5.8,
+                                       "measured": "2026-09-21"}
+        return led
+
+    def _pre_val(self):
+        return {"total_value_gbp": 6541.27, "cash_gbp": 706.0, "positions": {
+            "AMZN": {"current_value_gbp": 436.0, "pnl_pct": 0.41},
+            "DELL": {"current_value_gbp": 597.0, "pnl_pct": 177.0},
+        }}
+
+    RECS = [
+        {"action": "SELL", "yfinance_ticker": "DELL", "thesis_oneline": "level hit"},
+        {"action": "BUY", "yfinance_ticker": "LLY", "amount_gbp": 524,
+         "theme": "pharma", "thesis_oneline": "GLP-1"},
+        {"action": "BUY", "yfinance_ticker": "AMZN", "amount_gbp": 430,
+         "theme": "AI infrastructure", "thesis_oneline": "AWS"},
+    ]
+
+    def test_the_21_sep_top_up_is_blocked_on_a_fresh_clock(self, monkeypatch):
+        monkeypatch.setattr(ta, "_recent_full_exit_date", lambda *a: None)
+        allowed, events = ta.enforce_strategy_guards(
+            self.RECS, self._ledger("2026-09-21"), self._pre_val())
+        assert [ta._rec_ticker(r) for r in allowed] == ["DELL", "LLY"]
+        block = [e for e in events if e.startswith("BLOCKED BUY AMZN")]
+        assert len(block) == 1
+        assert "2026-10-19" in block[0]
+
+    def test_blocked_when_no_slice_was_in_band_at_run_start(self, monkeypatch):
+        monkeypatch.setattr(ta, "_recent_full_exit_date", lambda *a: None)
+        led = self._ledger(None)
+        led["deployable_slice"] = {"in_band_since": None, "pct": 14.7,
+                                   "measured": "2026-09-21"}
+        allowed, events = ta.enforce_strategy_guards(
+            self.RECS, led, self._pre_val())
+        assert "AMZN" not in [ta._rec_ticker(r) for r in allowed]
+        assert any("BLOCKED BUY AMZN" in e and "14.7%" in e for e in events)
+
+    def test_permitted_once_the_wait_is_served(self, monkeypatch):
+        monkeypatch.setattr(ta, "_recent_full_exit_date", lambda *a: None)
+        allowed, events = ta.enforce_strategy_guards(
+            self.RECS, self._ledger("2026-01-01"), self._pre_val())
+        amzn = [r for r in allowed if ta._rec_ticker(r) == "AMZN"]
+        assert len(amzn) == 1 and amzn[0]["topup"] is True
+        assert not any(e.startswith("BLOCKED BUY AMZN") for e in events)
+
+    def test_a_full_size_add_is_not_a_top_up(self, monkeypatch):
+        # 8%+ of the book added to an existing holding is an ordinary BUY.
+        monkeypatch.setattr(ta, "_recent_full_exit_date", lambda *a: None)
+        recs = [{"action": "BUY", "yfinance_ticker": "AMZN", "amount_gbp": 600,
+                 "theme": "AI infrastructure"}]
+        allowed, events = ta.enforce_strategy_guards(
+            recs, self._ledger(None), self._pre_val())
+        assert len(allowed) == 1 and "topup" not in allowed[0]
+        assert not any("BLOCKED" in e for e in events)
+
+    def test_a_new_position_is_never_blocked_by_the_wait(self, monkeypatch):
+        monkeypatch.setattr(ta, "_recent_full_exit_date", lambda *a: None)
+        recs = [{"action": "BUY", "yfinance_ticker": "LLY", "amount_gbp": 524,
+                 "theme": "pharma"}]
+        allowed, _ = ta.enforce_strategy_guards(
+            recs, self._ledger("2026-09-21"), self._pre_val())
+        assert len(allowed) == 1
+
+    def test_the_block_survives_a_missing_pct_field(self, monkeypatch):
+        monkeypatch.setattr(ta, "_recent_full_exit_date", lambda *a: None)
+        led = self._ledger(None)
+        led["deployable_slice"] = {"in_band_since": None}
+        allowed, events = ta.enforce_strategy_guards(self.RECS, led, self._pre_val())
+        assert "AMZN" not in [ta._rec_ticker(r) for r in allowed]
+        assert any("no deployable slice has been measured" in e for e in events)
+
+
+class TestManufacturedSliceAlert:
+    """21 Sep 2026: LLY at exactly the minimum, £454 left, topped up."""
+
+    LEDGER = {"positions": {"DELL": {}, "AMZN": {}}, "trades": []}
+
+    def _pre_val(self):
+        return {"total_value_gbp": 6541.27, "cash_gbp": 706.0, "positions": {
+            "DELL": {"current_value_gbp": 581.0},
+            "AMZN": {"current_value_gbp": 436.0},
+        }}
+
+    def test_fires_when_a_minimum_position_leaves_a_slice(self):
+        allowed = [
+            {"action": "SELL", "yfinance_ticker": "DELL"},
+            {"action": "BUY", "yfinance_ticker": "LLY", "amount_gbp": 524},
+        ]
+        alerts = ta._manufactured_slice_alerts(allowed, self.LEDGER, self._pre_val())
+        assert len(alerts) == 1
+        a = alerts[0]
+        assert "MANUFACTURED SLICE" in a and "LLY" in a
+        # cash 706 + 581 - 524 = 763; slice = 763 - 327 = 436; 524 + 436 = 960 (14.7%)
+        assert "GBP 436" in a and "GBP 960" in a and "14.7%" in a
+
+    def test_fires_even_when_the_remainder_was_topped_up(self):
+        allowed = [
+            {"action": "SELL", "yfinance_ticker": "DELL"},
+            {"action": "BUY", "yfinance_ticker": "LLY", "amount_gbp": 524},
+            {"action": "BUY", "yfinance_ticker": "AMZN", "amount_gbp": 430, "topup": True},
+        ]
+        alerts = ta._manufactured_slice_alerts(allowed, self.LEDGER, self._pre_val())
+        assert len(alerts) == 1
+
+    def test_silent_when_the_new_position_absorbs_the_cash(self):
+        allowed = [
+            {"action": "SELL", "yfinance_ticker": "DELL"},
+            {"action": "BUY", "yfinance_ticker": "LLY", "amount_gbp": 960},
+        ]
+        assert ta._manufactured_slice_alerts(allowed, self.LEDGER, self._pre_val()) == []
+
+    def test_silent_with_no_new_position(self):
+        allowed = [{"action": "SELL", "yfinance_ticker": "DELL"}]
+        assert ta._manufactured_slice_alerts(allowed, self.LEDGER, self._pre_val()) == []
+
+    def test_points_at_the_cap_when_the_combined_size_would_exceed_it(self):
+        pre_val = {"total_value_gbp": 5000.0, "cash_gbp": 1600.0, "positions": {}}
+        allowed = [{"action": "BUY", "yfinance_ticker": "NEW", "amount_gbp": 400}]
+        alerts = ta._manufactured_slice_alerts(allowed, self.LEDGER, pre_val)
+        # remainder 1200 - 250 = 950; 400 + 950 = 1350 > 20% cap of 1000
+        assert len(alerts) == 1 and "20% cap" in alerts[0]
+
+
+class TestTopUpCaseAlerts:
+    """
+    A permitted top-up must carry its case, and going to the laggard is
+    tagged and counted. The 21 Sep AMZN top-up: flattest eligible holding,
+    argued on "the widest gap between business momentum and stock price".
+    """
+
+    def _ledger(self, past=()):
+        return {"positions": {"AMZN": {}, "XOM": {}, "NVDA": {}},
+                "trades": [
+                    {"action": "BUY", "ticker": "AMZN", "date": "2026-04-26",
+                     "shares": 1, "amount_gbp": 436},
+                    {"action": "BUY", "ticker": "XOM", "date": "2026-06-22",
+                     "shares": 1, "amount_gbp": 700},
+                    {"action": "BUY", "ticker": "NVDA", "date": "2026-09-10",
+                     "shares": 1, "amount_gbp": 259},
+                ] + list(past)}
+
+    def _pre_val(self):
+        return {"total_value_gbp": 6541.27, "cash_gbp": 706.0, "positions": {
+            "AMZN": {"current_value_gbp": 436.0, "pnl_pct": 0.41},
+            "XOM":  {"current_value_gbp": 813.0, "pnl_pct": 16.09},
+            "NVDA": {"current_value_gbp": 1034.0, "pnl_pct": -2.0},
+        }}
+
+    CASE = {"metric": "AWS revenue growth YoY", "at_entry": "17%",
+            "now": "37%", "valuation_upside_pct": 22}
+
+    def test_missing_case_is_flagged(self):
+        rec = {"action": "BUY", "yfinance_ticker": "AMZN", "amount_gbp": 430, "topup": True}
+        alerts = ta._topup_case_alerts([rec], self._ledger(), self._pre_val())
+        assert any("TOP-UP WITHOUT A CASE" in a and "metric" in a for a in alerts)
+
+    def test_partial_case_names_the_missing_fields(self):
+        rec = {"action": "BUY", "yfinance_ticker": "AMZN", "amount_gbp": 430,
+               "topup": True, "topup_case": {"metric": "AWS growth", "now": "37%"}}
+        alerts = ta._topup_case_alerts([rec], self._ledger(), self._pre_val())
+        a = [x for x in alerts if "WITHOUT A CASE" in x][0]
+        missing = a.split("(")[1].split(" missing")[0]
+        assert missing == "at_entry, valuation_upside_pct"
+
+    def test_laggard_is_tagged_and_counted(self):
+        # NVDA is lower from entry but inside the 8-week repeat window, so
+        # AMZN is the worst-performing ELIGIBLE holding.
+        rec = {"action": "BUY", "yfinance_ticker": "AMZN", "amount_gbp": 430,
+               "topup": True, "topup_case": self.CASE}
+        alerts = ta._topup_case_alerts([rec], self._ledger(), self._pre_val())
+        assert rec["laggard_topup"] is True
+        assert any("LAGGARD TOP-UP: AMZN" in a and "1 of the last 1" in a for a in alerts)
+        assert not any("WITHOUT A CASE" in a for a in alerts)
+
+    def test_count_builds_from_the_trade_log(self):
+        past = [{"action": "BUY", "ticker": "AMZN", "date": "2026-07-01",
+                 "shares": 1, "amount_gbp": 200, "topup": True, "laggard_topup": True},
+                {"action": "BUY", "ticker": "XOM", "date": "2026-07-08",
+                 "shares": 1, "amount_gbp": 200, "topup": True}]
+        rec = {"action": "BUY", "yfinance_ticker": "AMZN", "amount_gbp": 430,
+               "topup": True, "topup_case": self.CASE}
+        alerts = ta._topup_case_alerts([rec], self._ledger(past), self._pre_val())
+        assert any("2 of the last 3" in a for a in alerts)
+
+    def test_top_up_to_a_leader_is_not_tagged(self):
+        rec = {"action": "BUY", "yfinance_ticker": "XOM", "amount_gbp": 300,
+               "topup": True, "topup_case": self.CASE}
+        alerts = ta._topup_case_alerts([rec], self._ledger(), self._pre_val())
+        assert "laggard_topup" not in rec
+        assert alerts == []
+
+    def test_non_top_ups_are_ignored(self):
+        rec = {"action": "BUY", "yfinance_ticker": "AMZN", "amount_gbp": 430}
+        assert ta._topup_case_alerts([rec], self._ledger(), self._pre_val()) == []
+
+    def test_provenance_is_persisted_on_the_trade(self):
+        ledger = make_ledger()
+        sp.apply_recommendations(ledger, [gbp_buy_rec("TEST", 200)], "2026-06-10")
+        sp.apply_recommendations(
+            ledger, [gbp_buy_rec("TEST", 100, topup=True, laggard_topup=True,
+                                 topup_case=self.CASE)], "2026-07-10")
+        t = ledger["trades"][-1]
+        assert t["topup"] is True and t["laggard_topup"] is True
+        assert t["topup_case"]["now"] == "37%"
+        assert "topup" not in ledger["trades"][-2]
 
 
 class TestTrimResetAlert:

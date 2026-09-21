@@ -187,6 +187,48 @@ All sizing rules are percentage-based so they scale as the portfolio grows.
   ENTRY and therefore always favours the holding that has gone up least. That
   is averaging down in the language of forward risk/reward, and it is why the
   slice went to the same name twice. The prompt now names it.
+- The slice must wait, and the top-up must carry a case (Sep 2026, after the
+  21 Sep run). Naming the bias in the prompt did not hold: the 21 Sep top-up
+  went to AMZN, the flattest eligible holding, argued as "the widest gap
+  between business momentum and stock price" — the same rule in new words.
+  Three dead-zone top-ups in three weeks (NVDA £246, NVDA £259, AMZN £430;
+  £935 for ~£20, all AI infrastructure) and the 21 Sep slice was MANUFACTURED:
+  ~£960 was deployable after the DELL sale, LLY was opened at exactly the
+  £524 minimum and the £454 remainder declared a dead zone the same run. The
+  idle-cash trap the Aug 2026 rule closed costs ~£6/month on a £450 slice;
+  the rule had made the escape hatch the default. Three mechanisms, all in
+  `enforce_strategy_guards()`:
+  1. BLOCK — `sp.update_deployable_slice()` (run_weekly step 4c, after the
+     valuation, before the prompt, before any trade) measures cash above the
+     5% floor at run START and keeps `ledger["deployable_slice"]`
+     (`in_band_since`, cleared when the slice leaves the 3–8% band in either
+     direction). A BUY of an existing holding under the 8% minimum
+     (`_is_topup`) is blocked unless the slice was in band at run start AND
+     has sat there `TOPUP_SLICE_MIN_AGE_WEEKS` (4). A block, not an alert:
+     the only mechanism it removes is "deploy now", and waiting IS the
+     mechanism — a trim or sale in the meantime combines with the slice to
+     fund a new position. The cash-band constants moved to
+     `shadow_portfolio.py` (aliased in `trading_agent.py`) because
+     `build_deployment_review()` quotes them into the prompt; the idle-cash
+     alert now fires only once the wait is served and shows an INFO line
+     with the clock until then.
+  2. ADVISORY `MANUFACTURED SLICE` (`_manufactured_slice_alerts`): a run that
+     opens a new position and leaves a ≥3% slice above the reserve, with
+     top-ups excluded from the arithmetic so it fires whether the remainder
+     was idled or spent. Names the combined size that was within the band.
+  3. ADVISORY `TOP-UP WITHOUT A CASE` / `LAGGARD TOP-UP`
+     (`_topup_case_alerts`): a permitted top-up must carry `topup_case`
+     {metric, at_entry, now, valuation_upside_pct} — a fundamental that is
+     better now than at entry, and upside to the thesis's own target from
+     TODAY's price; price-from-entry is inadmissible. A top-up to the
+     worst-performing eligible holding (held, priced, outside the 8-week
+     repeat window) is tagged `laggard_topup` on the rec, persisted on the
+     trade by `_apply_buy` with `topup` and `topup_case`, and the alert
+     carries a running "N of the last M" count from the trade log — after a
+     few months that count says whether the criterion is broken regardless
+     of the prose. Pre-Sep-2026 top-ups carry no flags and are not counted.
+  Under these rules 21 Sep replays as: DELL sold, LLY opened, AMZN top-up
+  BLOCKED until 19 Oct, MANUFACTURED SLICE flagged (£976 / 14.9% was legal).
 - Do NOT exit a position solely because it shrank below 8% — only exit if thesis broken
 - Thesis realized ≠ thesis intact (added July 2026): when a position's ORIGINAL
   thesis has substantially played out (mispricing closed, gain captured), HOLD is
@@ -287,6 +329,10 @@ before execution — prompt rules that were being violated are now mechanical:
   or the trim would be under £25.
 - **SET_TRIMS tighten-only** (added Aug 2026): blocks any SET_TRIMS that
   raises or removes the next un-hit trim trigger.
+- **Dead-zone top-up must wait** (added Sep 2026): a BUY of an existing
+  holding under the 8% minimum is blocked unless the deployable slice was in
+  the 3–8% band at run start and has aged 4 weeks (`sp.topup_permitted`).
+  See the strategy-constraints bullet for the three mechanisms and why.
 - **Trim trigger parsing** (fixed Aug 2026): `_parse_trim_triggers()` strips
   bracketed commentary before reading "+N%" levels, and honoured levels are
   counted from the FIRST SET_TRIMS for that ticker, not from `first_bought`.
@@ -327,7 +373,10 @@ before execution — prompt rules that were being violated are now mechanical:
   applied (added after the July 2026 Opus deep review flagged that AI infra
   was still ~58-63% weeks after the BUY-side cap existed, because nothing
   forces a correction when Claude doesn't propose a new buy in that theme —
-  fires every run until the overweight is actually addressed).
+  fires every run until the overweight is actually addressed); a run opens a
+  new position and leaves a top-up-sized slice behind (`MANUFACTURED SLICE`);
+  a permitted top-up has no `topup_case` or went to the laggard
+  (`LAGGARD TOP-UP`, with a running count from the trade log).
 - Guard actions appear in the weekly email under "Strategy guard actions".
 - The weekly email also flags a >15% week-on-week drawdown (kill criterion)
   the week it happens, and marks the week-on-week figure as indicative when
@@ -362,6 +411,20 @@ magnitude, not exact) rather than being skipped -- skipping them understated
 realised P&L by hundreds. Names with no position left to infer from stay in
 `tickers_with_incomplete_basis`, and their `unpriced_proceeds_gbp` are reported
 so a missing figure doesn't read as a zero.
+
+A closed position keeps its basis (Sep 2026 fix -- do not regress). The
+fallback read the basis off `ledger["positions"]`, and a closing SELL/TRIM
+deletes that record, so a winner's whole estimated basis vanished the day it
+was sold in full. On 21 Sep 2026 DELL's realised gain went from £1,183 to £90
+in one run, £2,008 of its proceeds became unpriced, the weekly email named
+MRVL top contributor and printed kill criterion #5 as PASSING (+31% ex-top)
+while Claude's own prose in the same email said FAILING (+7.7% vs +9.2%) --
+the prose was right. `_apply_sell_or_trim()` now stamps `avg_cost_gbp` on a
+closing trade, and `_fallback_basis()` reads the latest trade record for the
+ticker carrying one (closing SELL/TRIM, SYNC_COST or SYNC_ADD) once the
+position is gone. DELL needed no ledger repair: its 21 Sep SYNC_COST record
+carries the T212 re-based £156.82. The name stays in
+`tickers_with_estimated_basis`, exactly as it was while held.
 
 `sp.reconcile_trade_log()` checks the log still explains the positions held and
 the cash balance; the deep review prompt carries a WARNING block when it
@@ -742,7 +805,7 @@ or requires a name to persist N weeks before it can be bought. Those were
 considered and rejected — they forfeit real upside to buy a filter the data
 doesn't yet justify. Revisit only once there are ~3 months of scores.
 
-Test suite: `test_trading_agent.py` (327 tests, no network). Run it after any
+Test suite: `test_trading_agent.py` (359 tests, no network). Run it after any
 change to translation, sync, guards, or ledger logic.
 
 Theme tracking: every BUY rec now carries a `theme` label, persisted on the
